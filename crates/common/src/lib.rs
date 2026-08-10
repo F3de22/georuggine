@@ -7,3 +7,5 @@
 //! Questo crate e' una libreria: gli errori si modellano con `thiserror`, mai con
 //! `anyhow`, e non deve contenere `unwrap`/`expect`/`panic!` sui percorsi di
 //! produzione.
+
+pub mod types;
