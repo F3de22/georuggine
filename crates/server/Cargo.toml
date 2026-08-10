@@ -1,0 +1,27 @@
+[package]
+name = "georuggine-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Server Georuggine: accetta le connessioni dei veicoli e persiste le posizioni"
+
+[[bin]]
+name = "georuggine-server"
+path = "src/main.rs"
+
+[dependencies]
+georuggine-common = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rusqlite = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }

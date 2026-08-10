@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = ["crates/common", "crates/server", "crates/client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/G37/georuggine"
+
+[workspace.dependencies]
+# --- crate interni ---
+georuggine-common = { path = "crates/common" }
+
+# --- runtime asincrono ---
+tokio = { version = "1.53", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "macros",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# --- serializzazione ---
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+chrono = { version = "0.4", features = ["clock", "serde"] }
+
+# --- errori ---
+thiserror = "2.0"
+anyhow = "1.0"
+
+# --- osservabilita' ---
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# --- persistenza e sicurezza ---
+rusqlite = { version = "0.40", features = ["bundled"] }
+argon2 = "0.5"
+rand = "0.10"
+
+# --- interfaccia testuale ---
+ratatui = "0.30"
+crossterm = "0.29"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3

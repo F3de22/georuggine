@@ -1,0 +1,26 @@
+[package]
+name = "georuggine-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Client Georuggine: invia la posizione del veicolo e mostra la flotta in TUI"
+
+[[bin]]
+name = "georuggine-client"
+path = "src/main.rs"
+
+[dependencies]
+georuggine-common = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }

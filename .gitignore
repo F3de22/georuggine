@@ -1,0 +1,39 @@
+# Artefatti di build Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Lockfile: tenuto in repo (il workspace produce binari)
+# Cargo.lock NON va ignorato
+
+# Database SQLite generati a runtime
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Log
+*.log
+
+# Editor / IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Copertura e profilazione
+*.profraw
+*.profdata
+/coverage/
+
+# strumenti locali
+CLAUDE.md
+CLAUDE.local.md
+.claude/
