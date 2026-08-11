@@ -282,6 +282,37 @@ impl SessionToken {
         Ok(Self(esadecimale))
     }
 
+    /// Ricostruisce un token ricevuto dalla rete, verificandone la forma.
+    ///
+    /// Accetta soltanto cio' che [`SessionToken::generate`] produce: esattamente 64
+    /// caratteri esadecimali minuscoli. Senza questo controllo il token sarebbe un
+    /// campo di testo libero scelto dal client, e la mappa delle sessioni finirebbe per
+    /// contenere chiavi arbitrarie, anche molto grandi.
+    ///
+    /// # Errori
+    ///
+    /// [`AuthError::InvalidCredentials`] per qualunque stringa di forma diversa. E' lo
+    /// stesso errore che riceve chi presenta un token sconosciuto: distinguere
+    /// "malformato" da "non riconosciuto" non serve a un client corretto e direbbe a
+    /// chi prova quali forme il server considera plausibili.
+    pub fn parse(testo: &str) -> Result<Self, AuthError> {
+        // Il confronto sulla lunghezza in byte viene per primo e cortocircuita, quindi
+        // un input enorme costa un confronto invece di una scansione. Su una stringa di
+        // soli byte ASCII lunghezza in byte e in caratteri coincidono, e il controllo
+        // successivo garantisce che siano tutti ASCII: un input multibyte lungo 64 byte
+        // viene rifiutato dal secondo controllo, non accettato per errore dal primo.
+        let forma_valida = testo.len() == TOKEN_BYTES * 2
+            && testo
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+
+        if forma_valida {
+            Ok(Self(testo.to_owned()))
+        } else {
+            Err(AuthError::InvalidCredentials)
+        }
+    }
+
     /// Il token come stringa esadecimale di 64 caratteri.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -668,6 +699,45 @@ mod tests {
             assert!(visti.insert(token), "token ripetuto");
         }
         assert_eq!(visti.len(), 1_000);
+    }
+
+    #[test]
+    fn parse_accetta_cio_che_generate_produce() {
+        let originale = SessionToken::generate().expect("generazione riuscita");
+        let riletto = SessionToken::parse(originale.as_str()).expect("un token generato e' valido");
+
+        assert_eq!(riletto, originale);
+    }
+
+    #[test]
+    fn parse_rifiuta_ogni_forma_non_valida() {
+        let generato = SessionToken::generate().expect("generazione riuscita");
+        let valido = generato.as_str();
+
+        let casi = [
+            ("stringa vuota", String::new()),
+            ("un carattere in meno", valido[..63].to_owned()),
+            ("un carattere in piu'", format!("{valido}0")),
+            ("maiuscole", valido.to_uppercase()),
+            ("carattere non esadecimale", format!("{}z", &valido[..63])),
+            (
+                "spazio in mezzo",
+                format!("{} {}", &valido[..31], &valido[32..]),
+            ),
+            ("input molto lungo", "a".repeat(100_000)),
+            // 32 caratteri accentati fanno 64 byte ma non 64 caratteri esadecimali:
+            // il controllo non deve confondere la lunghezza in byte con quella in
+            // caratteri, ne' andare in panico su un confine multibyte.
+            ("caratteri multibyte", "\u{00e8}".repeat(32)),
+        ];
+
+        for (descrizione, testo) in casi {
+            let esito = SessionToken::parse(&testo);
+            assert!(
+                matches!(esito, Err(AuthError::InvalidCredentials)),
+                "{descrizione}: atteso InvalidCredentials, ottenuto {esito:?}"
+            );
+        }
     }
 
     // --- registro delle sessioni ---

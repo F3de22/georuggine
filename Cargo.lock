@@ -548,6 +548,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
 dependencies = [
  "futures-core",
+ "futures-sink",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -600,6 +601,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "chrono",
+ "futures-util",
  "georuggine-common",
  "libc",
  "rand 0.10.2",
