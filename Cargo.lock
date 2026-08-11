@@ -601,6 +601,7 @@ dependencies = [
  "argon2",
  "chrono",
  "georuggine-common",
+ "libc",
  "rand 0.10.2",
  "rusqlite",
  "serde",
@@ -609,6 +610,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]

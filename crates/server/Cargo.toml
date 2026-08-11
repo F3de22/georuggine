@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Server Georuggine: accetta le connessioni dei veicoli e persiste le posizioni"
 
+[lib]
+name = "georuggine_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "georuggine-server"
 path = "src/main.rs"
@@ -25,3 +29,11 @@ tracing-subscriber = { workspace = true }
 rusqlite = { workspace = true }
 argon2 = { workspace = true }
 rand = { workspace = true }
+
+# Dipendenze di piattaforma del modulo `cpu_time`: ognuna e' compilata solo sul
+# target che la usa, cosi' la build Windows non tira dentro `libc` ne' viceversa.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
