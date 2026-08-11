@@ -46,6 +46,13 @@ rand = "0.10"
 ratatui = "0.30"
 crossterm = "0.29"
 
+# --- API di sistema (solo modulo cpu_time del server) ---
+libc = "0.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
