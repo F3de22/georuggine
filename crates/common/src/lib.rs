@@ -8,6 +8,7 @@
 //! `anyhow`, e non deve contenere `unwrap`/`expect`/`panic!` sui percorsi di
 //! produzione.
 
+pub mod clock;
 pub mod codec;
 pub mod protocol;
 pub mod types;
