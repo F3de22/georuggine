@@ -8,3 +8,4 @@
 //! modulo [`cpu_time`].
 
 pub mod cpu_time;
+pub mod storage;
