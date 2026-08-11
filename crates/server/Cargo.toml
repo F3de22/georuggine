@@ -20,6 +20,7 @@ georuggine-common = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }

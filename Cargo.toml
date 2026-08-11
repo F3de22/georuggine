@@ -23,6 +23,12 @@ tokio = { version = "1.53", features = [
     "signal",
 ] }
 tokio-util = { version = "0.7", features = ["codec"] }
+# I trait di estensione per Stream e Sink: `Framed` implementa i trait di base, ma
+# `.next()` e `.send()` arrivano da qui.
+futures-util = { version = "0.3", default-features = false, features = [
+    "std",
+    "sink",
+] }
 
 # --- serializzazione ---
 serde = { version = "1.0", features = ["derive"] }
