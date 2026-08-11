@@ -7,5 +7,6 @@
 //! `unwrap`/`expect`/`panic!` sui percorsi di produzione e nessun `unsafe` fuori dal
 //! modulo [`cpu_time`].
 
+pub mod auth;
 pub mod cpu_time;
 pub mod storage;
