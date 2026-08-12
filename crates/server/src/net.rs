@@ -39,6 +39,21 @@
 //! [`StatoConnessione`], che vive nel suo gestore: la sessione aperta e il [`Limitatore`]
 //! delle posizioni. Il limite di frequenza e' per connessione, quindi tenerlo li' evita
 //! sia un lock sia una mappa per utente.
+//!
+//! # Il battito della macchina a stati
+//!
+//! Il passaggio a fermo del requisito R5 non ha un messaggio che lo provochi: succede
+//! perche' il tempo passa mentre il veicolo non invia nulla, quindi nessun gestore di
+//! connessione puo' accorgersene. Se ne occupa [`batti_gli_stati`], un task che a
+//! intervalli di [`ConnectionTimeouts::tick_interval`] chiama [`StateTracker::tick`] e
+//! recapita i cambi risultanti attraverso il registro.
+//!
+//! Il tracciatore gli arriva da un campo suo, [`ConnectionContext::ticker`], e non
+//! dall'osservatore: `tick` non fa parte di [`PositionObserver`], perche' non risponde a
+//! un evento della connessione, e da un `Arc<dyn PositionObserver>` non si puo' quindi
+//! chiamare. I due campi tengono lo stesso oggetto quando la macchina a stati c'e'
+//! davvero: [`Osservazione::con_stati`] li ricava entrambi da un solo [`Arc`], cosi' non
+//! possono divergere.
 
 use std::collections::HashMap;
 use std::io;
@@ -64,7 +79,8 @@ use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::auth::{self, AuthConfig, AuthError, SessionStore, SessionToken};
-use crate::observer::PositionObserver;
+use crate::observer::{NoopObserver, PositionObserver};
+use crate::state::StateTracker;
 use crate::storage::Repository;
 
 /// Messaggi che possono attendere in coda verso un client prima che le scritture
@@ -231,6 +247,16 @@ pub struct ConnectionTimeouts {
     pub idle: Duration,
     /// Attesa massima della chiusura ordinata dopo il segnale di spegnimento.
     pub shutdown: Duration,
+    /// Intervallo fra due passaggi della macchina a stati.
+    ///
+    /// E' la risoluzione con cui si accorge del ritorno a fermo: un utente che smette di
+    /// spostarsi viene segnalato fra [`STILL_AFTER_SECS`] e `STILL_AFTER_SECS +
+    /// tick_interval` secondi dopo l'ultimo movimento. Dieci secondi su tre minuti sono
+    /// un ritardo trascurabile per chi guarda la flotta, e il passaggio costa una
+    /// scansione di una mappa in memoria.
+    ///
+    /// [`STILL_AFTER_SECS`]: georuggine_common::types::STILL_AFTER_SECS
+    pub tick_interval: Duration,
 }
 
 impl Default for ConnectionTimeouts {
@@ -239,6 +265,45 @@ impl Default for ConnectionTimeouts {
             handshake: Duration::from_secs(5),
             idle: Duration::from_secs(90),
             shutdown: Duration::from_secs(5),
+            tick_interval: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Chi riceve gli eventi delle connessioni, ed eventualmente scandisce il tempo.
+///
+/// Sta insieme perche' i due ruoli li ricopre lo stesso oggetto: [`StateTracker`] e'
+/// l'osservatore delle posizioni e anche cio' che il task periodico fa avanzare. Il
+/// secondo ruolo ha bisogno di un campo suo perche' [`StateTracker::tick`] non fa parte
+/// di [`PositionObserver`], e da dietro `Arc<dyn PositionObserver>` non si raggiunge.
+///
+/// Costruirla dai due costruttori invece che dai campi e' cio' che tiene allineati i due
+/// ruoli: un ticker diverso dall'osservatore riceverebbe le posizioni su una macchina a
+/// stati e le scadenze su un'altra, e nessuna delle due direbbe la verita'.
+pub struct Osservazione {
+    /// Destinatario degli eventi di sessione e di posizione.
+    pub observer: Arc<dyn PositionObserver>,
+    /// Macchina a stati da far avanzare periodicamente, se c'e'.
+    pub ticker: Option<Arc<StateTracker>>,
+}
+
+impl Osservazione {
+    /// Macchina a stati vera: lo stesso tracciatore osserva le posizioni e batte il tempo.
+    pub fn con_stati(tracker: Arc<StateTracker>) -> Self {
+        Self {
+            observer: Arc::clone(&tracker) as Arc<dyn PositionObserver>,
+            ticker: Some(tracker),
+        }
+    }
+
+    /// Nessuno stato di movimento: le posizioni si persistono e basta.
+    ///
+    /// Senza tracciatore non c'e' nulla da far avanzare, quindi il task periodico non
+    /// viene nemmeno avviato.
+    pub fn inerte() -> Self {
+        Self {
+            observer: Arc::new(NoopObserver),
+            ticker: None,
         }
     }
 }
@@ -258,6 +323,11 @@ pub struct ConnectionContext {
     pub clock: Arc<dyn Clock>,
     /// Destinatario degli eventi di sessione e di posizione.
     pub observer: Arc<dyn PositionObserver>,
+    /// Macchina a stati che il task periodico fa avanzare, se e' collegata.
+    ///
+    /// E' lo stesso oggetto di [`observer`](Self::observer) quando c'e': vedi
+    /// [`Osservazione`] e la nota nel modulo.
+    pub ticker: Option<Arc<StateTracker>>,
     /// Parametri di costo dell'hashing delle password.
     pub auth: AuthConfig,
     /// Scadenze del ciclo di vita.
@@ -512,23 +582,31 @@ pub async fn run(
     sessions: Arc<SessionStore>,
     registry: Arc<ConnectionRegistry>,
     clock: Arc<dyn Clock>,
-    observer: Arc<dyn PositionObserver>,
+    osservazione: Osservazione,
     shutdown: broadcast::Sender<()>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
     let indirizzo = listener.local_addr()?;
     tracing::info!(%indirizzo, "server in ascolto");
 
+    let Osservazione { observer, ticker } = osservazione;
     let contesto = Arc::new(ConnectionContext {
         repo,
         sessions,
         registry,
         clock,
         observer,
+        ticker,
         auth: AuthConfig::default(),
         timeouts: ConnectionTimeouts::default(),
     });
     let mut spegnimento = shutdown.subscribe();
+
+    // Senza macchina a stati non c'e' nulla da far avanzare: il task non si avvia
+    // affatto, invece di svegliarsi ogni dieci secondi per non fare niente.
+    if contesto.ticker.is_some() {
+        tokio::spawn(batti_gli_stati(Arc::clone(&contesto), shutdown.subscribe()));
+    }
 
     loop {
         tokio::select! {
@@ -555,6 +633,54 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Fa avanzare la macchina a stati a intervalli regolari fino allo spegnimento.
+///
+/// E' il percorso del requisito R5: [`StateTracker::tick`] dice chi non si sposta da
+/// [`STILL_AFTER_SECS`] secondi, e ognuno di quei cambi va al diretto interessato
+/// attraverso il registro. Un utente che nel frattempo si e' disconnesso non e' un caso
+/// da trattare: [`ConnectionRegistry::send_to`] risponde falso e il giro prosegue.
+///
+/// Il task non ha una scadenza propria: dorme quasi sempre, e l'unica cosa che deve
+/// farlo terminare e' il segnale di spegnimento.
+///
+/// Senza tracciatore esce subito, ma il caso non dovrebbe presentarsi: chi lo avvia lo
+/// fa solo quando [`ConnectionContext::ticker`] e' presente.
+///
+/// [`STILL_AFTER_SECS`]: georuggine_common::types::STILL_AFTER_SECS
+async fn batti_gli_stati(contesto: Arc<ConnectionContext>, mut shutdown: broadcast::Receiver<()>) {
+    let Some(tracciatore) = contesto.ticker.clone() else {
+        return;
+    };
+
+    let mut battito = tokio::time::interval(contesto.timeouts.tick_interval);
+    // La prima scadenza di `interval` matura subito: la si consuma qui, altrimenti il
+    // primo passaggio avverrebbe all'avvio del server, quando non c'e' ancora nessuno.
+    battito.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => {
+                tracing::info!("spegnimento: la macchina a stati smette di battere");
+                return;
+            }
+            _ = battito.tick() => {
+                for (user_id, stato) in tracciatore.tick() {
+                    let recapitato = contesto
+                        .registry
+                        .send_to(user_id, ServerMessage::StateChanged { state: stato })
+                        .await;
+                    if !recapitato {
+                        tracing::debug!(
+                            utente = user_id.0,
+                            "cambio di stato non recapitato: l'utente non e' piu' connesso"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Segue una connessione dall'apertura alla chiusura.
@@ -1056,11 +1182,10 @@ mod tests {
 
     use chrono::TimeDelta;
     use georuggine_common::clock::FakeClock;
-    use georuggine_common::types::UserState;
+    use georuggine_common::types::{STILL_AFTER_SECS, UserState};
     use tokio_util::bytes::Bytes;
     use tokio_util::codec::BytesCodec;
 
-    use crate::observer::NoopObserver;
     use crate::storage::InMemoryRepository;
 
     /// Quanto un test aspetta una risposta prima di considerarla mancata.
@@ -1068,6 +1193,14 @@ mod tests {
     /// E' generoso perche' lo si paga solo quando il test sta gia' fallendo: nel caso
     /// normale la risposta arriva in pochi millisecondi.
     const ATTESA: Duration = Duration::from_secs(5);
+
+    /// Intervallo del task periodico nei test.
+    ///
+    /// Va accorciato perche' e' tempo vero, che nessun orologio finto puo' saltare: e'
+    /// solo la frequenza con cui il task si sveglia. La scadenza dei tre minuti e'
+    /// invece tempo di dominio, che i test spostano con [`FakeClock::advance`] senza
+    /// aspettare: [`STILL_AFTER_SECS`] resta percio' il valore di produzione.
+    const TICK_DI_PROVA: Duration = Duration::from_millis(50);
 
     /// Password che rispetta la policy di [`crate::auth::valida_password`].
     const PASSWORD: &str = "scorta12";
@@ -1084,7 +1217,13 @@ mod tests {
             handshake: Duration::from_millis(200),
             idle: Duration::from_secs(30),
             shutdown: Duration::from_millis(200),
+            tick_interval: TICK_DI_PROVA,
         }
+    }
+
+    /// Un secondo oltre la soglia di ritorno a fermo, nel tipo di chrono.
+    fn oltre_la_soglia_di_fermo() -> TimeDelta {
+        TimeDelta::seconds(i64::try_from(STILL_AFTER_SECS).expect("la soglia entra in i64") + 1)
     }
 
     /// Parametri di Argon2 al minimo: l'hashing di produzione e' lento apposta.
@@ -1191,34 +1330,62 @@ mod tests {
         orologio: Arc<FakeClock>,
         /// Segnale di spegnimento propagato ai gestori.
         spegnimento: broadcast::Sender<()>,
+        /// Task periodico della macchina a stati, presente solo se c'e' un ticker.
+        ///
+        /// Il test lo attende per verificare che lo spegnimento lo faccia terminare.
+        battito: Option<JoinHandle<()>>,
     }
 
     async fn avvia_banco() -> Banco {
-        avvia_banco_completo(tempi(), Arc::new(NoopObserver)).await
+        avvia_banco_completo(tempi(), |_| Osservazione::inerte()).await
     }
 
     async fn avvia_banco_con(timeouts: ConnectionTimeouts) -> Banco {
-        avvia_banco_completo(timeouts, Arc::new(NoopObserver)).await
+        avvia_banco_completo(timeouts, |_| Osservazione::inerte()).await
     }
 
     async fn avvia_banco_osservato(observer: Arc<dyn PositionObserver>) -> Banco {
-        avvia_banco_completo(tempi(), observer).await
+        avvia_banco_completo(tempi(), move |_| Osservazione {
+            observer,
+            ticker: None,
+        })
+        .await
     }
 
-    async fn avvia_banco_completo(
-        timeouts: ConnectionTimeouts,
-        observer: Arc<dyn PositionObserver>,
-    ) -> Banco {
+    /// Banco con la macchina a stati vera e il suo task periodico.
+    ///
+    /// Il tracciatore riceve l'orologio del banco, come in produzione riceve quello del
+    /// processo: spostando `banco.orologio` il test muove anche il tempo su cui la
+    /// macchina a stati misura i tre minuti.
+    async fn avvia_banco_con_stati() -> Banco {
+        avvia_banco_completo(tempi(), |orologio| {
+            Osservazione::con_stati(Arc::new(StateTracker::new(orologio)))
+        })
+        .await
+    }
+
+    /// Monta un banco il cui osservatore puo' dipendere dall'orologio del banco stesso.
+    ///
+    /// L'osservatore arriva come funzione e non come valore perche' la macchina a stati
+    /// va costruita sull'orologio finto creato qui: darla gia' fatta costringerebbe il
+    /// chiamante a creare un secondo orologio, e il tempo del tracciatore non sarebbe
+    /// quello che il test sposta.
+    async fn avvia_banco_completo<F>(timeouts: ConnectionTimeouts, osservazione: F) -> Banco
+    where
+        F: FnOnce(Arc<dyn Clock>) -> Osservazione,
+    {
         let orologio = Arc::new(FakeClock::new(istante_base()));
         let sorgente: Arc<dyn Clock> = orologio.clone();
         let repo: Arc<dyn Repository> = Arc::new(InMemoryRepository::new(Arc::clone(&sorgente)));
 
+        let Osservazione { observer, ticker } = osservazione(Arc::clone(&sorgente));
         let contesto = Arc::new(ConnectionContext {
             repo,
             sessions: Arc::new(SessionStore::new()),
             registry: Arc::new(ConnectionRegistry::new()),
             clock: sorgente,
             observer,
+            ticker,
             auth: autenticazione(),
             timeouts,
         });
@@ -1228,6 +1395,15 @@ mod tests {
             .await
             .expect("bind sulla porta effimera riuscito");
         let indirizzo = listener.local_addr().expect("indirizzo locale disponibile");
+
+        // Il banco monta il task periodico alle stesse condizioni di `run`: solo se c'e'
+        // una macchina a stati da far avanzare.
+        let battito = contesto.ticker.is_some().then(|| {
+            tokio::spawn(batti_gli_stati(
+                Arc::clone(&contesto),
+                spegnimento.subscribe(),
+            ))
+        });
 
         let condiviso = Arc::clone(&contesto);
         let segnale = spegnimento.clone();
@@ -1247,6 +1423,7 @@ mod tests {
             contesto,
             orologio,
             spegnimento,
+            battito,
         }
     }
 
@@ -1264,6 +1441,15 @@ mod tests {
                     istante_base() + TimeDelta::days(1),
                 )
                 .expect("lettura delle posizioni riuscita")
+        }
+
+        /// Stato che la macchina a stati del banco attribuisce all'utente.
+        fn stato_di(&self, user_id: UserId) -> Option<UserState> {
+            self.contesto
+                .ticker
+                .as_ref()
+                .expect("il banco di questo test deve avere una macchina a stati")
+                .current_state(user_id)
         }
     }
 
@@ -2068,6 +2254,139 @@ mod tests {
         assert_eq!(osservatore.connessioni(), 0);
         assert_eq!(osservatore.disconnessioni(), 0);
         assert!(banco.contesto.registry.connected_users().await.is_empty());
+    }
+
+    // --- macchina a stati collegata ---
+
+    /// Porta in [`UserState::Moving`] l'utente della connessione, con due posizioni.
+    ///
+    /// La prima non ha un precedente con cui confrontarsi e produce il solo Ack; la
+    /// seconda dista un centinaio di metri, quindi oltre la soglia di movimento, e porta
+    /// con se' il cambio di stato.
+    async fn porta_in_movimento(cliente: &mut Cliente) {
+        for offset in [0, 1] {
+            cliente
+                .invia(ClientMessage::Position {
+                    coordinate: punto(offset),
+                    recorded_at: istante_base(),
+                })
+                .await;
+            assert_eq!(
+                cliente.ricevi().await,
+                ServerMessage::Ack {
+                    request: AckKind::Position
+                }
+            );
+        }
+
+        assert_eq!(
+            cliente.ricevi().await,
+            ServerMessage::StateChanged {
+                state: UserState::Moving
+            },
+            "la preparazione del test deve lasciare l'utente in movimento"
+        );
+    }
+
+    #[tokio::test]
+    async fn il_task_periodico_riporta_a_fermo_chi_smette_di_inviare() {
+        let banco = avvia_banco_con_stati().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+        porta_in_movimento(&mut cliente).await;
+
+        // Da qui il client non invia piu' nulla: il tempo di dominio scavalca la soglia
+        // e l'unica cosa che possa ancora produrre un messaggio e' il task periodico.
+        banco.orologio.advance(oltre_la_soglia_di_fermo());
+
+        assert_eq!(
+            cliente.ricevi().await,
+            ServerMessage::StateChanged {
+                state: UserState::Still
+            },
+            "il ritorno a fermo arriva senza che il client abbia inviato altro"
+        );
+        assert_eq!(banco.stato_di(UserId(1)), Some(UserState::Still));
+    }
+
+    #[tokio::test]
+    async fn un_utente_disconnesso_non_riceve_altri_cambi_di_stato() {
+        let banco = avvia_banco_con_stati().await;
+
+        let mut uscente = Cliente::connetti(banco.indirizzo).await;
+        uscente.registra("veicolo_01").await;
+        porta_in_movimento(&mut uscente).await;
+
+        // Un secondo utente resta connesso: senza di lui il test non potrebbe distinguere
+        // un task che salta il disconnesso da un task che non gira affatto.
+        let mut presente = Cliente::connetti(banco.indirizzo).await;
+        presente.registra("veicolo_02").await;
+        porta_in_movimento(&mut presente).await;
+
+        uscente.invia(ClientMessage::Logout).await;
+        assert!(matches!(
+            uscente.ricevi().await,
+            ServerMessage::Ack {
+                request: AckKind::Logout
+            }
+        ));
+        assert!(uscente.e_chiusa().await, "il logout chiude la connessione");
+
+        banco.orologio.advance(oltre_la_soglia_di_fermo());
+
+        assert_eq!(
+            presente.ricevi().await,
+            ServerMessage::StateChanged {
+                state: UserState::Still
+            }
+        );
+        assert_eq!(
+            banco.stato_di(UserId(1)),
+            Some(UserState::Disconnected),
+            "chi si e' disconnesso non torna fermo, quindi non c'e' nulla da recapitargli"
+        );
+
+        // Il task periodico e' sopravvissuto al giro: la connessione rimasta risponde
+        // ancora, e l'ordine della coda garantisce che in mezzo non sia passato altro.
+        presente.invia(ClientMessage::Ping).await;
+        assert_eq!(presente.ricevi().await, ServerMessage::Pong);
+    }
+
+    #[tokio::test]
+    async fn lo_spegnimento_ferma_il_task_periodico() {
+        let banco = avvia_banco_con_stati().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+        porta_in_movimento(&mut cliente).await;
+
+        // Prima si verifica che il task stia davvero girando: senza questo passaggio il
+        // test passerebbe anche con un task che esce subito, perche' anche quello
+        // termina.
+        banco.orologio.advance(oltre_la_soglia_di_fermo());
+        assert_eq!(
+            cliente.ricevi().await,
+            ServerMessage::StateChanged {
+                state: UserState::Still
+            }
+        );
+
+        banco
+            .spegnimento
+            .send(())
+            .expect("almeno un gestore e' in ascolto");
+
+        assert!(
+            cliente.e_chiusa().await,
+            "lo spegnimento chiude le connessioni anche con la macchina a stati attiva"
+        );
+
+        let battito = banco
+            .battito
+            .expect("il banco con gli stati monta il task periodico");
+        timeout(ATTESA, battito)
+            .await
+            .expect("il task periodico deve terminare allo spegnimento")
+            .expect("il task periodico non deve andare in panico");
     }
 
     // --- limite di frequenza ---
