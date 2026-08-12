@@ -10,4 +10,5 @@
 pub mod auth;
 pub mod cpu_time;
 pub mod net;
+pub mod observer;
 pub mod storage;
