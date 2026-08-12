@@ -70,14 +70,18 @@ const BIND_PREDEFINITO: &str = "127.0.0.1:7878";
 /// File di persistenza predefinito.
 const DB_PREDEFINITO: &str = "georuggine.db";
 
+/// Cartella predefinita dei log, relativa alla directory di lavoro.
+const LOG_DIR_PREDEFINITA: &str = "logs";
+
 /// Testo mostrato da `--help`.
 pub const USO: &str = "\
 Uso: georuggine-server [OPZIONI]
 
 Opzioni:
-  --bind <INDIRIZZO>  indirizzo e porta di ascolto (predefinito 127.0.0.1:7878)
-  --db <PERCORSO>     file SQLite della persistenza (predefinito georuggine.db)
-  --help              mostra questo messaggio ed esce
+  --bind <INDIRIZZO>    indirizzo e porta di ascolto (predefinito 127.0.0.1:7878)
+  --db <PERCORSO>       file SQLite della persistenza (predefinito georuggine.db)
+  --log-dir <PERCORSO>  cartella dei log del tempo di CPU (predefinito logs)
+  --help                mostra questo messaggio ed esce
 ";
 
 /// Errore nell'analisi degli argomenti da riga di comando.
@@ -106,18 +110,23 @@ pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     /// File SQLite in cui persistere utenti, posizioni e messaggi.
     pub db_path: PathBuf,
+    /// Cartella in cui scrivere i log del tempo di CPU.
+    ///
+    /// Se relativa, si intende rispetto alla directory di lavoro del processo.
+    pub log_dir: PathBuf,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            // I due valori predefiniti sono costanti testuali valide per costruzione;
+            // I valori predefiniti sono costanti testuali valide per costruzione;
             // se non lo fossero il server partirebbe comunque, sull'indirizzo di
             // ripiego, invece di andare in panico all'avvio.
             bind_addr: BIND_PREDEFINITO
                 .parse()
                 .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 7878))),
             db_path: PathBuf::from(DB_PREDEFINITO),
+            log_dir: PathBuf::from(LOG_DIR_PREDEFINITA),
         }
     }
 }
@@ -167,6 +176,10 @@ impl ServerConfig {
                 "--db" => {
                     let valore = voci.next().ok_or(ArgsError::ValoreMancante("--db"))?;
                     configurazione.db_path = PathBuf::from(valore);
+                }
+                "--log-dir" => {
+                    let valore = voci.next().ok_or(ArgsError::ValoreMancante("--log-dir"))?;
+                    configurazione.log_dir = PathBuf::from(valore);
                 }
                 altro => return Err(ArgsError::OpzioneSconosciuta(altro.to_owned())),
             }
@@ -274,6 +287,28 @@ impl ConnectionRegistry {
             Some(mittente) => mittente.send(message).await.is_ok(),
             None => false,
         }
+    }
+
+    /// Recapita lo stesso messaggio a tutte le connessioni registrate.
+    ///
+    /// Restituisce il numero di destinatari a cui il messaggio e' stato accodato. Il
+    /// fallimento di uno non ferma gli altri: chi non e' raggiungibile viene saltato e
+    /// semplicemente non conteggiato.
+    ///
+    /// A differenza di [`send_to`](Self::send_to) l'accodamento non attende: un
+    /// destinatario che legge troppo piano perde il messaggio invece di sospendere il
+    /// broadcast verso tutti gli altri, che con una coda piena resterebbero in attesa
+    /// del piu' lento.
+    pub async fn broadcast_all(&self, message: ServerMessage) -> usize {
+        // Come in `send_to`, i mittenti si clonano dentro la sezione critica e si usano
+        // fuori: il lock non deve restare preso per tutta la durata degli invii.
+        let destinatari: Vec<mpsc::Sender<ServerMessage>> =
+            self.connessioni.read().await.values().cloned().collect();
+
+        destinatari
+            .iter()
+            .filter(|mittente| mittente.try_send(message.clone()).is_ok())
+            .count()
     }
 
     /// Utenti con una connessione aperta, in ordine di id crescente.
@@ -998,8 +1033,49 @@ mod tests {
         let atteso = ServerConfig {
             bind_addr: "0.0.0.0:9000".parse().expect("indirizzo di test valido"),
             db_path: PathBuf::from("flotta.sqlite3"),
+            log_dir: PathBuf::from("logs"),
         };
         assert_eq!(avvio, Avvio::Configurato(atteso));
+    }
+
+    #[test]
+    fn senza_log_dir_vale_la_cartella_predefinita() {
+        let avvio = ServerConfig::from_args(argomenti(&[])).expect("analisi riuscita");
+        assert_eq!(
+            avvio,
+            Avvio::Configurato(ServerConfig {
+                log_dir: PathBuf::from("logs"),
+                ..ServerConfig::default()
+            })
+        );
+    }
+
+    #[test]
+    fn log_dir_sovrascrive_la_cartella_predefinita() {
+        let avvio = ServerConfig::from_args(argomenti(&["--log-dir", "/var/log/georuggine"]))
+            .expect("analisi riuscita");
+
+        let atteso = ServerConfig {
+            log_dir: PathBuf::from("/var/log/georuggine"),
+            ..ServerConfig::default()
+        };
+        assert_eq!(avvio, Avvio::Configurato(atteso));
+    }
+
+    #[test]
+    fn log_dir_senza_valore_e_un_errore() {
+        assert!(matches!(
+            ServerConfig::from_args(argomenti(&["--log-dir"])),
+            Err(ArgsError::ValoreMancante("--log-dir"))
+        ));
+    }
+
+    #[test]
+    fn l_uso_documenta_log_dir() {
+        assert!(
+            USO.contains("--log-dir <PERCORSO>"),
+            "il testo di aiuto deve elencare --log-dir"
+        );
     }
 
     #[test]
@@ -1062,6 +1138,59 @@ mod tests {
 
         registro.unregister(UserId(1)).await;
         assert_eq!(registro.connected_users().await, vec![UserId(2)]);
+    }
+
+    #[tokio::test]
+    async fn broadcast_all_raggiunge_tutte_le_connessioni() {
+        let registro = ConnectionRegistry::new();
+        let (primo, mut primo_ricevitore) = mpsc::channel(4);
+        let (secondo, mut secondo_ricevitore) = mpsc::channel(4);
+        let (terzo, mut terzo_ricevitore) = mpsc::channel(4);
+        registro.register(UserId(1), primo).await;
+        registro.register(UserId(2), secondo).await;
+        registro.register(UserId(3), terzo).await;
+
+        assert_eq!(registro.broadcast_all(ServerMessage::Pong).await, 3);
+
+        assert_eq!(primo_ricevitore.recv().await, Some(ServerMessage::Pong));
+        assert_eq!(secondo_ricevitore.recv().await, Some(ServerMessage::Pong));
+        assert_eq!(terzo_ricevitore.recv().await, Some(ServerMessage::Pong));
+    }
+
+    #[tokio::test]
+    async fn broadcast_all_senza_connessioni_non_raggiunge_nessuno() {
+        let registro = ConnectionRegistry::new();
+
+        assert_eq!(registro.broadcast_all(ServerMessage::Pong).await, 0);
+    }
+
+    #[tokio::test]
+    async fn broadcast_all_prosegue_oltre_un_destinatario_irraggiungibile() {
+        let registro = ConnectionRegistry::new();
+        let (primo, mut primo_ricevitore) = mpsc::channel(4);
+        // Capacita' uno e un messaggio gia' accodato: la coda e' piena senza doverne
+        // inviare a migliaia. Il ricevitore resta vivo, cosi' il canale e' pieno e non
+        // chiuso, che sono due motivi diversi di fallimento.
+        let (pieno, _pieno_ricevitore) = mpsc::channel(1);
+        pieno
+            .send(ServerMessage::Welcome {
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .await
+            .expect("la prima accodata riempie la coda");
+        let (terzo, mut terzo_ricevitore) = mpsc::channel(4);
+        registro.register(UserId(1), primo).await;
+        registro.register(UserId(2), pieno).await;
+        registro.register(UserId(3), terzo).await;
+
+        assert_eq!(
+            registro.broadcast_all(ServerMessage::Pong).await,
+            2,
+            "il destinatario con la coda piena non va contato"
+        );
+
+        assert_eq!(primo_ricevitore.recv().await, Some(ServerMessage::Pong));
+        assert_eq!(terzo_ricevitore.recv().await, Some(ServerMessage::Pong));
     }
 
     // --- handshake ---
