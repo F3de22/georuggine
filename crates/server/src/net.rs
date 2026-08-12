@@ -31,6 +31,14 @@
 //! voce dal registro, o sostituirla, chiude davvero la connessione; se il gestore
 //! tenesse un mittente forte, il canale resterebbe vivo e la vecchia connessione non si
 //! chiuderebbe mai.
+//!
+//! # Stato condiviso e stato di una connessione
+//!
+//! Le dipendenze che tutte le connessioni usano stanno in [`ConnectionContext`], dietro
+//! un solo [`Arc`]. Cio' che riguarda una connessione sola sta invece in
+//! [`StatoConnessione`], che vive nel suo gestore: la sessione aperta e il [`Limitatore`]
+//! delle posizioni. Il limite di frequenza e' per connessione, quindi tenerlo li' evita
+//! sia un lock sia una mappa per utente.
 
 use std::collections::HashMap;
 use std::io;
@@ -39,21 +47,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt as _, StreamExt as _};
+use georuggine_common::clock::Clock;
 use georuggine_common::codec::{ClientCodec, ServerCodec};
 use georuggine_common::protocol::{
     AckKind, ClientMessage, ErrorCode, PROTOCOL_VERSION, ServerMessage,
 };
-use georuggine_common::types::{UserId, Username};
+use georuggine_common::types::{Coordinate, PositionRecord, UserId, Username};
 use thiserror::Error;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, broadcast, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{self, JoinHandle};
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::auth::{self, AuthConfig, AuthError, SessionStore, SessionToken};
+use crate::observer::PositionObserver;
 use crate::storage::Repository;
 
 /// Messaggi che possono attendere in coda verso un client prima che le scritture
@@ -63,6 +74,25 @@ use crate::storage::Repository;
 /// di quanto il server produca: raggiunta la capacita', chi invia attende invece di
 /// accumulare.
 const CAPACITA_CODA: usize = 32;
+
+/// Posizioni che una connessione puo' far accettare in una finestra di
+/// [`FINESTRA_SECS`] secondi.
+///
+/// Un veicolo invia la propria posizione ogni pochi secondi, quindi dieci al minuto
+/// coprono il ritmo previsto con margine; oltre, o il client e' guasto o sta provando a
+/// riempire il database, e in nessuno dei due casi il server ha motivo di scrivere.
+const MAX_POSIZIONI_PER_FINESTRA: u32 = 10;
+
+/// Durata in secondi della finestra su cui si conta [`MAX_POSIZIONI_PER_FINESTRA`].
+const FINESTRA_SECS: i64 = 60;
+
+/// Anticipo massimo, in secondi, che si tollera su `recorded_at`.
+///
+/// L'istante lo misura il client, il cui orologio non e' sincronizzato con quello del
+/// server: qualche minuto di scarto e' normale e non va buttato via. Una rilevazione
+/// datata molto piu' avanti non e' invece spiegabile con la deriva di un orologio, e
+/// accettarla sposterebbe in avanti le analisi di tutto lo storico.
+const ANTICIPO_MASSIMO_SECS: i64 = 300;
 
 /// Indirizzo di ascolto predefinito.
 const BIND_PREDEFINITO: &str = "127.0.0.1:7878";
@@ -224,6 +254,10 @@ pub struct ConnectionContext {
     pub sessions: Arc<SessionStore>,
     /// Registro delle connessioni aperte, una per utente.
     pub registry: Arc<ConnectionRegistry>,
+    /// Sorgente dell'ora: il gestore non chiama mai `Utc::now()` da se'.
+    pub clock: Arc<dyn Clock>,
+    /// Destinatario degli eventi di sessione e di posizione.
+    pub observer: Arc<dyn PositionObserver>,
     /// Parametri di costo dell'hashing delle password.
     pub auth: AuthConfig,
     /// Scadenze del ciclo di vita.
@@ -392,6 +426,76 @@ struct Sessione {
     token: SessionToken,
 }
 
+/// Contatore a finestra fissa che limita le posizioni accettate da una connessione.
+///
+/// La finestra parte dal primo messaggio dopo l'apertura di quella precedente e dura
+/// [`FINESTRA_SECS`] secondi; a scadenza il conteggio riparte da zero. E' la forma piu'
+/// semplice di limitazione, e ha il difetto noto delle finestre fisse: a cavallo di due
+/// finestre contigue si possono far passare fino al doppio delle richieste in poco
+/// tempo. Non e' un problema qui, perche' il limite serve a fermare un client che invia
+/// senza sosta, non a spianare il traffico al secondo.
+///
+/// Vive nello stato della singola connessione e non nel contesto condiviso: il limite e'
+/// per connessione, quindi non serve ne' un lock ne' una mappa per utente.
+struct Limitatore {
+    /// Istante di inizio della finestra corrente.
+    inizio: DateTime<Utc>,
+    /// Posizioni gia' conteggiate in questa finestra.
+    conteggio: u32,
+}
+
+impl Limitatore {
+    /// Apre la prima finestra all'istante indicato.
+    fn nuovo(adesso: DateTime<Utc>) -> Self {
+        Self {
+            inizio: adesso,
+            conteggio: 0,
+        }
+    }
+
+    /// Conta una posizione e dice se sta dentro il limite.
+    ///
+    /// Il conteggio comprende anche le posizioni che verranno poi rifiutate perche'
+    /// malformate: il limite riguarda i messaggi che il client invia, e non contarle
+    /// lascerebbe a un client difettoso la possibilita' di chiamare il server quanto
+    /// vuole purche' sbagli i dati.
+    ///
+    /// Un orologio che tornasse indietro non riaprirebbe la finestra: la differenza
+    /// diventa negativa e il conteggio prosegue, che e' il comportamento prudente.
+    fn consenti(&mut self, adesso: DateTime<Utc>) -> bool {
+        if adesso.signed_duration_since(self.inizio).num_seconds() >= FINESTRA_SECS {
+            self.inizio = adesso;
+            self.conteggio = 0;
+        }
+
+        if self.conteggio < MAX_POSIZIONI_PER_FINESTRA {
+            // Non puo' traboccare: il ramo si prende solo sotto il limite.
+            self.conteggio += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Stato che vive quanto una connessione e non e' condiviso con le altre.
+struct StatoConnessione {
+    /// Sessione aperta, presente solo dopo un'autenticazione riuscita.
+    sessione: Option<Sessione>,
+    /// Limite di frequenza delle posizioni di questa connessione.
+    limitatore: Limitatore,
+}
+
+impl StatoConnessione {
+    /// Stato di una connessione appena aperta, senza sessione.
+    fn nuovo(adesso: DateTime<Utc>) -> Self {
+        Self {
+            sessione: None,
+            limitatore: Limitatore::nuovo(adesso),
+        }
+    }
+}
+
 /// Accetta connessioni finche' non arriva il segnale di spegnimento.
 ///
 /// L'indirizzo effettivo viene registrato nel log: con la porta 0 non coincide con
@@ -407,6 +511,8 @@ pub async fn run(
     repo: Arc<dyn Repository>,
     sessions: Arc<SessionStore>,
     registry: Arc<ConnectionRegistry>,
+    clock: Arc<dyn Clock>,
+    observer: Arc<dyn PositionObserver>,
     shutdown: broadcast::Sender<()>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
@@ -417,6 +523,8 @@ pub async fn run(
         repo,
         sessions,
         registry,
+        clock,
+        observer,
         auth: AuthConfig::default(),
         timeouts: ConnectionTimeouts::default(),
     });
@@ -471,13 +579,13 @@ pub async fn handle_connection(
     ));
 
     let mut uscita = Uscita::Propria(mittente);
-    let mut sessione = None;
+    let mut stato = StatoConnessione::nuovo(contesto.clock.now());
 
     if handshake(&mut ingresso, &uscita, &contesto, peer).await {
         dialogo(
             &mut ingresso,
             &mut uscita,
-            &mut sessione,
+            &mut stato,
             &contesto,
             &mut shutdown,
             &mut scrittore,
@@ -488,7 +596,7 @@ pub async fn handle_connection(
 
     // La sessione va sganciata qualunque sia il motivo della chiusura: logout, silenzio,
     // spegnimento o errore. `chiudi_sessione` non fa nulla se e' gia' stata sganciata.
-    chiudi_sessione(&mut sessione, &uscita, &contesto).await;
+    chiudi_sessione(&mut stato.sessione, &uscita, &contesto).await;
 
     // Caduto anche l'ultimo mittente, il task di scrittura svuota la coda e chiude il
     // socket in modo ordinato. Si aspetta, ma non oltre la scadenza: un peer che non
@@ -587,7 +695,7 @@ async fn handshake(
 async fn dialogo(
     ingresso: &mut FramedRead<OwnedReadHalf, ClientCodec>,
     uscita: &mut Uscita,
-    sessione: &mut Option<Sessione>,
+    stato: &mut StatoConnessione,
     contesto: &ConnectionContext,
     shutdown: &mut broadcast::Receiver<()>,
     scrittore: &mut JoinHandle<()>,
@@ -622,7 +730,7 @@ async fn dialogo(
                     Ok(Some(Ok(messaggio))) => messaggio,
                 };
 
-                if !servi(messaggio, uscita, sessione, contesto, peer).await {
+                if !servi(messaggio, uscita, stato, contesto, peer).await {
                     return;
                 }
             }
@@ -634,18 +742,34 @@ async fn dialogo(
 async fn servi(
     messaggio: ClientMessage,
     uscita: &mut Uscita,
-    sessione: &mut Option<Sessione>,
+    stato: &mut StatoConnessione,
     contesto: &ConnectionContext,
     peer: SocketAddr,
 ) -> bool {
-    match (sessione.is_some(), messaggio) {
+    match (stato.sessione.is_some(), messaggio) {
         (false, ClientMessage::Register { username, password }) => {
             let esito = auth::register(&contesto.repo, &contesto.auth, &username, &password).await;
-            concludi_autenticazione(esito, &username, uscita, sessione, contesto, peer).await
+            concludi_autenticazione(
+                esito,
+                &username,
+                uscita,
+                &mut stato.sessione,
+                contesto,
+                peer,
+            )
+            .await
         }
         (false, ClientMessage::Login { username, password }) => {
             let esito = auth::login(&contesto.repo, &username, &password).await;
-            concludi_autenticazione(esito, &username, uscita, sessione, contesto, peer).await
+            concludi_autenticazione(
+                esito,
+                &username,
+                uscita,
+                &mut stato.sessione,
+                contesto,
+                peer,
+            )
+            .await
         }
         (false, _) => {
             uscita
@@ -664,16 +788,33 @@ async fn servi(
                     request: AckKind::Logout,
                 })
                 .await;
-            chiudi_sessione(sessione, uscita, contesto).await;
+            chiudi_sessione(&mut stato.sessione, uscita, contesto).await;
             tracing::info!(%peer, "logout richiesto dal client");
             false
         }
         (
             true,
-            ClientMessage::Position { .. }
-            | ClientMessage::TextToServer { .. }
-            | ClientMessage::RequestAnalysis { .. },
-        ) => {
+            ClientMessage::Position {
+                coordinate,
+                recorded_at,
+            },
+        ) => match stato.sessione.as_ref().map(|attiva| attiva.user_id) {
+            Some(user_id) => {
+                servi_posizione(
+                    user_id,
+                    coordinate,
+                    recorded_at,
+                    uscita,
+                    &mut stato.limitatore,
+                    contesto,
+                    peer,
+                )
+                .await
+            }
+            // Non raggiungibile: il ramo si sceglie proprio sulla presenza della sessione.
+            None => true,
+        },
+        (true, ClientMessage::TextToServer { .. } | ClientMessage::RequestAnalysis { .. }) => {
             uscita
                 .invia(ServerMessage::Error {
                     code: ErrorCode::Internal,
@@ -690,6 +831,102 @@ async fn servi(
                 })
                 .await
         }
+    }
+}
+
+/// Persiste una posizione e conferma al client; vero se la connessione resta aperta.
+///
+/// Requisito R3 della traccia. L'ordine dei controlli e' quello del costo crescente: il
+/// limite di frequenza non tocca nulla, la validazione dell'istante e' un confronto, e
+/// solo cio' che passa entrambi arriva al database. Nessuno dei due rifiuti chiude la
+/// connessione: sono errori della singola richiesta, non della sequenza, e un veicolo
+/// che sbaglia una rilevazione non ha motivo di riconnettersi.
+async fn servi_posizione(
+    user_id: UserId,
+    coordinate: Coordinate,
+    recorded_at: DateTime<Utc>,
+    uscita: &Uscita,
+    limitatore: &mut Limitatore,
+    contesto: &ConnectionContext,
+    peer: SocketAddr,
+) -> bool {
+    let adesso = contesto.clock.now();
+
+    if !limitatore.consenti(adesso) {
+        tracing::warn!(%peer, utente = user_id.0, "limite di posizioni superato");
+        return uscita
+            .invia(ServerMessage::Error {
+                code: ErrorCode::RateLimited,
+                message: format!(
+                    "al massimo {MAX_POSIZIONI_PER_FINESTRA} posizioni ogni {FINESTRA_SECS} secondi"
+                ),
+            })
+            .await;
+    }
+
+    // L'istante lo misura il client: va verificato prima di scriverlo, perche' una
+    // rilevazione datata nel futuro falserebbe ogni analisi calcolata sullo storico.
+    if recorded_at.signed_duration_since(adesso).num_seconds() > ANTICIPO_MASSIMO_SECS {
+        tracing::warn!(%peer, utente = user_id.0, %recorded_at, "posizione datata troppo avanti");
+        return uscita
+            .invia(ServerMessage::Error {
+                code: ErrorCode::MalformedMessage,
+                message: format!(
+                    "recorded_at e' piu' di {} minuti avanti rispetto all'ora del server",
+                    ANTICIPO_MASSIMO_SECS / 60
+                ),
+            })
+            .await;
+    }
+
+    let record = PositionRecord {
+        user_id,
+        coordinate,
+        recorded_at,
+    };
+    // Il repository e' sincrono: la scrittura va su un thread da lavoro, altrimenti
+    // fermerebbe un thread dell'esecutore per tutta la durata dell'accesso a SQLite.
+    let repo = Arc::clone(&contesto.repo);
+    let esito = task::spawn_blocking(move || repo.insert_position(&record)).await;
+
+    match esito {
+        Ok(Ok(())) => {}
+        Ok(Err(errore)) => {
+            // Il messaggio originale parla di tabelle e vincoli: al client va il solo
+            // codice, come per gli errori di autenticazione.
+            tracing::error!(%peer, utente = user_id.0, %errore, "posizione non persistita");
+            return uscita
+                .invia(ServerMessage::Error {
+                    code: ErrorCode::Internal,
+                    message: ErrorCode::Internal.to_string(),
+                })
+                .await;
+        }
+        Err(errore) => {
+            tracing::error!(%peer, %errore, "attivita' di scrittura non completata");
+            return uscita
+                .invia(ServerMessage::Error {
+                    code: ErrorCode::Internal,
+                    message: ErrorCode::Internal.to_string(),
+                })
+                .await;
+        }
+    }
+
+    if !uscita
+        .invia(ServerMessage::Ack {
+            request: AckKind::Position,
+        })
+        .await
+    {
+        return false;
+    }
+
+    // L'osservatore vede solo le posizioni davvero persistite, e viene interpellato dopo
+    // l'Ack: la conferma della richiesta non deve dipendere dallo stato di movimento.
+    match contesto.observer.on_position(user_id, coordinate) {
+        Some(state) => uscita.invia(ServerMessage::StateChanged { state }).await,
+        None => true,
     }
 }
 
@@ -752,6 +989,7 @@ async fn concludi_autenticazione(
         user_id,
         token: token.clone(),
     });
+    contesto.observer.on_connect(user_id);
     tracing::info!(%peer, utente = username.as_str(), "accesso riuscito");
 
     uscita
@@ -789,7 +1027,8 @@ fn risposta_a(errore: &AuthError) -> (ErrorCode, String) {
 /// Sgancia la sessione dallo store dei token e dal registro delle connessioni.
 ///
 /// Non fa nulla se la sessione e' gia' stata sganciata, cosi' il logout e la pulizia
-/// finale possono chiamarla entrambi.
+/// finale possono chiamarla entrambi: e' anche cio' che rende `on_disconnect` una
+/// notifica sola per connessione, qualunque sia il motivo della chiusura.
 async fn chiudi_sessione(
     sessione: &mut Option<Sessione>,
     uscita: &Uscita,
@@ -806,18 +1045,22 @@ async fn chiudi_sessione(
             .unregister_se_propria(attiva.user_id, debole)
             .await;
     }
+    contesto.observer.on_disconnect(attiva.user_id);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use chrono::DateTime;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chrono::TimeDelta;
     use georuggine_common::clock::FakeClock;
-    use georuggine_common::types::Coordinate;
+    use georuggine_common::types::UserState;
     use tokio_util::bytes::Bytes;
     use tokio_util::codec::BytesCodec;
 
+    use crate::observer::NoopObserver;
     use crate::storage::InMemoryRepository;
 
     /// Quanto un test aspetta una risposta prima di considerarla mancata.
@@ -858,6 +1101,82 @@ mod tests {
         Username::new(nome).expect("username di test valido")
     }
 
+    /// Istante su cui e' fermo l'orologio finto dei test: 2024-01-01T00:00:00Z.
+    fn istante_base() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_704_067_200, 0).expect("istante valido")
+    }
+
+    /// Coordinata associata all'offset in secondi di una posizione di prova.
+    ///
+    /// Insieme a `recorded_at` fa da impronta del record: se il server persistesse la
+    /// posizione sbagliata, o la attribuisse a un altro utente, le coordinate rilette
+    /// dal repository non tornerebbero.
+    fn punto(offset: i64) -> Coordinate {
+        Coordinate::new(45.0 + offset as f64 / 1_000.0, 7.6869).expect("coordinata valida")
+    }
+
+    /// Osservatore di prova: conta le chiamate e restituisce uno stato programmato.
+    ///
+    /// I contatori sono atomici perche' il gestore della connessione li incrementa dal
+    /// proprio task mentre il test li legge dal suo. `Ordering::Relaxed` basta: i
+    /// contatori sono indipendenti fra loro e non fanno da guardia ad altri dati, e il
+    /// test li legge solo dopo aver visto una risposta del server, che e' gia' un punto
+    /// di sincronizzazione.
+    struct OsservatoreDiProva {
+        /// Stato restituito alla prima chiamata a `on_position`; dalla seconda in poi la
+        /// risposta e' sempre `None`.
+        primo_stato: Option<UserState>,
+        /// Quante volte e' stato segnalato l'ingresso di un utente.
+        connessioni: AtomicUsize,
+        /// Quante volte e' stata segnalata la chiusura di una sessione.
+        disconnessioni: AtomicUsize,
+        /// Quante posizioni sono arrivate all'osservatore.
+        posizioni: AtomicUsize,
+    }
+
+    impl OsservatoreDiProva {
+        /// Costruisce un osservatore che risponde `primo_stato` alla prima posizione.
+        fn nuovo(primo_stato: Option<UserState>) -> Self {
+            Self {
+                primo_stato,
+                connessioni: AtomicUsize::new(0),
+                disconnessioni: AtomicUsize::new(0),
+                posizioni: AtomicUsize::new(0),
+            }
+        }
+
+        fn connessioni(&self) -> usize {
+            self.connessioni.load(Ordering::Relaxed)
+        }
+
+        fn disconnessioni(&self) -> usize {
+            self.disconnessioni.load(Ordering::Relaxed)
+        }
+
+        fn posizioni(&self) -> usize {
+            self.posizioni.load(Ordering::Relaxed)
+        }
+    }
+
+    impl PositionObserver for OsservatoreDiProva {
+        fn on_position(&self, _user_id: UserId, _coordinate: Coordinate) -> Option<UserState> {
+            let precedenti = self.posizioni.fetch_add(1, Ordering::Relaxed);
+            if precedenti == 0 {
+                self.primo_stato
+            } else {
+                None
+            }
+        }
+
+        fn on_connect(&self, _user_id: UserId) {
+            self.connessioni.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_disconnect(&self, _user_id: UserId) {
+            self.disconnessioni.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Server di prova in ascolto su una porta effimera.
     ///
     /// Non usa [`run`] ma un ciclo di accept equivalente, per due motivi: la porta 0
@@ -868,23 +1187,38 @@ mod tests {
         indirizzo: SocketAddr,
         /// Dipendenze condivise, ispezionabili dal test.
         contesto: Arc<ConnectionContext>,
+        /// Orologio del server, che il test puo' spostare a mano.
+        orologio: Arc<FakeClock>,
         /// Segnale di spegnimento propagato ai gestori.
         spegnimento: broadcast::Sender<()>,
     }
 
     async fn avvia_banco() -> Banco {
-        avvia_banco_con(tempi()).await
+        avvia_banco_completo(tempi(), Arc::new(NoopObserver)).await
     }
 
     async fn avvia_banco_con(timeouts: ConnectionTimeouts) -> Banco {
-        let istante = DateTime::from_timestamp(1_704_067_200, 0).expect("istante valido");
-        let repo: Arc<dyn Repository> =
-            Arc::new(InMemoryRepository::new(Arc::new(FakeClock::new(istante))));
+        avvia_banco_completo(timeouts, Arc::new(NoopObserver)).await
+    }
+
+    async fn avvia_banco_osservato(observer: Arc<dyn PositionObserver>) -> Banco {
+        avvia_banco_completo(tempi(), observer).await
+    }
+
+    async fn avvia_banco_completo(
+        timeouts: ConnectionTimeouts,
+        observer: Arc<dyn PositionObserver>,
+    ) -> Banco {
+        let orologio = Arc::new(FakeClock::new(istante_base()));
+        let sorgente: Arc<dyn Clock> = orologio.clone();
+        let repo: Arc<dyn Repository> = Arc::new(InMemoryRepository::new(Arc::clone(&sorgente)));
 
         let contesto = Arc::new(ConnectionContext {
             repo,
             sessions: Arc::new(SessionStore::new()),
             registry: Arc::new(ConnectionRegistry::new()),
+            clock: sorgente,
+            observer,
             auth: autenticazione(),
             timeouts,
         });
@@ -911,7 +1245,25 @@ mod tests {
         Banco {
             indirizzo,
             contesto,
+            orologio,
             spegnimento,
+        }
+    }
+
+    impl Banco {
+        /// Posizioni persistite per l'utente, dall'inizio dei tempi del banco in poi.
+        ///
+        /// L'intervallo e' volutamente largo: un test che verifica cosa e' stato scritto
+        /// non deve poter fallire perche' la finestra di lettura era troppo stretta.
+        fn posizioni_di(&self, user_id: UserId) -> Vec<PositionRecord> {
+            self.contesto
+                .repo
+                .positions_in_range(
+                    user_id,
+                    istante_base() - TimeDelta::days(1),
+                    istante_base() + TimeDelta::days(1),
+                )
+                .expect("lettura delle posizioni riuscita")
         }
     }
 
@@ -1378,8 +1730,8 @@ mod tests {
 
         cliente
             .invia(ClientMessage::Position {
-                coordinate: Coordinate::new(45.0703, 7.6869).expect("coordinata valida"),
-                recorded_at: DateTime::from_timestamp(1_704_067_200, 0).expect("istante valido"),
+                coordinate: punto(0),
+                recorded_at: istante_base(),
             })
             .await;
 
@@ -1418,26 +1770,332 @@ mod tests {
         assert_eq!(cliente.ricevi().await, ServerMessage::Pong);
     }
 
+    // --- posizioni ---
+
     #[tokio::test]
-    async fn position_risponde_che_non_e_ancora_implementata() {
+    async fn tre_posizioni_valide_finiscono_nel_repository() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+        let t0 = istante_base();
+
+        for offset in [0, 10, 20] {
+            cliente
+                .invia(ClientMessage::Position {
+                    coordinate: punto(offset),
+                    recorded_at: t0 + TimeDelta::seconds(offset),
+                })
+                .await;
+            assert_eq!(
+                cliente.ricevi().await,
+                ServerMessage::Ack {
+                    request: AckKind::Position
+                }
+            );
+        }
+
+        let salvate = banco.posizioni_di(UserId(1));
+        assert_eq!(
+            salvate.iter().map(|p| p.recorded_at).collect::<Vec<_>>(),
+            vec![t0, t0 + TimeDelta::seconds(10), t0 + TimeDelta::seconds(20),]
+        );
+        for (posizione, offset) in salvate.iter().zip([0, 10, 20]) {
+            assert_eq!(
+                posizione.user_id,
+                UserId(1),
+                "la posizione va attribuita all'utente della sessione"
+            );
+            assert_eq!(posizione.coordinate, punto(offset));
+        }
+    }
+
+    #[tokio::test]
+    async fn una_posizione_troppo_nel_futuro_e_rifiutata_e_non_persistita() {
         let banco = avvia_banco().await;
         let mut cliente = Cliente::connetti(banco.indirizzo).await;
         cliente.registra("veicolo_01").await;
 
         cliente
             .invia(ClientMessage::Position {
-                coordinate: Coordinate::new(45.0703, 7.6869).expect("coordinata valida"),
-                recorded_at: DateTime::from_timestamp(1_704_067_200, 0).expect("istante valido"),
+                coordinate: punto(0),
+                recorded_at: istante_base() + TimeDelta::minutes(10),
             })
             .await;
 
         assert!(matches!(
             cliente.ricevi().await,
             ServerMessage::Error {
-                code: ErrorCode::Internal,
+                code: ErrorCode::MalformedMessage,
                 ..
             }
         ));
+        assert!(
+            banco.posizioni_di(UserId(1)).is_empty(),
+            "una posizione rifiutata non deve essere persistita"
+        );
+    }
+
+    #[tokio::test]
+    async fn una_posizione_appena_dentro_la_tolleranza_e_accettata() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        // Il limite e' l'anticipo massimo esatto: l'orologio del client puo' essere
+        // avanti di poco senza che le sue rilevazioni vengano buttate via.
+        cliente
+            .invia(ClientMessage::Position {
+                coordinate: punto(0),
+                recorded_at: istante_base() + TimeDelta::seconds(ANTICIPO_MASSIMO_SECS),
+            })
+            .await;
+
+        assert_eq!(
+            cliente.ricevi().await,
+            ServerMessage::Ack {
+                request: AckKind::Position
+            }
+        );
+        assert_eq!(banco.posizioni_di(UserId(1)).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn oltre_dieci_posizioni_al_minuto_arriva_rate_limited() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        for tentativo in 0..15 {
+            cliente
+                .invia(ClientMessage::Position {
+                    coordinate: punto(tentativo),
+                    recorded_at: istante_base(),
+                })
+                .await;
+
+            let risposta = cliente.ricevi().await;
+            if tentativo < i64::from(MAX_POSIZIONI_PER_FINESTRA) {
+                assert_eq!(
+                    risposta,
+                    ServerMessage::Ack {
+                        request: AckKind::Position
+                    },
+                    "la posizione {tentativo} sta dentro il limite"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        risposta,
+                        ServerMessage::Error {
+                            code: ErrorCode::RateLimited,
+                            ..
+                        }
+                    ),
+                    "la posizione {tentativo} supera il limite, ottenuto {risposta:?}"
+                );
+            }
+        }
+
+        // Il limite non chiude la connessione: lo si dimostra usandola.
+        cliente.invia(ClientMessage::Ping).await;
+        assert_eq!(cliente.ricevi().await, ServerMessage::Pong);
+
+        assert_eq!(
+            banco.posizioni_di(UserId(1)).len(),
+            usize::try_from(MAX_POSIZIONI_PER_FINESTRA).expect("il limite entra in usize"),
+            "le posizioni oltre il limite non vanno persistite"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_finestra_del_limite_riparte_dopo_un_minuto() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        for _ in 0..=MAX_POSIZIONI_PER_FINESTRA {
+            cliente
+                .invia(ClientMessage::Position {
+                    coordinate: punto(0),
+                    recorded_at: istante_base(),
+                })
+                .await;
+            cliente.ricevi().await;
+        }
+
+        banco.orologio.advance(TimeDelta::seconds(FINESTRA_SECS));
+        cliente
+            .invia(ClientMessage::Position {
+                coordinate: punto(0),
+                recorded_at: istante_base(),
+            })
+            .await;
+
+        assert_eq!(
+            cliente.ricevi().await,
+            ServerMessage::Ack {
+                request: AckKind::Position
+            },
+            "passata la finestra il conteggio riparte"
+        );
+    }
+
+    #[tokio::test]
+    async fn lo_stato_restituito_dall_osservatore_raggiunge_il_client() {
+        let osservatore = Arc::new(OsservatoreDiProva::nuovo(Some(UserState::Moving)));
+        let banco =
+            avvia_banco_osservato(Arc::clone(&osservatore) as Arc<dyn PositionObserver>).await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        cliente
+            .invia(ClientMessage::Position {
+                coordinate: punto(0),
+                recorded_at: istante_base(),
+            })
+            .await;
+
+        assert_eq!(
+            cliente.ricevi().await,
+            ServerMessage::Ack {
+                request: AckKind::Position
+            },
+            "l'Ack arriva comunque, prima dell'eventuale cambio di stato"
+        );
+        assert_eq!(
+            cliente.ricevi().await,
+            ServerMessage::StateChanged {
+                state: UserState::Moving
+            }
+        );
+
+        // Dalla seconda posizione l'osservatore non segnala piu' nulla: dopo l'Ack il
+        // client deve ricevere il Pong, non un altro StateChanged.
+        cliente
+            .invia(ClientMessage::Position {
+                coordinate: punto(1),
+                recorded_at: istante_base(),
+            })
+            .await;
+        assert_eq!(
+            cliente.ricevi().await,
+            ServerMessage::Ack {
+                request: AckKind::Position
+            }
+        );
+        cliente.invia(ClientMessage::Ping).await;
+        assert_eq!(cliente.ricevi().await, ServerMessage::Pong);
+    }
+
+    #[tokio::test]
+    async fn senza_cambio_di_stato_il_client_riceve_solo_ack() {
+        let osservatore = Arc::new(OsservatoreDiProva::nuovo(None));
+        let banco =
+            avvia_banco_osservato(Arc::clone(&osservatore) as Arc<dyn PositionObserver>).await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        for offset in 0..3 {
+            cliente
+                .invia(ClientMessage::Position {
+                    coordinate: punto(offset),
+                    recorded_at: istante_base(),
+                })
+                .await;
+            assert_eq!(
+                cliente.ricevi().await,
+                ServerMessage::Ack {
+                    request: AckKind::Position
+                }
+            );
+        }
+
+        // Un Pong subito dopo l'ultimo Ack dimostra che in mezzo non e' passato nessuno
+        // StateChanged: sarebbe arrivato prima, perche' la coda conserva l'ordine.
+        cliente.invia(ClientMessage::Ping).await;
+        assert_eq!(cliente.ricevi().await, ServerMessage::Pong);
+        assert_eq!(
+            osservatore.posizioni(),
+            3,
+            "l'osservatore va interpellato per ogni posizione persistita"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_connect_e_on_disconnect_valgono_una_volta_per_connessione() {
+        let osservatore = Arc::new(OsservatoreDiProva::nuovo(None));
+        let banco =
+            avvia_banco_osservato(Arc::clone(&osservatore) as Arc<dyn PositionObserver>).await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        assert_eq!(osservatore.connessioni(), 1);
+        assert_eq!(osservatore.disconnessioni(), 0);
+
+        cliente.invia(ClientMessage::Logout).await;
+        assert!(matches!(
+            cliente.ricevi().await,
+            ServerMessage::Ack {
+                request: AckKind::Logout
+            }
+        ));
+        // La chiusura del flusso arriva dopo lo sgancio della sessione: quando il client
+        // la vede, `on_disconnect` e' gia' stato chiamato.
+        assert!(cliente.e_chiusa().await);
+
+        assert_eq!(osservatore.connessioni(), 1);
+        assert_eq!(osservatore.disconnessioni(), 1);
+    }
+
+    #[tokio::test]
+    async fn una_connessione_mai_autenticata_non_muove_l_osservatore() {
+        let osservatore = Arc::new(OsservatoreDiProva::nuovo(None));
+        let banco =
+            avvia_banco_osservato(Arc::clone(&osservatore) as Arc<dyn PositionObserver>).await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        assert!(matches!(
+            cliente.saluta().await,
+            ServerMessage::Welcome { .. }
+        ));
+
+        // Chiudendo il client il gestore esce dal ciclo e passa dalla pulizia finale,
+        // che su una connessione senza sessione non deve segnalare nulla. L'attesa da'
+        // al gestore il tempo di arrivarci: senza, il test passerebbe anche se la
+        // pulizia sbagliasse, semplicemente perche' non e' ancora avvenuta.
+        drop(cliente);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(osservatore.connessioni(), 0);
+        assert_eq!(osservatore.disconnessioni(), 0);
+        assert!(banco.contesto.registry.connected_users().await.is_empty());
+    }
+
+    // --- limite di frequenza ---
+
+    #[test]
+    fn il_limitatore_ammette_dieci_posizioni_per_finestra() {
+        let t0 = istante_base();
+        let mut limitatore = Limitatore::nuovo(t0);
+
+        for _ in 0..MAX_POSIZIONI_PER_FINESTRA {
+            assert!(limitatore.consenti(t0));
+        }
+        assert!(!limitatore.consenti(t0));
+        assert!(
+            !limitatore.consenti(t0 + TimeDelta::seconds(FINESTRA_SECS - 1)),
+            "dentro la finestra il conteggio non riparte"
+        );
+    }
+
+    #[test]
+    fn il_limitatore_riapre_la_finestra_a_scadenza() {
+        let t0 = istante_base();
+        let mut limitatore = Limitatore::nuovo(t0);
+        for _ in 0..=MAX_POSIZIONI_PER_FINESTRA {
+            limitatore.consenti(t0);
+        }
+
+        assert!(limitatore.consenti(t0 + TimeDelta::seconds(FINESTRA_SECS)));
     }
 
     #[tokio::test]

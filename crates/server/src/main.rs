@@ -10,9 +10,10 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use georuggine_common::clock::SystemClock;
+use georuggine_common::clock::{Clock, SystemClock};
 use georuggine_server::auth::SessionStore;
 use georuggine_server::net::{self, Avvio, ConnectionRegistry, ServerConfig};
+use georuggine_server::observer::{NoopObserver, PositionObserver};
 use georuggine_server::storage::{Repository, SqliteRepository};
 use tokio::sync::broadcast;
 
@@ -59,14 +60,20 @@ async fn main() -> ExitCode {
 /// L'errore di apertura del database o quello di ascolto sull'indirizzo richiesto: sono
 /// i due casi in cui il server non puo' partire.
 async fn avvia(config: ServerConfig) -> anyhow::Result<()> {
+    // Un solo orologio per tutto il processo: la persistenza e il livello di rete devono
+    // datare gli stessi fatti allo stesso modo.
+    let orologio: Arc<dyn Clock> = Arc::new(SystemClock);
     let repo: Arc<dyn Repository> = Arc::new(SqliteRepository::new(
         &config.db_path,
-        Arc::new(SystemClock),
+        Arc::clone(&orologio),
     )?);
     tracing::info!(database = %config.db_path.display(), "persistenza aperta");
 
     let sessions = Arc::new(SessionStore::new());
     let registry = Arc::new(ConnectionRegistry::new());
+    // Lo stato di movimento non e' ancora calcolato: fino ad allora le posizioni vengono
+    // solo persistite, e nessun cambio di stato raggiunge i client.
+    let observer: Arc<dyn PositionObserver> = Arc::new(NoopObserver);
     let (spegnimento, _) = broadcast::channel(CAPACITA_SPEGNIMENTO);
 
     // L'attesa del segnale vive in un task suo: `run` deve restare libera di accettare
@@ -86,7 +93,16 @@ async fn avvia(config: ServerConfig) -> anyhow::Result<()> {
         }
     });
 
-    net::run(config, repo, sessions, registry, spegnimento).await?;
+    net::run(
+        config,
+        repo,
+        sessions,
+        registry,
+        orologio,
+        observer,
+        spegnimento,
+    )
+    .await?;
 
     Ok(())
 }
