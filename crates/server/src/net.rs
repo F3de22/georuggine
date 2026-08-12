@@ -67,7 +67,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use georuggine_common::clock::Clock;
 use georuggine_common::codec::{ClientCodec, ServerCodec};
 use georuggine_common::protocol::{
-    AckKind, ClientMessage, ErrorCode, PROTOCOL_VERSION, ServerMessage,
+    AckKind, AnalysisRange, ClientMessage, ErrorCode, PROTOCOL_VERSION, ServerMessage,
 };
 use georuggine_common::types::{Coordinate, PositionRecord, UserId, Username};
 use thiserror::Error;
@@ -78,6 +78,7 @@ use tokio::task::{self, JoinHandle};
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
+use crate::analysis::{self, AnalysisRangeExt as _};
 use crate::auth::{self, AuthConfig, AuthError, SessionStore, SessionToken};
 use crate::observer::{NoopObserver, PositionObserver};
 use crate::state::StateTracker;
@@ -109,6 +110,15 @@ const FINESTRA_SECS: i64 = 60;
 /// datata molto piu' avanti non e' invece spiegabile con la deriva di un orologio, e
 /// accettarla sposterebbe in avanti le analisi di tutto lo storico.
 const ANTICIPO_MASSIMO_SECS: i64 = 300;
+
+/// Posizioni che una singola analisi puo' prendere in esame.
+///
+/// Un veicolo che invia una rilevazione ogni cinque secondi ne produce circa 17_000 al
+/// giorno, quindi il limite lascia passare per intero anche un mese abbondante di
+/// storico. Serve contro l'intervallo smisurato: senza, una richiesta su anni di dati
+/// caricherebbe tutto in memoria e finirebbe in un messaggio che il client deve
+/// ricevere, dato che `route` riporta ogni punto.
+const MAX_POSIZIONI_ANALIZZATE: usize = 50_000;
 
 /// Indirizzo di ascolto predefinito.
 const BIND_PREDEFINITO: &str = "127.0.0.1:7878";
@@ -940,7 +950,16 @@ async fn servi(
             // Non raggiungibile: il ramo si sceglie proprio sulla presenza della sessione.
             None => true,
         },
-        (true, ClientMessage::TextToServer { .. } | ClientMessage::RequestAnalysis { .. }) => {
+        (true, ClientMessage::RequestAnalysis { range }) => {
+            match stato.sessione.as_ref().map(|attiva| attiva.user_id) {
+                Some(user_id) => {
+                    servi_richiesta_analisi(user_id, range, uscita, contesto, peer).await
+                }
+                // Non raggiungibile: il ramo si sceglie proprio sulla presenza della sessione.
+                None => true,
+            }
+        }
+        (true, ClientMessage::TextToServer { .. }) => {
             uscita
                 .invia(ServerMessage::Error {
                     code: ErrorCode::Internal,
@@ -1054,6 +1073,109 @@ async fn servi_posizione(
         Some(state) => uscita.invia(ServerMessage::StateChanged { state }).await,
         None => true,
     }
+}
+
+/// Calcola il riepilogo dei movimenti richiesto; vero se la connessione resta aperta.
+///
+/// Requisito R10 della traccia. L'intervallo si risolve prima di toccare il database,
+/// cosi' una finestra vuota per costruzione non produce nemmeno una lettura; la lettura
+/// vera e propria e' il caso costoso, ed e' l'unico che va su un thread da lavoro.
+///
+/// Un intervallo senza posizioni non e' un errore: e' la risposta a un veicolo che quel
+/// giorno non ha viaggiato, e [`analysis::analyze`] la esprime gia' con un riepilogo a
+/// zero. Rispondere con un errore costringerebbe il client a distinguere fra "non ho
+/// dati" e "non ho potuto calcolare", che sono due cose diverse.
+async fn servi_richiesta_analisi(
+    user_id: UserId,
+    range: AnalysisRange,
+    uscita: &Uscita,
+    contesto: &ConnectionContext,
+    peer: SocketAddr,
+) -> bool {
+    let (from, to) = range.to_bounds(contesto.clock.now());
+
+    // Le tre varianti di calendario partono da un istante che non viene mai dopo `now`,
+    // quindi qui si finisce solo con un [`AnalysisRange::Custom`] rovesciato. Il
+    // controllo guarda gli estremi risolti invece della variante perche' e' la stessa
+    // condizione detta una volta sola.
+    if from > to {
+        tracing::warn!(%peer, utente = user_id.0, %from, %to, "intervallo di analisi rovesciato");
+        return uscita
+            .invia(ServerMessage::Error {
+                code: ErrorCode::MalformedMessage,
+                message: "l'inizio dell'intervallo richiesto viene dopo la fine".to_owned(),
+            })
+            .await;
+    }
+
+    // Come per la scrittura in `servi_posizione`: il repository e' sincrono, e una
+    // lettura su SQLite fermerebbe un thread dell'esecutore per tutta la sua durata.
+    let repo = Arc::clone(&contesto.repo);
+    let esito = task::spawn_blocking(move || repo.positions_in_range(user_id, from, to)).await;
+
+    let lette = match esito {
+        Ok(Ok(posizioni)) => posizioni,
+        Ok(Err(errore)) => {
+            // Come altrove nel modulo, al client va il solo codice: il messaggio
+            // originale parla di tabelle e colonne.
+            tracing::error!(%peer, utente = user_id.0, %errore, "posizioni non lette");
+            return uscita
+                .invia(ServerMessage::Error {
+                    code: ErrorCode::Internal,
+                    message: ErrorCode::Internal.to_string(),
+                })
+                .await;
+        }
+        Err(errore) => {
+            tracing::error!(%peer, %errore, "attivita' di lettura non completata");
+            return uscita
+                .invia(ServerMessage::Error {
+                    code: ErrorCode::Internal,
+                    message: ErrorCode::Internal.to_string(),
+                })
+                .await;
+        }
+    };
+
+    let (posizioni, troncate_da) = tronca_alle_piu_recenti(lette, MAX_POSIZIONI_ANALIZZATE);
+    if let Some(totale) = troncate_da {
+        // Il riepilogo che il client riceve non copre l'intervallo che ha chiesto: se
+        // non restasse nel log, la differenza sarebbe invisibile a tutti.
+        tracing::warn!(
+            %peer,
+            utente = user_id.0,
+            totale,
+            analizzate = MAX_POSIZIONI_ANALIZZATE,
+            "posizioni oltre il limite: analizzate solo le piu' recenti"
+        );
+    }
+
+    uscita
+        .invia(ServerMessage::AnalysisReport(analysis::analyze(&posizioni)))
+        .await
+}
+
+/// Tiene le ultime `massimo` posizioni, dicendo quante erano in tutto se ha troncato.
+///
+/// Restituisce `None` come secondo elemento quando non ha tolto nulla, cosi' il chiamante
+/// distingue senza confrontare le lunghezze. Il conteggio riportato e' quello di
+/// partenza, che e' l'unico utile in un log: quello finale il chiamante ce l'ha gia'.
+///
+/// Si tiene la coda e non la testa perche' [`Repository::positions_in_range`] ordina per
+/// `recorded_at` crescente: su un intervallo troppo grande le rilevazioni piu' recenti
+/// sono quelle che interessano. Il taglio in testa preserva inoltre la precondizione di
+/// ordinamento di [`analysis::analyze`].
+fn tronca_alle_piu_recenti(
+    mut posizioni: Vec<PositionRecord>,
+    massimo: usize,
+) -> (Vec<PositionRecord>, Option<usize>) {
+    let totale = posizioni.len();
+    if totale <= massimo {
+        return (posizioni, None);
+    }
+
+    posizioni.drain(..totale - massimo);
+    (posizioni, Some(totale))
 }
 
 /// Traduce l'esito dell'autenticazione in una risposta al client.
@@ -1182,7 +1304,8 @@ mod tests {
 
     use chrono::TimeDelta;
     use georuggine_common::clock::FakeClock;
-    use georuggine_common::types::{STILL_AFTER_SECS, UserState};
+    use georuggine_common::protocol::MovementSummary;
+    use georuggine_common::types::{STILL_AFTER_SECS, UserState, haversine_meters};
     use tokio_util::bytes::Bytes;
     use tokio_util::codec::BytesCodec;
 
@@ -2254,6 +2377,279 @@ mod tests {
         assert_eq!(osservatore.connessioni(), 0);
         assert_eq!(osservatore.disconnessioni(), 0);
         assert!(banco.contesto.registry.connected_users().await.is_empty());
+    }
+
+    // --- analisi dei percorsi ---
+
+    /// Invia le posizioni di prova e ne conferma l'accettazione.
+    ///
+    /// Gli istanti partono da [`istante_base`], su cui e' fermo l'orologio del banco: le
+    /// rilevazioni sono quindi al massimo pochi secondi avanti rispetto all'ora del
+    /// server, dentro la tolleranza di [`ANTICIPO_MASSIMO_SECS`].
+    async fn invia_percorso(cliente: &mut Cliente, offsets: &[i64]) {
+        for offset in offsets {
+            cliente
+                .invia(ClientMessage::Position {
+                    coordinate: punto(*offset),
+                    recorded_at: istante_base() + TimeDelta::seconds(*offset),
+                })
+                .await;
+            assert_eq!(
+                cliente.ricevi().await,
+                ServerMessage::Ack {
+                    request: AckKind::Position
+                }
+            );
+        }
+    }
+
+    /// Chiede l'analisi e pretende che la risposta sia un [`MovementSummary`].
+    async fn chiedi_analisi(cliente: &mut Cliente, range: AnalysisRange) -> MovementSummary {
+        cliente
+            .invia(ClientMessage::RequestAnalysis { range })
+            .await;
+        match cliente.ricevi().await {
+            ServerMessage::AnalysisReport(riepilogo) => riepilogo,
+            altro => panic!("atteso AnalysisReport, ottenuto {altro:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn un_percorso_persistito_torna_come_analisi_del_giorno() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        // Tre punti su un meridiano, un centesimo di grado (oltre un chilometro) l'uno
+        // dall'altro, a dieci secondi di distanza: due segmenti, entrambi in movimento.
+        invia_percorso(&mut cliente, &[0, 10, 20]).await;
+
+        // L'orologio del banco e' fermo su `istante_base`, che in UTC coincide con la
+        // mezzanotte locale: senza spostarlo l'estremo superiore dell'intervallo Today
+        // sarebbe l'istante della prima rilevazione e le altre due resterebbero fuori.
+        banco.orologio.advance(TimeDelta::seconds(60));
+
+        let riepilogo = chiedi_analisi(&mut cliente, AnalysisRange::Today).await;
+
+        let attesa = haversine_meters(punto(0), punto(10)) + haversine_meters(punto(10), punto(20));
+        assert!(
+            (riepilogo.total_distance_meters - attesa).abs() < 1.0,
+            "distanza {} m, attesi {attesa} m",
+            riepilogo.total_distance_meters
+        );
+        assert_eq!(riepilogo.moving_duration_secs, 20);
+        assert_eq!(riepilogo.pause_duration_secs, 0);
+        assert_eq!(riepilogo.stop_count, 0);
+        assert!(riepilogo.average_speed_kmh.is_finite());
+        assert_eq!(
+            riepilogo.route,
+            banco.posizioni_di(UserId(1)),
+            "la rotta deve riportare le posizioni davvero persistite"
+        );
+    }
+
+    #[tokio::test]
+    async fn l_analisi_di_un_altro_utente_non_entra_nel_riepilogo() {
+        let banco = avvia_banco().await;
+        let mut primo = Cliente::connetti(banco.indirizzo).await;
+        primo.registra("veicolo_01").await;
+        invia_percorso(&mut primo, &[0, 10, 20]).await;
+
+        let mut secondo = Cliente::connetti(banco.indirizzo).await;
+        secondo.registra("veicolo_02").await;
+        banco.orologio.advance(TimeDelta::seconds(60));
+
+        // Il secondo utente non ha inviato nulla: l'analisi guarda le posizioni della
+        // sessione corrente, non quelle di tutta la flotta.
+        let riepilogo = chiedi_analisi(&mut secondo, AnalysisRange::Today).await;
+
+        assert_eq!(riepilogo.total_distance_meters, 0.0);
+        assert!(riepilogo.route.is_empty());
+    }
+
+    #[tokio::test]
+    async fn senza_posizioni_l_analisi_e_un_riepilogo_a_zero_non_un_errore() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        let riepilogo = chiedi_analisi(&mut cliente, AnalysisRange::Today).await;
+
+        assert_eq!(riepilogo.total_distance_meters, 0.0);
+        assert_eq!(riepilogo.moving_duration_secs, 0);
+        assert_eq!(riepilogo.pause_duration_secs, 0);
+        assert_eq!(riepilogo.average_speed_kmh, 0.0);
+        assert_eq!(riepilogo.stop_count, 0);
+        assert!(riepilogo.route.is_empty());
+    }
+
+    #[tokio::test]
+    async fn un_intervallo_custom_rovesciato_e_malformato() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+        // Le posizioni ci sono davvero: se la richiesta arrivasse al repository invece di
+        // essere respinta, l'estremo rovesciato non troverebbe nulla e la risposta
+        // sarebbe un riepilogo a zero. Ricevere un errore dice che il controllo e'
+        // avvenuto prima della lettura.
+        invia_percorso(&mut cliente, &[0, 10, 20]).await;
+
+        cliente
+            .invia(ClientMessage::RequestAnalysis {
+                range: AnalysisRange::Custom {
+                    from: istante_base() + TimeDelta::days(1),
+                    to: istante_base() - TimeDelta::days(1),
+                },
+            })
+            .await;
+
+        assert!(matches!(
+            cliente.ricevi().await,
+            ServerMessage::Error {
+                code: ErrorCode::MalformedMessage,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn un_intervallo_custom_valido_seleziona_le_posizioni() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+        invia_percorso(&mut cliente, &[0, 10, 20]).await;
+
+        // Estremi inclusi: la finestra si ferma alla seconda rilevazione, quindi resta
+        // un solo segmento.
+        let riepilogo = chiedi_analisi(
+            &mut cliente,
+            AnalysisRange::Custom {
+                from: istante_base(),
+                to: istante_base() + TimeDelta::seconds(10),
+            },
+        )
+        .await;
+
+        assert_eq!(riepilogo.route.len(), 2);
+        assert_eq!(riepilogo.moving_duration_secs, 10);
+    }
+
+    #[tokio::test]
+    async fn request_analysis_prima_dell_accesso_riceve_not_authenticated() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        assert!(matches!(
+            cliente.saluta().await,
+            ServerMessage::Welcome { .. }
+        ));
+
+        cliente
+            .invia(ClientMessage::RequestAnalysis {
+                range: AnalysisRange::Today,
+            })
+            .await;
+
+        assert!(matches!(
+            cliente.ricevi().await,
+            ServerMessage::Error {
+                code: ErrorCode::NotAuthenticated,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn text_to_server_resta_non_implementato() {
+        // Fissa il confine di questo passo: la sostituzione riguarda la sola analisi, e
+        // il ramo condiviso con TextToServer non e' stato smontato per sbaglio.
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        cliente
+            .invia(ClientMessage::TextToServer {
+                body: "in arrivo al deposito".to_owned(),
+            })
+            .await;
+
+        assert!(matches!(
+            cliente.ricevi().await,
+            ServerMessage::Error {
+                code: ErrorCode::Internal,
+                ..
+            }
+        ));
+    }
+
+    // --- limite di posizioni analizzate ---
+
+    /// Posizioni di prova a un secondo l'una dall'altra, dalla piu' vecchia alla piu'
+    /// recente, come le restituisce [`Repository::positions_in_range`].
+    fn percorso_finto(quante: i64) -> Vec<PositionRecord> {
+        (0..quante)
+            .map(|offset| PositionRecord {
+                user_id: UserId(1),
+                coordinate: punto(offset),
+                recorded_at: istante_base() + TimeDelta::seconds(offset),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sotto_il_limite_le_posizioni_non_vengono_toccate() {
+        let posizioni = percorso_finto(3);
+
+        let (analizzate, scartate) = tronca_alle_piu_recenti(posizioni.clone(), 5);
+
+        assert_eq!(analizzate, posizioni);
+        assert_eq!(
+            scartate, None,
+            "senza troncamento non c'e' nulla da segnalare"
+        );
+    }
+
+    #[test]
+    fn esattamente_al_limite_le_posizioni_non_vengono_toccate() {
+        let posizioni = percorso_finto(5);
+
+        let (analizzate, scartate) = tronca_alle_piu_recenti(posizioni.clone(), 5);
+
+        assert_eq!(analizzate, posizioni);
+        assert_eq!(scartate, None);
+    }
+
+    #[test]
+    fn oltre_il_limite_restano_le_piu_recenti() {
+        let posizioni = percorso_finto(5);
+
+        let (analizzate, scartate) = tronca_alle_piu_recenti(posizioni.clone(), 2);
+
+        assert_eq!(
+            analizzate,
+            posizioni[3..],
+            "vanno tenute le ultime in ordine di recorded_at"
+        );
+        assert_eq!(
+            scartate,
+            Some(5),
+            "il conteggio originale serve al log, non quello troncato"
+        );
+    }
+
+    #[test]
+    fn un_limite_nullo_non_lascia_nessuna_posizione() {
+        let (analizzate, scartate) = tronca_alle_piu_recenti(percorso_finto(3), 0);
+
+        assert!(analizzate.is_empty());
+        assert_eq!(scartate, Some(3));
+    }
+
+    #[test]
+    fn troncare_un_percorso_vuoto_non_segnala_nulla() {
+        let (analizzate, scartate) = tronca_alle_piu_recenti(Vec::new(), 0);
+
+        assert!(analizzate.is_empty());
+        assert_eq!(scartate, None);
     }
 
     // --- macchina a stati collegata ---
