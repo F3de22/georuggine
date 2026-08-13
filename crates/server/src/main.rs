@@ -12,7 +12,10 @@ use std::sync::Arc;
 
 use georuggine_common::clock::{Clock, SystemClock};
 use georuggine_server::auth::SessionStore;
-use georuggine_server::net::{self, Avvio, ConnectionRegistry, Osservazione, ServerConfig};
+use georuggine_server::messaging::MessageHub;
+use georuggine_server::net::{
+    self, Avvio, ConnectionRegistry, Dipendenze, Osservazione, ServerConfig,
+};
 use georuggine_server::state::StateTracker;
 use georuggine_server::storage::{Repository, SqliteRepository};
 use tokio::sync::broadcast;
@@ -71,6 +74,13 @@ async fn avvia(config: ServerConfig) -> anyhow::Result<()> {
 
     let sessions = Arc::new(SessionStore::new());
     let registry = Arc::new(ConnectionRegistry::new());
+    // La messaggistica riceve lo stesso registro delle connessioni che usa il livello di
+    // rete: un secondo registro non vedrebbe nessuno dei veicoli collegati.
+    let messaging = Arc::new(MessageHub::new(
+        Arc::clone(&repo),
+        Arc::clone(&registry),
+        Arc::clone(&orologio),
+    ));
     // La macchina a stati legge lo stesso orologio della persistenza: le posizioni e le
     // scadenze dei tre minuti devono essere datate dalla stessa sorgente.
     let osservazione = Osservazione::con_stati(Arc::new(StateTracker::new(Arc::clone(&orologio))));
@@ -95,10 +105,13 @@ async fn avvia(config: ServerConfig) -> anyhow::Result<()> {
 
     net::run(
         config,
-        repo,
-        sessions,
-        registry,
-        orologio,
+        Dipendenze {
+            repo,
+            sessions,
+            registry,
+            messaging,
+            clock: orologio,
+        },
         osservazione,
         spegnimento,
     )

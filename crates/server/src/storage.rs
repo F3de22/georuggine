@@ -129,6 +129,19 @@ impl MessageDirection {
     }
 }
 
+/// Identificatore di una riga di `messages`.
+///
+/// E' un `i64` e non un `u32` come [`UserId`]: quello viaggia nel protocollo e paga una
+/// conversione verificata a ogni lettura, mentre questo resta dentro il server e
+/// coincide con il `rowid` di SQLite, che e' gia' un `i64`. Tenere lo stesso tipo evita
+/// una conversione che potrebbe fallire su un archivio molto grande, cioe' proprio quando
+/// perdere la marcatura di un messaggio sarebbe piu' facile da non notare.
+///
+/// E' un newtype e non un alias perche' il compilatore lo distingua da un id di utente:
+/// scambiarli marcherebbe consegnato il messaggio sbagliato, in silenzio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MessageId(pub i64);
+
 /// Messaggio destinato a un utente e non ancora consegnato.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingMessage {
@@ -201,11 +214,17 @@ pub trait Repository: Send + Sync + 'static {
         to: DateTime<Utc>,
     ) -> Result<Vec<PositionRecord>, StorageError>;
 
-    /// Registra un messaggio, marcandolo come non ancora consegnato.
+    /// Registra un messaggio, marcandolo come non ancora consegnato, e ne restituisce
+    /// l'id.
     ///
     /// `user_id` e' `None` per i messaggi che non hanno un singolo destinatario: restano
     /// a storico e non compaiono in [`Repository::pending_messages`] di nessun utente.
-    /// Un invio a tutti i veicoli si registra con una riga per destinatario.
+    ///
+    /// L'id serve a marcare consegnato **quel** messaggio con
+    /// [`Repository::mark_delivered`], senza toccare gli altri che lo stesso utente
+    /// potrebbe avere davvero in attesa: e' cio' che permette di scrivere prima e
+    /// consegnare poi, che e' l'ordine con cui la messaggistica evita di perdere un
+    /// messaggio se il destinatario non e' raggiungibile.
     ///
     /// # Errori
     ///
@@ -216,9 +235,15 @@ pub trait Repository: Send + Sync + 'static {
         direction: MessageDirection,
         body: &str,
         at: DateTime<Utc>,
-    ) -> Result<(), StorageError>;
+    ) -> Result<MessageId, StorageError>;
 
-    /// Messaggi destinati all'utente e non ancora consegnati.
+    /// Messaggi che il server deve ancora recapitare all'utente.
+    ///
+    /// Sono i soli [`MessageDirection::Direct`] non ancora consegnati. Cio' che l'utente
+    /// ha mandato al server ([`MessageDirection::Inbound`]) e gli avvisi alla flotta
+    /// ([`MessageDirection::Broadcast`]) stanno nella stessa tabella ma non sono in
+    /// attesa per nessuno: i primi hanno gia' raggiunto il destinatario, che e' il server,
+    /// e i secondi valgono per chi era collegato quando sono partiti.
     ///
     /// Il risultato e' ordinato per `sent_at` crescente e, a parita' di istante, per
     /// ordine di inserimento.
@@ -228,7 +253,24 @@ pub trait Repository: Send + Sync + 'static {
     /// [`StorageError::Serialization`] se una riga non si converte nei tipi di dominio.
     fn pending_messages(&self, user_id: UserId) -> Result<Vec<PendingMessage>, StorageError>;
 
+    /// Segna come consegnato il singolo messaggio indicato.
+    ///
+    /// Serve alla consegna immediata: il messaggio e' stato scritto prima di provare
+    /// l'invio, e una volta recapitato va tolto dall'attesa senza toccare quelli che lo
+    /// precedono, che potrebbero non essere mai stati consegnati.
+    ///
+    /// E' idempotente, e su un id che non esiste non e' un errore: come per le letture,
+    /// l'assenza e' un esito normale.
+    ///
+    /// # Errori
+    ///
+    /// [`StorageError::Sqlite`] se la scrittura fallisce.
+    fn mark_delivered(&self, id: MessageId) -> Result<(), StorageError>;
+
     /// Segna come consegnati tutti i messaggi in attesa dell'utente.
+    ///
+    /// Riguarda esattamente cio' che [`Repository::pending_messages`] restituirebbe: i
+    /// messaggi diretti non ancora consegnati, e nessuna delle altre righe dell'utente.
     ///
     /// Le righe non vengono cancellate ma marcate: lo storico resta interrogabile. E'
     /// idempotente, e su un utente senza messaggi non e' un errore.
@@ -464,7 +506,7 @@ impl Repository for SqliteRepository {
         direction: MessageDirection,
         body: &str,
         at: DateTime<Utc>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<MessageId, StorageError> {
         let connessione = self.blocca();
         connessione.execute(
             "INSERT INTO messages (user_id, direction, body, sent_at) VALUES (?1, ?2, ?3, ?4)",
@@ -476,20 +518,24 @@ impl Repository for SqliteRepository {
             ],
         )?;
 
-        Ok(())
+        // `last_insert_rowid` e' relativo alla connessione, che qui e' una sola e sta
+        // sotto lo stesso lock dell'inserimento: fra le due chiamate non puo' passare
+        // un'altra scrittura.
+        Ok(MessageId(connessione.last_insert_rowid()))
     }
 
     fn pending_messages(&self, user_id: UserId) -> Result<Vec<PendingMessage>, StorageError> {
         let connessione = self.blocca();
         let mut interrogazione = connessione.prepare(
             "SELECT body, sent_at FROM messages \
-             WHERE user_id = ?1 AND delivered = 0 \
+             WHERE user_id = ?1 AND direction = ?2 AND delivered = 0 \
              ORDER BY sent_at ASC, id ASC",
         )?;
 
-        let righe = interrogazione.query_map(params![user_id.0], |riga| {
-            Ok((riga.get::<_, String>(0)?, riga.get::<_, String>(1)?))
-        })?;
+        let righe = interrogazione.query_map(
+            params![user_id.0, MessageDirection::Direct.as_str()],
+            |riga| Ok((riga.get::<_, String>(0)?, riga.get::<_, String>(1)?)),
+        )?;
 
         let mut messaggi = Vec::new();
         for riga in righe {
@@ -503,11 +549,27 @@ impl Repository for SqliteRepository {
         Ok(messaggi)
     }
 
+    fn mark_delivered(&self, id: MessageId) -> Result<(), StorageError> {
+        let connessione = self.blocca();
+        // Un id che non esiste aggiorna zero righe: `execute` non lo considera un
+        // errore, ed e' il comportamento voluto.
+        connessione.execute(
+            "UPDATE messages SET delivered = 1 WHERE id = ?1",
+            params![id.0],
+        )?;
+
+        Ok(())
+    }
+
     fn clear_pending_messages(&self, user_id: UserId) -> Result<(), StorageError> {
         let connessione = self.blocca();
+        // Il filtro sulla direzione ripete quello di `pending_messages`: le due
+        // operazioni devono avere la stessa idea di cosa sia un messaggio in attesa,
+        // altrimenti lo svuotamento marcherebbe righe che nessuno ha mai letto.
         connessione.execute(
-            "UPDATE messages SET delivered = 1 WHERE user_id = ?1 AND delivered = 0",
-            params![user_id.0],
+            "UPDATE messages SET delivered = 1 \
+             WHERE user_id = ?1 AND direction = ?2 AND delivered = 0",
+            params![user_id.0, MessageDirection::Direct.as_str()],
         )?;
 
         Ok(())
@@ -533,19 +595,36 @@ impl Repository for SqliteRepository {
 
 /// Messaggio come conservato da [`InMemoryRepository`].
 ///
-/// Non tiene la direzione: nessun metodo di [`Repository`] la restituisce, quindi
-/// conservarla qui sarebbe un campo mai letto. Il backend SQLite la scrive perche' lo
-/// schema la prevede e la rende leggibile a mano nel database.
+/// Tiene la direzione anche se nessun metodo di [`Repository`] la restituisce: e' cio' su
+/// cui [`Repository::pending_messages`] filtra, quindi senza di essa questo backend
+/// tornerebbe anche i messaggi che l'utente ha mandato al server e divergerebbe da quello
+/// su SQLite.
 #[derive(Debug, Clone)]
 struct MessaggioSalvato {
+    /// Identificatore assegnato alla scrittura, come il `rowid` di SQLite.
+    id: MessageId,
     /// Destinatario, `None` per i messaggi senza un singolo destinatario.
     user_id: Option<UserId>,
+    /// Verso del messaggio rispetto al server.
+    direction: MessageDirection,
     /// Testo del messaggio.
     body: String,
     /// Istante di produzione.
     sent_at: DateTime<Utc>,
     /// Vero quando il messaggio e' gia' stato consegnato.
     delivered: bool,
+}
+
+/// Vero se il messaggio e' fra quelli che il server deve ancora recapitare all'utente.
+///
+/// Sta in una funzione sola perche' [`Repository::pending_messages`] e
+/// [`Repository::clear_pending_messages`] devono leggere e marcare esattamente le stesse
+/// righe: due condizioni scritte a mano divergerebbero alla prima modifica. E' l'equivalente
+/// della clausola `WHERE` che le due interrogazioni condividono nel backend su SQLite.
+fn e_in_attesa(messaggio: &MessaggioSalvato, user_id: UserId) -> bool {
+    messaggio.user_id == Some(user_id)
+        && messaggio.direction == MessageDirection::Direct
+        && !messaggio.delivered
 }
 
 /// Contenuto di [`InMemoryRepository`], protetto da un solo lock.
@@ -564,6 +643,8 @@ struct Stato {
     messaggi: Vec<MessaggioSalvato>,
     /// Ultimo id assegnato: il prossimo utente prende `ultimo_id + 1`.
     ultimo_id: u32,
+    /// Ultimo id di messaggio assegnato, come il `rowid` che SQLite fa crescere da se'.
+    ultimo_id_messaggio: i64,
 }
 
 /// Repository in memoria, con la stessa semantica di [`SqliteRepository`].
@@ -678,19 +759,28 @@ impl Repository for InMemoryRepository {
     fn insert_message(
         &self,
         user_id: Option<UserId>,
-        _direction: MessageDirection,
+        direction: MessageDirection,
         body: &str,
         at: DateTime<Utc>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<MessageId, StorageError> {
         let mut stato = self.blocca();
+        // Gli id partono da 1 e crescono di uno, come i `rowid` di SQLite.
+        let id =
+            MessageId(stato.ultimo_id_messaggio.checked_add(1).ok_or_else(|| {
+                StorageError::Serialization("id dei messaggi esauriti".to_owned())
+            })?);
+        stato.ultimo_id_messaggio = id.0;
+
         stato.messaggi.push(MessaggioSalvato {
+            id,
             user_id,
+            direction,
             body: body.to_owned(),
             sent_at: at,
             delivered: false,
         });
 
-        Ok(())
+        Ok(id)
     }
 
     fn pending_messages(&self, user_id: UserId) -> Result<Vec<PendingMessage>, StorageError> {
@@ -698,7 +788,7 @@ impl Repository for InMemoryRepository {
         let mut trovati: Vec<&MessaggioSalvato> = stato
             .messaggi
             .iter()
-            .filter(|messaggio| messaggio.user_id == Some(user_id) && !messaggio.delivered)
+            .filter(|messaggio| e_in_attesa(messaggio, user_id))
             .collect();
 
         trovati.sort_by_key(|messaggio| messaggio.sent_at);
@@ -712,10 +802,21 @@ impl Repository for InMemoryRepository {
             .collect())
     }
 
+    fn mark_delivered(&self, id: MessageId) -> Result<(), StorageError> {
+        let mut stato = self.blocca();
+        // Un id che non esiste non trova nulla da marcare: come l'UPDATE di SQLite che
+        // aggiorna zero righe, non e' un errore.
+        if let Some(messaggio) = stato.messaggi.iter_mut().find(|salvato| salvato.id == id) {
+            messaggio.delivered = true;
+        }
+
+        Ok(())
+    }
+
     fn clear_pending_messages(&self, user_id: UserId) -> Result<(), StorageError> {
         let mut stato = self.blocca();
         for messaggio in &mut stato.messaggi {
-            if messaggio.user_id == Some(user_id) {
+            if e_in_attesa(messaggio, user_id) {
                 messaggio.delivered = true;
             }
         }
@@ -930,19 +1031,50 @@ mod tests {
         );
 
         // --- messaggi in attesa ---
+        //
+        // In attesa e' solo cio' che il server deve ancora recapitare, cioe' i messaggi
+        // diretti non consegnati. Nella stessa tabella stanno anche il testo che il
+        // veicolo ha mandato al server (Inbound) e gli avvisi alla flotta (Broadcast):
+        // senza il filtro sulla direzione un veicolo, al ritorno, si vedrebbe recapitare
+        // i propri stessi messaggi.
 
+        let piu_recente = repo
+            .insert_message(
+                Some(id),
+                MessageDirection::Direct,
+                "torna in sede",
+                t0 + TimeDelta::seconds(5),
+            )
+            .expect("inserimento del messaggio riuscito");
+        let piu_vecchio = repo
+            .insert_message(
+                Some(id),
+                MessageDirection::Direct,
+                "passa dal deposito",
+                t0 + TimeDelta::seconds(1),
+            )
+            .expect("inserimento del messaggio riuscito");
+        assert_ne!(
+            piu_recente, piu_vecchio,
+            "ogni messaggio scritto ha un id suo"
+        );
+
+        // Messaggio che l'utente ha mandato al server: e' suo, non e' ancora marcato, e
+        // non deve comparire fra quelli che gli tornano indietro.
         repo.insert_message(
             Some(id),
-            MessageDirection::Direct,
-            "torna in sede",
-            t0 + TimeDelta::seconds(5),
+            MessageDirection::Inbound,
+            "sono in arrivo al deposito",
+            t0 + TimeDelta::seconds(2),
         )
         .expect("inserimento del messaggio riuscito");
+        // Un avviso alla flotta registrato con il destinatario: nemmeno questo e' un
+        // messaggio in attesa, perche' vale per chi era collegato quando e' partito.
         repo.insert_message(
             Some(id),
             MessageDirection::Broadcast,
             "chiusura turno",
-            t0 + TimeDelta::seconds(1),
+            t0 + TimeDelta::seconds(3),
         )
         .expect("inserimento del messaggio riuscito");
         repo.insert_message(
@@ -981,11 +1113,42 @@ mod tests {
         let pendenti = repo.pending_messages(id).expect("lettura riuscita");
         assert_eq!(
             pendenti.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
-            vec!["chiusura turno", "torna in sede"],
-            "attesi solo i messaggi dell'utente, ordinati per sent_at crescente"
+            vec!["passa dal deposito", "torna in sede"],
+            "attesi i soli messaggi diretti dell'utente, ordinati per sent_at crescente"
         );
         assert_eq!(pendenti[0].sent_at, t0 + TimeDelta::seconds(1));
         assert_eq!(pendenti[1].sent_at, t0 + TimeDelta::seconds(5));
+
+        // --- marcatura di un singolo messaggio ---
+
+        repo.mark_delivered(piu_vecchio)
+            .expect("marcatura riuscita");
+        assert_eq!(
+            repo.pending_messages(id)
+                .expect("lettura riuscita")
+                .iter()
+                .map(|m| m.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["torna in sede"],
+            "la marcatura riguarda il solo messaggio indicato, non tutti quelli dell'utente"
+        );
+        assert_eq!(
+            repo.pending_messages(secondo)
+                .expect("lettura riuscita")
+                .len(),
+            1,
+            "la marcatura non tocca gli altri utenti"
+        );
+
+        // Marcare due volte, o marcare un id che non esiste, non e' un errore.
+        repo.mark_delivered(piu_vecchio)
+            .expect("marcatura idempotente");
+        repo.mark_delivered(MessageId(999_999))
+            .expect("marcare un id sconosciuto non e' un errore");
+        assert_eq!(
+            repo.pending_messages(id).expect("lettura riuscita").len(),
+            1
+        );
 
         // --- svuotamento ---
 

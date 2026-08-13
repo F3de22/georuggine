@@ -10,6 +10,7 @@
 pub mod analysis;
 pub mod auth;
 pub mod cpu_time;
+pub mod messaging;
 pub mod net;
 pub mod observer;
 pub mod state;
