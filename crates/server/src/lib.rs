@@ -9,6 +9,7 @@
 
 pub mod analysis;
 pub mod auth;
+pub mod console;
 pub mod cpu_time;
 pub mod messaging;
 pub mod net;
