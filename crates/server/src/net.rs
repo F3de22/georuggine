@@ -80,6 +80,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::analysis::{self, AnalysisRangeExt as _};
 use crate::auth::{self, AuthConfig, AuthError, SessionStore, SessionToken};
+use crate::messaging::{MessageHub, MessagingError};
 use crate::observer::{NoopObserver, PositionObserver};
 use crate::state::StateTracker;
 use crate::storage::Repository;
@@ -318,6 +319,26 @@ impl Osservazione {
     }
 }
 
+/// Risorse condivise che il chiamante costruisce e [`run`] passa alle connessioni.
+///
+/// Sono i pezzi che vivono quanto il processo e che hanno un esemplare solo: cambiarli
+/// vorrebbe dire, per esempio, dare alla messaggistica un registro diverso da quello del
+/// livello di rete, che non vedrebbe nessuno dei veicoli collegati. Stanno insieme per la
+/// stessa ragione di [`Osservazione`]: passarli uno a uno allungherebbe la firma di
+/// [`run`] senza dire nulla su come sono legati fra loro.
+pub struct Dipendenze {
+    /// Persistenza di utenti, posizioni e messaggi.
+    pub repo: Arc<dyn Repository>,
+    /// Registro dei token di sessione attivi.
+    pub sessions: Arc<SessionStore>,
+    /// Registro delle connessioni aperte, una per utente.
+    pub registry: Arc<ConnectionRegistry>,
+    /// Messaggistica, costruita sullo stesso [`registry`](Self::registry).
+    pub messaging: Arc<MessageHub>,
+    /// Sorgente dell'ora, condivisa con la persistenza e la macchina a stati.
+    pub clock: Arc<dyn Clock>,
+}
+
 /// Dipendenze che ogni connessione condivide.
 ///
 /// Stanno in una struttura sola perche' il gestore le riceve tutte insieme dietro un
@@ -329,6 +350,11 @@ pub struct ConnectionContext {
     pub sessions: Arc<SessionStore>,
     /// Registro delle connessioni aperte, una per utente.
     pub registry: Arc<ConnectionRegistry>,
+    /// Messaggistica: persiste i messaggi e li recapita a chi e' collegato.
+    ///
+    /// Tiene un riferimento allo stesso [`registry`](Self::registry): e' costruito una
+    /// volta sola e condiviso da tutte le connessioni, come le altre dipendenze qui.
+    pub messaging: Arc<MessageHub>,
     /// Sorgente dell'ora: il gestore non chiama mai `Utc::now()` da se'.
     pub clock: Arc<dyn Clock>,
     /// Destinatario degli eventi di sessione e di posizione.
@@ -588,10 +614,7 @@ impl StatoConnessione {
 /// perche' sono in genere transitori (descrittori esauriti, peer sparito).
 pub async fn run(
     config: ServerConfig,
-    repo: Arc<dyn Repository>,
-    sessions: Arc<SessionStore>,
-    registry: Arc<ConnectionRegistry>,
-    clock: Arc<dyn Clock>,
+    dipendenze: Dipendenze,
     osservazione: Osservazione,
     shutdown: broadcast::Sender<()>,
 ) -> io::Result<()> {
@@ -599,11 +622,19 @@ pub async fn run(
     let indirizzo = listener.local_addr()?;
     tracing::info!(%indirizzo, "server in ascolto");
 
+    let Dipendenze {
+        repo,
+        sessions,
+        registry,
+        messaging,
+        clock,
+    } = dipendenze;
     let Osservazione { observer, ticker } = osservazione;
     let contesto = Arc::new(ConnectionContext {
         repo,
         sessions,
         registry,
+        messaging,
         clock,
         observer,
         ticker,
@@ -959,13 +990,12 @@ async fn servi(
                 None => true,
             }
         }
-        (true, ClientMessage::TextToServer { .. }) => {
-            uscita
-                .invia(ServerMessage::Error {
-                    code: ErrorCode::Internal,
-                    message: "non ancora implementato".to_owned(),
-                })
-                .await
+        (true, ClientMessage::TextToServer { body }) => {
+            match stato.sessione.as_ref().map(|attiva| attiva.user_id) {
+                Some(user_id) => servi_testo(user_id, &body, uscita, contesto, peer).await,
+                // Non raggiungibile: il ramo si sceglie proprio sulla presenza della sessione.
+                None => true,
+            }
         }
         (true, _) => {
             // Hello, Register o Login a sessione gia' aperta: fuori sequenza.
@@ -1073,6 +1103,130 @@ async fn servi_posizione(
         Some(state) => uscita.invia(ServerMessage::StateChanged { state }).await,
         None => true,
     }
+}
+
+/// Prende in carico un testo inviato dal client; vero se la connessione resta aperta.
+///
+/// Requisito R13. Il messaggio viene solo persistito: al client torna un `Ack`, non una
+/// risposta di contenuto. Come per le posizioni, un corpo rifiutato non chiude la
+/// connessione: e' un errore della singola richiesta, e il veicolo puo' riprovare.
+///
+/// Il testo troppo lungo e' l'unico caso imputabile a cio' che il client ha mandato, e
+/// solo per quello il messaggio d'errore riporta il dettaglio: gli altri sono guasti
+/// interni, e il loro testo parlerebbe di tabelle o di attivita' in background.
+async fn servi_testo(
+    user_id: UserId,
+    body: &str,
+    uscita: &Uscita,
+    contesto: &ConnectionContext,
+    peer: SocketAddr,
+) -> bool {
+    match contesto.messaging.from_user(user_id, body).await {
+        Ok(()) => {
+            uscita
+                .invia(ServerMessage::Ack {
+                    request: AckKind::TextToServer,
+                })
+                .await
+        }
+        Err(errore @ MessagingError::TooLong { .. }) => {
+            tracing::warn!(%peer, utente = user_id.0, %errore, "testo rifiutato");
+            uscita
+                .invia(ServerMessage::Error {
+                    code: ErrorCode::MalformedMessage,
+                    message: errore.to_string(),
+                })
+                .await
+        }
+        Err(errore) => {
+            tracing::error!(%peer, utente = user_id.0, %errore, "testo non persistito");
+            uscita
+                .invia(ServerMessage::Error {
+                    code: ErrorCode::Internal,
+                    message: ErrorCode::Internal.to_string(),
+                })
+                .await
+        }
+    }
+}
+
+/// Recapita i messaggi arrivati mentre l'utente era scollegato; vero se la connessione
+/// resta aperta.
+///
+/// Requisito R12, dal lato di chi torna: [`MessageHub::direct`] ha gia' scritto a storico
+/// i messaggi che non aveva potuto consegnare, e questo e' il momento in cui l'utente li
+/// ritrova. Se non ce n'e' nessuno non succede nulla di osservabile, nemmeno la scrittura
+/// che marca la consegna.
+///
+/// L'invio passa da `uscita` e non da [`ConnectionRegistry::send_to`]: quest'ultima
+/// risolverebbe di nuovo l'utente dal registro, mentre la voce appena scritta potrebbe
+/// gia' essere stata sostituita da un'altra connessione dello stesso veicolo, e i
+/// messaggi finirebbero a quella invece che a questa.
+///
+/// Un guasto in lettura o nella marcatura non chiude la connessione: l'accesso e'
+/// riuscito, e togliere la sessione per un messaggio non recapitato sarebbe un danno
+/// maggiore del problema. Resta nel log, che e' l'unico posto in cui sia visibile.
+async fn consegna_messaggi_in_attesa(
+    user_id: UserId,
+    uscita: &Uscita,
+    contesto: &ConnectionContext,
+    peer: SocketAddr,
+) -> bool {
+    // Il repository e' sincrono: la lettura va su un thread da lavoro, come ogni altro
+    // accesso alla persistenza in questo modulo.
+    let repo = Arc::clone(&contesto.repo);
+    let in_attesa = match task::spawn_blocking(move || repo.pending_messages(user_id)).await {
+        Ok(Ok(messaggi)) => messaggi,
+        Ok(Err(errore)) => {
+            tracing::error!(%peer, utente = user_id.0, %errore, "messaggi in attesa non letti");
+            return true;
+        }
+        Err(errore) => {
+            tracing::error!(%peer, %errore, "attivita' di lettura non completata");
+            return true;
+        }
+    };
+
+    if in_attesa.is_empty() {
+        return true;
+    }
+
+    for messaggio in &in_attesa {
+        if !uscita
+            .invia(ServerMessage::Direct {
+                body: messaggio.body.clone(),
+                sent_at: messaggio.sent_at,
+            })
+            .await
+        {
+            // La connessione si e' chiusa a meta' consegna: i messaggi non recapitati
+            // restano in attesa, perche' la marcatura non e' ancora avvenuta.
+            tracing::warn!(%peer, utente = user_id.0, "consegna interrotta: connessione chiusa");
+            return false;
+        }
+    }
+
+    // I messaggi sono accodati: la marcatura avviene qui e non a monte, cosi' un guasto
+    // dell'invio li lascia in attesa invece di darli per consegnati.
+    let repo = Arc::clone(&contesto.repo);
+    match task::spawn_blocking(move || repo.clear_pending_messages(user_id)).await {
+        Ok(Ok(())) => {
+            tracing::info!(
+                %peer,
+                utente = user_id.0,
+                quanti = in_attesa.len(),
+                "messaggi in attesa consegnati"
+            );
+        }
+        Ok(Err(errore)) => {
+            tracing::error!(%peer, utente = user_id.0, %errore, "messaggi non marcati");
+        }
+        Err(errore) => {
+            tracing::error!(%peer, %errore, "attivita' di marcatura non completata");
+        }
+    }
+
+    true
 }
 
 /// Calcola il riepilogo dei movimenti richiesto; vero se la connessione resta aperta.
@@ -1240,11 +1394,20 @@ async fn concludi_autenticazione(
     contesto.observer.on_connect(user_id);
     tracing::info!(%peer, utente = username.as_str(), "accesso riuscito");
 
-    uscita
+    // Il token e' la risposta a Register o Login e parte per primo: il client sta
+    // aspettando quello, e la sequenza documentata in `protocol` prevede che sia la
+    // replica a un accesso riuscito. I messaggi rimasti in attesa lo seguono subito,
+    // prima di qualunque altra cosa il server possa mandare.
+    if !uscita
         .invia(ServerMessage::SessionToken {
             token: token.as_str().to_owned(),
         })
         .await
+    {
+        return false;
+    }
+
+    consegna_messaggi_in_attesa(user_id, uscita, contesto, peer).await
 }
 
 /// Codice ed eventuale spiegazione da mandare al client per un errore di autenticazione.
@@ -1309,7 +1472,8 @@ mod tests {
     use tokio_util::bytes::Bytes;
     use tokio_util::codec::BytesCodec;
 
-    use crate::storage::InMemoryRepository;
+    use crate::messaging::MAX_CARATTERI;
+    use crate::storage::{InMemoryRepository, PendingMessage};
 
     /// Quanto un test aspetta una risposta prima di considerarla mancata.
     ///
@@ -1502,10 +1666,17 @@ mod tests {
         let repo: Arc<dyn Repository> = Arc::new(InMemoryRepository::new(Arc::clone(&sorgente)));
 
         let Osservazione { observer, ticker } = osservazione(Arc::clone(&sorgente));
+        let registry = Arc::new(ConnectionRegistry::new());
+        let messaging = Arc::new(MessageHub::new(
+            Arc::clone(&repo),
+            Arc::clone(&registry),
+            Arc::clone(&sorgente),
+        ));
         let contesto = Arc::new(ConnectionContext {
             repo,
             sessions: Arc::new(SessionStore::new()),
-            registry: Arc::new(ConnectionRegistry::new()),
+            registry,
+            messaging,
             clock: sorgente,
             observer,
             ticker,
@@ -1564,6 +1735,14 @@ mod tests {
                     istante_base() + TimeDelta::days(1),
                 )
                 .expect("lettura delle posizioni riuscita")
+        }
+
+        /// Messaggi ancora in attesa di consegna per l'utente.
+        fn pendenti_di(&self, user_id: UserId) -> Vec<PendingMessage> {
+            self.contesto
+                .repo
+                .pending_messages(user_id)
+                .expect("lettura dei messaggi in attesa riuscita")
         }
 
         /// Stato che la macchina a stati del banco attribuisce all'utente.
@@ -2558,10 +2737,10 @@ mod tests {
         ));
     }
 
+    // --- messaggistica ---
+
     #[tokio::test]
-    async fn text_to_server_resta_non_implementato() {
-        // Fissa il confine di questo passo: la sostituzione riguarda la sola analisi, e
-        // il ramo condiviso con TextToServer non e' stato smontato per sbaglio.
+    async fn text_to_server_riceve_ack() {
         let banco = avvia_banco().await;
         let mut cliente = Cliente::connetti(banco.indirizzo).await;
         cliente.registra("veicolo_01").await;
@@ -2572,13 +2751,171 @@ mod tests {
             })
             .await;
 
+        assert_eq!(
+            cliente.ricevi().await,
+            ServerMessage::Ack {
+                request: AckKind::TextToServer
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn un_testo_oltre_il_limite_e_malformato() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        cliente
+            .invia(ClientMessage::TextToServer {
+                body: "a".repeat(MAX_CARATTERI + 1),
+            })
+            .await;
+
         assert!(matches!(
             cliente.ricevi().await,
             ServerMessage::Error {
-                code: ErrorCode::Internal,
+                code: ErrorCode::MalformedMessage,
                 ..
             }
         ));
+
+        // Il rifiuto riguarda la singola richiesta, non la sequenza: la connessione
+        // resta utilizzabile, e lo si dimostra usandola.
+        cliente.invia(ClientMessage::Ping).await;
+        assert_eq!(cliente.ricevi().await, ServerMessage::Pong);
+    }
+
+    #[tokio::test]
+    async fn text_to_server_prima_dell_accesso_riceve_not_authenticated() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        assert!(matches!(
+            cliente.saluta().await,
+            ServerMessage::Welcome { .. }
+        ));
+
+        cliente
+            .invia(ClientMessage::TextToServer {
+                body: "in arrivo al deposito".to_owned(),
+            })
+            .await;
+
+        assert!(matches!(
+            cliente.ricevi().await,
+            ServerMessage::Error {
+                code: ErrorCode::NotAuthenticated,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn al_login_arrivano_i_messaggi_rimasti_in_attesa() {
+        let banco = avvia_banco().await;
+
+        // L'utente viene creato e poi si scollega: da qui in avanti e' irraggiungibile,
+        // ed e' la condizione in cui i messaggi si accumulano.
+        let mut prima = Cliente::connetti(banco.indirizzo).await;
+        prima.registra("veicolo_01").await;
+        prima.invia(ClientMessage::Logout).await;
+        assert!(matches!(
+            prima.ricevi().await,
+            ServerMessage::Ack {
+                request: AckKind::Logout
+            }
+        ));
+        assert!(prima.e_chiusa().await);
+
+        let attesi = ["torna in sede", "poi passa dal deposito"];
+        for corpo in attesi {
+            assert!(
+                !banco
+                    .contesto
+                    .messaging
+                    .direct(UserId(1), corpo)
+                    .await
+                    .expect("l'invio diretto riesce"),
+                "l'utente e' scollegato: la consegna non puo' essere immediata"
+            );
+        }
+
+        let mut dopo = Cliente::connetti(banco.indirizzo).await;
+        dopo.accedi("veicolo_01").await;
+
+        for corpo in attesi {
+            assert_eq!(
+                dopo.ricevi().await,
+                ServerMessage::Direct {
+                    body: corpo.to_owned(),
+                    sent_at: istante_base(),
+                },
+                "i messaggi in attesa arrivano tutti, nell'ordine in cui erano stati mandati"
+            );
+        }
+
+        // Un Pong subito dopo l'ultimo Direct dimostra che in mezzo non e' passato altro:
+        // la coda conserva l'ordine.
+        dopo.invia(ClientMessage::Ping).await;
+        assert_eq!(dopo.ricevi().await, ServerMessage::Pong);
+
+        assert!(
+            banco.pendenti_di(UserId(1)).is_empty(),
+            "i messaggi consegnati vanno marcati, altrimenti tornerebbero al prossimo accesso"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_direct_ricevuto_da_collegati_non_torna_al_prossimo_accesso() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        assert!(
+            banco
+                .contesto
+                .messaging
+                .direct(UserId(1), "torna in sede")
+                .await
+                .expect("l'invio diretto riesce"),
+            "l'utente e' collegato: la consegna e' immediata"
+        );
+        assert_eq!(
+            cliente.ricevi().await,
+            ServerMessage::Direct {
+                body: "torna in sede".to_owned(),
+                sent_at: istante_base(),
+            }
+        );
+
+        cliente.invia(ClientMessage::Logout).await;
+        assert!(matches!(
+            cliente.ricevi().await,
+            ServerMessage::Ack {
+                request: AckKind::Logout
+            }
+        ));
+        assert!(cliente.e_chiusa().await);
+
+        let mut di_nuovo = Cliente::connetti(banco.indirizzo).await;
+        di_nuovo.accedi("veicolo_01").await;
+
+        // Se il messaggio risultasse ancora in attesa arriverebbe qui, prima del Pong:
+        // la coda conserva l'ordine, quindi un Pong come prima risposta lo esclude.
+        di_nuovo.invia(ClientMessage::Ping).await;
+        assert_eq!(di_nuovo.ricevi().await, ServerMessage::Pong);
+        assert!(banco.pendenti_di(UserId(1)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn senza_messaggi_in_attesa_l_accesso_non_manda_altro() {
+        let banco = avvia_banco().await;
+        let mut cliente = Cliente::connetti(banco.indirizzo).await;
+        cliente.registra("veicolo_01").await;
+
+        // Dopo il token non deve arrivare nulla: se la consegna dei pendenti producesse
+        // un messaggio anche a mani vuote, il Pong non sarebbe la prima risposta.
+        cliente.invia(ClientMessage::Ping).await;
+        assert_eq!(cliente.ricevi().await, ServerMessage::Pong);
     }
 
     // --- limite di posizioni analizzate ---
