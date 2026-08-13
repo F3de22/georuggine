@@ -572,6 +572,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "georuggine-common",
+ "rand 0.10.2",
  "ratatui",
  "serde",
  "thiserror 2.0.20",
