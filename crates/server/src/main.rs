@@ -10,10 +10,12 @@
 use std::io::{self, BufRead};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use georuggine_common::clock::{Clock, SystemClock};
 use georuggine_server::auth::SessionStore;
 use georuggine_server::console::{self, ConsoleContext, ErroreComando};
+use georuggine_server::cpu_log::CpuLogger;
 use georuggine_server::messaging::MessageHub;
 use georuggine_server::net::{
     self, Avvio, ConnectionRegistry, Dipendenze, Osservazione, ServerConfig,
@@ -21,12 +23,24 @@ use georuggine_server::net::{
 use georuggine_server::state::StateTracker;
 use georuggine_server::storage::{Repository, SqliteRepository};
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::timeout;
 
 /// Numero di segnali di spegnimento che il canale conserva.
 ///
 /// Ne basta uno: il segnale si manda una volta sola e chi si iscrive dopo trova la
 /// connessione gia' in chiusura per altre vie.
 const CAPACITA_SPEGNIMENTO: usize = 1;
+
+/// Tempo fra due righe del log del tempo di CPU.
+///
+/// Due minuti sono il valore chiesto dal requisito R15.
+const INTERVALLO_LOG_CPU: Duration = Duration::from_secs(120);
+
+/// Attesa massima concessa al log del tempo di CPU per scrivere la riga finale.
+///
+/// E' la stessa scadenza che il livello di rete concede alla chiusura ordinata di una
+/// connessione: qualche secondo basta a una scrittura su file, e oltre non si aspetta.
+const ATTESA_CHIUSURA_LOG_CPU: Duration = Duration::from_secs(5);
 
 /// Righe di stdin che possono attendere in coda prima che il lettore si fermi.
 ///
@@ -130,6 +144,20 @@ async fn avvia(config: ServerConfig) -> anyhow::Result<()> {
         shutdown: spegnimento.clone(),
     });
 
+    // Il log del tempo di CPU parte prima di `net::run` per la stessa ragione della
+    // console: si iscrive al canale di spegnimento adesso, mentre `run` lo fa solo dopo
+    // aver aperto l'ascolto, e un segnale che arrivasse nel mezzo lascerebbe il task in
+    // attesa per sempre. Ha anche un effetto utile: la prima riga del log e' datata
+    // all'avvio del processo, non al momento in cui la porta e' pronta.
+    let log_cpu = tokio::spawn(
+        CpuLogger::new(
+            config.log_dir.clone(),
+            INTERVALLO_LOG_CPU,
+            Arc::clone(&orologio),
+        )
+        .avvia(Arc::clone(&registry), spegnimento.subscribe()),
+    );
+
     tokio::select! {
         esito = net::run(
             config,
@@ -153,6 +181,16 @@ async fn avvia(config: ServerConfig) -> anyhow::Result<()> {
         _ = richiesta_di_spegnimento.recv() => {
             tracing::info!("spegnimento richiesto: il server termina");
         }
+    }
+
+    // Si arriva qui solo dopo che il segnale di spegnimento e' partito, quindi il logger
+    // lo ha gia' ricevuto e sta scrivendo la sua riga finale. L'attesa non e' un dettaglio
+    // di cortesia: al ritorno di `main` il runtime viene distrutto e i task ancora vivi
+    // spariscono, quindi senza questa attesa l'ultima riga del log andrebbe persa in una
+    // corsa. Il tetto vale per il caso opposto, un disco che non risponde: si preferisce
+    // perdere una riga piuttosto che lasciare il processo appeso allo spegnimento.
+    if timeout(ATTESA_CHIUSURA_LOG_CPU, log_cpu).await.is_err() {
+        tracing::warn!("log del tempo di CPU non chiuso entro la scadenza");
     }
 
     Ok(())
