@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Client Georuggine: invia la posizione del veicolo e mostra la flotta in TUI"
 
+[lib]
+name = "georuggine_client"
+path = "src/lib.rs"
+
 [[bin]]
 name = "georuggine-client"
 path = "src/main.rs"
@@ -22,5 +26,6 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+rand = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
