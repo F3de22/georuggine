@@ -3,17 +3,32 @@
 //!
 //! Il client non ha un GPS: la posizione da inviare al server arriva da una
 //! [`PositionSource`], che il resto del programma usa dietro il trait senza sapere quale
-//! strategia ci sia dietro. Qui vivono le prime due, [`FileSource`] e
-//! [`RandomWalkSource`]; le altre due previste dalla traccia (percorso interpolato e
-//! inserimento manuale) si aggiungeranno alle varianti di [`SourceKind`].
+//! strategia ci sia dietro. Le quattro previste dalla traccia sono [`FileSource`],
+//! [`RandomWalkSource`], [`RouteSource`] e [`ManualSource`]; la configurazione le sceglie
+//! attraverso le varianti di [`SourceKind`].
 //!
 //! Come per la logica di dominio del server, nessuna sorgente chiama `Utc::now()`: il
 //! tempo entra come parametro di [`PositionSource::next_position`], cosi' i test possono
 //! far scorrere ore in pochi microsecondi e verificare i tempi esatti di ogni punto.
+//!
+//! # Perche' l'interpolazione non e' una media di latitudine e longitudine
+//!
+//! [`RouteSource`] costruisce le posizioni intermedie con [`destinazione`], camminando
+//! lungo la geodetica per la distanza gia' percorsa. La scorciatoia consueta — la media
+//! pesata dei gradi di latitudine e longitudine fra partenza e arrivo — sembra
+//! equivalente ma non lo e': i meridiani si stringono verso i poli, quindi un grado di
+//! longitudine non vale sempre lo stesso numero di metri, e il punto medio dei gradi non
+//! e' il punto medio del cammino. Su una rotta lunga alle nostre latitudini lo scarto e'
+//! di chilometri, e la velocita' apparente non risulterebbe piu' costante: il server, che
+//! ricostruisce lo stato del veicolo dagli spostamenti, ne uscirebbe con un moto che
+//! accelera e rallenta senza motivo. Chi legge questo modulo troverebbe altrimenti la
+//! trigonometria sospetta: e' voluta, la media aritmetica sarebbe il vero difetto.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use georuggine_common::types::Coordinate;
@@ -45,6 +60,17 @@ const HEADER_ATTESO: &str = "lat,lon,offset_secs";
 /// tutti i casi realistici, e quando davvero non ce ne sono (raggio piu' piccolo del
 /// passo) restare fermi per un giro e' la risposta giusta, non un errore.
 const TENTATIVI_MASSIMI: u8 = 16;
+
+/// Raggio di tolleranza, in metri, entro cui [`RouteSource`] considera il veicolo su uno
+/// degli estremi del tragitto.
+///
+/// Il tempo di arrivo esce da una divisione fra distanza e velocita' e non cade quasi mai
+/// su un valore esatto in virgola mobile: senza tolleranza l'ultima posizione sarebbe un
+/// punto interpolato a frazioni di millimetro dalla destinazione, e il server ne
+/// ricaverebbe uno spostamento residuo che non e' mai avvenuto. Un millimetro e' ben oltre
+/// la precisione di qualunque posizione reale e ben sotto qualunque movimento che il
+/// server debba distinguere.
+const TOLLERANZA_ESTREMI_M: f64 = 0.001;
 
 /// Sorgente da cui il client legge la posizione da inviare al server.
 ///
@@ -457,12 +483,448 @@ fn normalizza_longitudine(gradi: f64) -> f64 {
     (gradi + 180.0).rem_euclid(360.0) - 180.0
 }
 
+/// Direzione iniziale, in gradi (0 = nord, 90 = est), della geodetica da `origine` ad
+/// `arrivo`.
+///
+/// E' l'azimut di partenza del cerchio massimo che unisce i due punti. Un'origine e un
+/// azimut iniziale individuano un unico cerchio massimo, quindi camminare `d` metri con
+/// [`destinazione`] lungo questa direzione da' esattamente il punto che sta a `d` metri
+/// lungo la geodetica verso l'arrivo: la direzione si calcola una volta sola alla
+/// costruzione della rotta, anche se l'azimut *vero* cambia strada facendo.
+///
+/// La differenza di longitudine non va normalizzata: seno e coseno sono periodici, quindi
+/// la formula da' l'azimut del tragitto breve anche quando i due punti stanno ai lati
+/// dell'antimeridiano, coerentemente con la distanza misurata da `haversine_meters`.
+fn rotta_iniziale(origine: Coordinate, arrivo: Coordinate) -> f64 {
+    let lat_origine = origine.lat().to_radians();
+    let lat_arrivo = arrivo.lat().to_radians();
+    let delta_lon = (arrivo.lon() - origine.lon()).to_radians();
+
+    let y = delta_lon.sin() * lat_arrivo.cos();
+    let x = lat_origine.cos() * lat_arrivo.sin()
+        - lat_origine.sin() * lat_arrivo.cos() * delta_lon.cos();
+
+    // `atan2` da' un angolo in `(-180, 180]`: gli azimut si contano da nord in senso
+    // orario, quindi si riporta in `[0, 360)`.
+    y.atan2(x).to_degrees().rem_euclid(360.0)
+}
+
+/// Sosta programmata lungo il tragitto di [`RouteSource`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pausa {
+    /// Punto del tragitto in cui la sosta avviene: `0.0` la partenza, `1.0` l'arrivo.
+    ///
+    /// I valori fuori da `[0, 1]` vengono riportati all'estremo piu' vicino e quelli non
+    /// finiti scartati, in entrambi i casi con un warn: vedi [`RouteSource::new`].
+    pub a_frazione: f64,
+    /// Quanto il veicolo resta fermo in quel punto.
+    pub durata: Duration,
+}
+
+/// Un tratto della linea del tempo di [`RouteSource`].
+///
+/// Movimento e sosta hanno la stessa forma: in una sosta le due frazioni coincidono,
+/// quindi interpolare fra loro restituisce sempre lo stesso punto e non serve
+/// distinguere i due casi al momento di calcolare la posizione.
+#[derive(Debug, Clone, Copy)]
+struct Tappa {
+    /// Inizio del tratto, in secondi dal tempo zero della sorgente.
+    inizio_s: f64,
+    /// Fine del tratto, in secondi dal tempo zero della sorgente.
+    fine_s: f64,
+    /// Frazione di tragitto gia' percorsa all'inizio del tratto.
+    da_frazione: f64,
+    /// Frazione di tragitto percorsa alla fine del tratto.
+    a_frazione: f64,
+}
+
+/// Sorgente che percorre una rotta fra due punti a velocita' costante, con soste.
+///
+/// Il veicolo parte da `partenza`, procede lungo la geodetica verso `arrivo` alla
+/// velocita' indicata e si ferma nei punti descritti dalle [`Pausa`], per poi restare
+/// fermo a destinazione. Come in [`FileSource`] il tempo zero e' il primo istante passato
+/// a [`PositionSource::next_position`], non quello di costruzione: fra la costruzione e la
+/// prima posizione inviata passano la connessione al server e l'autenticazione, e non ha
+/// senso che il tragitto scorra durante l'attesa.
+///
+/// Il tempo del movimento e quello delle soste non si sovrappongono: durante una pausa il
+/// tragitto non avanza, quindi la durata complessiva e' la somma del tempo di movimento
+/// (distanza diviso velocita') e della durata di tutte le pause.
+///
+/// Finita la rotta la sorgente non restituisce `None` ma ripete la coordinata di arrivo:
+/// a differenza di un percorso registrato che si esaurisce, una rotta conclusa e' un
+/// veicolo che esiste ancora e sta fermo a destinazione, ed e' cosi' che il server lo vede
+/// passare a `Still` (requisito R5).
+///
+/// # Esempio
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use chrono::Utc;
+/// use georuggine_client::sources::{Pausa, PositionSource, RouteSource};
+/// use georuggine_common::types::Coordinate;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let torino = Coordinate::new(45.0703, 7.6869)?;
+/// let milano = Coordinate::new(45.4642, 9.1900)?;
+/// let mut rotta = RouteSource::new(
+///     torino,
+///     milano,
+///     90.0,
+///     vec![Pausa { a_frazione: 0.5, durata: Duration::from_secs(600) }],
+/// );
+/// if let Some(posizione) = rotta.next_position(Utc::now()) {
+///     println!("{} {}", posizione.lat(), posizione.lon());
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct RouteSource {
+    /// Punto di partenza, restituito finche' il tragitto non e' cominciato.
+    partenza: Coordinate,
+    /// Punto di arrivo, restituito tale e quale a tragitto finito.
+    arrivo: Coordinate,
+    /// Lunghezza del tragitto in metri, misurata all'atto della costruzione.
+    distanza_totale_m: f64,
+    /// Azimut iniziale verso l'arrivo, in gradi: uno solo per tutto il tragitto.
+    direzione_gradi: f64,
+    /// Tratti in ordine di tempo e senza buchi: ognuno comincia dove finisce il
+    /// precedente. Vuoto solo se il tragitto ha durata nulla.
+    tappe: Vec<Tappa>,
+    /// Durata dell'intero tragitto, pause comprese, in secondi.
+    durata_totale_s: f64,
+    /// Vero quando la velocita' non e' utilizzabile: il veicolo non parte mai.
+    fermo: bool,
+    /// Istante da cui si contano i tempi, fissato alla prima chiamata.
+    zero: Option<DateTime<Utc>>,
+}
+
+impl RouteSource {
+    /// Prepara la rotta da `partenza` ad `arrivo` a `velocita_kmh`, con le soste indicate.
+    ///
+    /// La distanza si misura subito con l'emisenoverso e da li' si ricava il tempo di
+    /// movimento; le pause vengono ordinate per frazione crescente e intercalate ai tratti
+    /// di movimento, cosi' che a ogni chiamata basti cercare il tratto in corso. **Due
+    /// pause sulla stessa frazione diventano una sola sosta lunga quanto la somma delle
+    /// due**: tenerle distinte darebbe fra loro un tratto di movimento di durata nulla,
+    /// e le due varianti sarebbero comunque indistinguibili da fuori, visto che la
+    /// coordinata resta la stessa per tutto il tempo.
+    ///
+    /// Sono normalizzati, con un warn, anche i parametri assurdi, perche' arrivano dalla
+    /// configurazione e devono produrre un log leggibile e non una posizione priva di
+    /// senso:
+    ///
+    /// - `velocita_kmh` non positiva o non finita: il veicolo resta fermo alla partenza
+    ///   per sempre, pause comprese, e la rotta non arriva mai a destinazione;
+    /// - [`Pausa::a_frazione`] fuori da `[0, 1]`: riportata all'estremo piu' vicino, cioe'
+    ///   una sosta alla partenza o all'arrivo;
+    /// - [`Pausa::a_frazione`] non finita: la pausa viene scartata.
+    pub fn new(
+        partenza: Coordinate,
+        arrivo: Coordinate,
+        velocita_kmh: f64,
+        pause: Vec<Pausa>,
+    ) -> Self {
+        let fermo = !velocita_kmh.is_finite() || velocita_kmh <= 0.0;
+        if fermo {
+            tracing::warn!(
+                velocita_kmh,
+                "velocita' non utilizzabile: il veicolo resta fermo alla partenza"
+            );
+        }
+
+        let distanza_totale_m = georuggine_common::types::haversine_meters(partenza, arrivo);
+        let durata_movimento_s = if fermo {
+            0.0
+        } else {
+            distanza_totale_m / (velocita_kmh * 1_000.0 / 3_600.0)
+        };
+
+        let tappe = linea_del_tempo(durata_movimento_s, pause);
+        let durata_totale_s = tappe.last().map_or(0.0, |tappa| tappa.fine_s);
+
+        tracing::info!(
+            distanza_m = distanza_totale_m,
+            velocita_kmh,
+            durata_totale_s,
+            soste = tappe
+                .iter()
+                .filter(|t| t.da_frazione == t.a_frazione)
+                .count(),
+            "rotta preparata"
+        );
+
+        Self {
+            partenza,
+            arrivo,
+            distanza_totale_m,
+            direzione_gradi: rotta_iniziale(partenza, arrivo),
+            tappe,
+            durata_totale_s,
+            fermo,
+            zero: None,
+        }
+    }
+
+    /// Coordinata del punto che sta alla frazione `frazione` del tragitto.
+    ///
+    /// La posizione si costruisce con [`destinazione`], camminando lungo la geodetica per
+    /// la distanza gia' percorsa: **non** interpolando linearmente latitudine e
+    /// longitudine, che e' impreciso alle alte latitudini e su tragitti lunghi (vedi la
+    /// documentazione del modulo).
+    ///
+    /// I due estremi non passano dall'interpolazione: entro [`TOLLERANZA_ESTREMI_M`] si
+    /// restituiscono le coordinate ricevute dal costruttore, cosi' come sono. E' il raggio
+    /// di tolleranza che serve perche' distanza e velocita' non danno quasi mai un tempo
+    /// di arrivo esatto in virgola mobile, e un arrivo "quasi giusto" per pochi decimi di
+    /// millimetro si propagherebbe nelle analisi del server.
+    fn coordinata_a(&self, frazione: f64) -> Coordinate {
+        let percorsi_m = frazione * self.distanza_totale_m;
+        if percorsi_m <= TOLLERANZA_ESTREMI_M {
+            return self.partenza;
+        }
+        if self.distanza_totale_m - percorsi_m <= TOLLERANZA_ESTREMI_M {
+            return self.arrivo;
+        }
+
+        // La formula non produce coordinate fuori intervallo: se mai accadesse, il
+        // veicolo resta dov'era invece di finire in un punto inventato.
+        destinazione(self.partenza, percorsi_m, self.direzione_gradi).unwrap_or(self.partenza)
+    }
+}
+
+impl PositionSource for RouteSource {
+    /// Posizione lungo la rotta all'istante `now`, oppure l'arrivo se il tragitto e'
+    /// finito.
+    ///
+    /// Non restituisce mai `None`: vedi la documentazione di [`RouteSource`].
+    fn next_position(&mut self, now: DateTime<Utc>) -> Option<Coordinate> {
+        if self.fermo {
+            return Some(self.partenza);
+        }
+
+        let zero = *self.zero.get_or_insert(now);
+        let trascorso_s = secondi_trascorsi(zero, now);
+        if trascorso_s >= self.durata_totale_s {
+            return Some(self.arrivo);
+        }
+
+        // I tratti sono pochi (due per pausa, piu' uno) e in ordine di tempo: la scansione
+        // lineare costa meno di una ricerca dicotomica e si legge molto meglio.
+        for tappa in &self.tappe {
+            if trascorso_s < tappa.fine_s {
+                let durata_s = tappa.fine_s - tappa.inizio_s;
+                let avanzamento = if durata_s > 0.0 {
+                    ((trascorso_s - tappa.inizio_s) / durata_s).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let frazione =
+                    tappa.da_frazione + (tappa.a_frazione - tappa.da_frazione) * avanzamento;
+                return Some(self.coordinata_a(frazione));
+            }
+        }
+
+        Some(self.arrivo)
+    }
+
+    fn name(&self) -> &'static str {
+        "route"
+    }
+}
+
+/// Intercala i tratti di movimento alle soste, in ordine di tempo.
+///
+/// `durata_movimento_s` e' il tempo del solo movimento sull'intero tragitto: ogni tratto
+/// ne riceve la quota corrispondente alla frazione che copre, cosi' la velocita' resta
+/// costante e la somma dei tratti torna al totale.
+fn linea_del_tempo(durata_movimento_s: f64, pause: Vec<Pausa>) -> Vec<Tappa> {
+    let soste = normalizza_pause(pause);
+    let mut tappe = Vec::with_capacity(soste.len() * 2 + 1);
+    let mut cursore_s = 0.0;
+    let mut frazione = 0.0;
+
+    for (a_frazione, durata_sosta_s) in soste {
+        if a_frazione > frazione {
+            let durata_s = durata_movimento_s * (a_frazione - frazione);
+            tappe.push(Tappa {
+                inizio_s: cursore_s,
+                fine_s: cursore_s + durata_s,
+                da_frazione: frazione,
+                a_frazione,
+            });
+            cursore_s += durata_s;
+            frazione = a_frazione;
+        }
+
+        tappe.push(Tappa {
+            inizio_s: cursore_s,
+            fine_s: cursore_s + durata_sosta_s,
+            da_frazione: frazione,
+            a_frazione: frazione,
+        });
+        cursore_s += durata_sosta_s;
+    }
+
+    if frazione < 1.0 {
+        tappe.push(Tappa {
+            inizio_s: cursore_s,
+            fine_s: cursore_s + durata_movimento_s * (1.0 - frazione),
+            da_frazione: frazione,
+            a_frazione: 1.0,
+        });
+    }
+
+    tappe
+}
+
+/// Riporta le pause in `[0, 1]`, le ordina per frazione crescente e fonde quelle che
+/// cadono nello stesso punto, restituendo coppie `(frazione, durata in secondi)`.
+fn normalizza_pause(pause: Vec<Pausa>) -> Vec<(f64, f64)> {
+    let mut soste: Vec<(f64, f64)> = Vec::with_capacity(pause.len());
+
+    for pausa in pause {
+        if !pausa.a_frazione.is_finite() {
+            tracing::warn!(
+                a_frazione = pausa.a_frazione,
+                "pausa con frazione non finita, scartata"
+            );
+            continue;
+        }
+
+        let frazione = pausa.a_frazione.clamp(0.0, 1.0);
+        if frazione != pausa.a_frazione {
+            tracing::warn!(
+                richiesta = pausa.a_frazione,
+                usata = frazione,
+                "frazione di pausa fuori da [0, 1], riportata all'estremo piu' vicino"
+            );
+        }
+        soste.push((frazione, pausa.durata.as_secs_f64()));
+    }
+
+    // Le frazioni sono finite, quindi `total_cmp` e' qui un ordine totale come lo sarebbe
+    // il confronto usuale, senza il caso `None` di `partial_cmp` da gestire.
+    soste.sort_by(|(una, _), (altra, _)| una.total_cmp(altra));
+
+    let mut fuse: Vec<(f64, f64)> = Vec::with_capacity(soste.len());
+    for (frazione, durata_s) in soste {
+        match fuse.last_mut() {
+            // Ordinate, le pause sullo stesso punto sono adiacenti: sommarle evita di
+            // separarle con un tratto di movimento di durata nulla.
+            Some((ultima, accumulata)) if *ultima == frazione => *accumulata += durata_s,
+            _ => fuse.push((frazione, durata_s)),
+        }
+    }
+
+    fuse
+}
+
+/// Secondi trascorsi da `zero` a `now`, mai negativi.
+///
+/// Un `now` precedente al tempo zero non dovrebbe arrivare, ma un orologio corretto
+/// all'indietro puo' produrlo: vale come istante zero, cosi' il veicolo si limita a
+/// restare alla partenza invece di indietreggiare fuori dal tragitto. Uno scarto talmente
+/// grande da non stare in microsecondi (oltre duecentomila anni) diventa
+/// [`f64::INFINITY`], che ogni rotta legge come "ampiamente arrivato".
+fn secondi_trascorsi(zero: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
+    match now.signed_duration_since(zero).num_microseconds() {
+        Some(microsecondi) if microsecondi <= 0 => 0.0,
+        Some(microsecondi) => microsecondi as f64 / 1e6,
+        None => f64::INFINITY,
+    }
+}
+
+/// Sorgente guidata da fuori: la posizione arriva su un canale, dall'operatore.
+///
+/// Serve per la prova manuale e per la dimostrazione: chi tiene il capo trasmittente
+/// decide dove si trova il veicolo, senza percorsi registrati ne' generatori casuali.
+///
+/// Il canale e' quello sincrono di [`std::sync::mpsc`] e non quello di tokio, perche'
+/// [`PositionSource::next_position`] e' un metodo sincrono che puo' essere chiamato anche
+/// fuori da un contesto asincrono; la lettura usa
+/// [`try_recv`](std::sync::mpsc::Receiver::try_recv) e non blocca mai, perche' una
+/// sorgente che si mette in attesa fermerebbe l'invio periodico delle posizioni.
+///
+/// Ogni chiamata svuota il canale e tiene l'ultima coordinata arrivata: le posizioni
+/// accumulate fra due chiamate non sono una coda da smaltire un elemento per volta ma
+/// correzioni successive dello stesso operatore, di cui vale l'ultima. Finche' non ne
+/// arriva nessuna vale la coordinata iniziale, e la sorgente non finisce mai: un operatore
+/// che smette di mandare posizioni non ha concluso la simulazione, ha solo lasciato il
+/// veicolo fermo dov'era.
+#[derive(Debug)]
+pub struct ManualSource {
+    /// Ultima coordinata nota: quella iniziale finche' il canale non ne consegna un'altra.
+    corrente: Coordinate,
+    /// Capo ricevente del canale alimentato dall'operatore.
+    comandi: Receiver<Coordinate>,
+}
+
+impl ManualSource {
+    /// Costruisce la sorgente ferma su `iniziale`, insieme al capo con cui guidarla.
+    ///
+    /// Il canale nasce qui e non viene passato da fuori perche' i due capi hanno senso
+    /// solo in coppia: restituirli insieme rende impossibile costruire una sorgente il
+    /// cui mittente e' gia' stato perso. Lasciar cadere il [`Sender`] non e' comunque un
+    /// errore: la sorgente continua a ripetere l'ultima coordinata nota.
+    pub fn new(iniziale: Coordinate) -> (Self, Sender<Coordinate>) {
+        let (trasmettitore, comandi) = mpsc::channel();
+        (
+            Self {
+                corrente: iniziale,
+                comandi,
+            },
+            trasmettitore,
+        )
+    }
+}
+
+impl PositionSource for ManualSource {
+    /// Aggiorna la posizione con l'ultima coordinata ricevuta, o ripete quella nota.
+    ///
+    /// L'istante `now` non conta: questa sorgente e' guidata dagli invii, non dal tempo.
+    /// Non restituisce mai `None`.
+    fn next_position(&mut self, _now: DateTime<Utc>) -> Option<Coordinate> {
+        // Il ciclo termina sempre: `try_recv` fallisce non appena il canale e' vuoto o
+        // senza mittenti, e nessuno puo' riempirlo piu' in fretta di quanto lo si svuota
+        // qui, visto che ogni invio richiede il suo tempo.
+        while let Ok(coordinate) = self.comandi.try_recv() {
+            self.corrente = coordinate;
+        }
+
+        Some(self.corrente)
+    }
+
+    fn name(&self) -> &'static str {
+        "manual"
+    }
+}
+
+/// Esito di [`SourceKind::build`]: la sorgente e, dove serve, il canale per guidarla.
+///
+/// Esiste perche' una sola variante, [`SourceKind::Manual`], ha bisogno di restituire
+/// qualcosa in piu' della sorgente. L'alternativa — lasciare `build` com'era e aggiungere
+/// un costruttore separato per il caso manuale — renderebbe rappresentabile uno stato
+/// illegale, cioe' una variante su cui `build` deve fallire per un motivo che non e' un
+/// errore di configurazione; qui invece ogni variante si costruisce allo stesso modo e
+/// chi non ha un canale lo dichiara con `None`.
+pub struct SorgenteCostruita {
+    /// Sorgente pronta all'uso, dietro il trait.
+    pub sorgente: Box<dyn PositionSource>,
+    /// Capo trasmittente di [`ManualSource`], `None` per ogni altra variante.
+    ///
+    /// Finche' resta vivo si possono inviare nuove posizioni; lasciarlo cadere non ferma
+    /// la sorgente, che si limita a ripetere l'ultima coordinata nota.
+    pub comandi: Option<Sender<Coordinate>>,
+}
+
 /// Strategia di simulazione scelta dalla configurazione del client.
 ///
 /// E' il punto in cui la configurazione diventa codice: le varianti descrivono i
-/// parametri, [`SourceKind::build`] costruisce l'oggetto. Le due strategie che mancano
-/// alla traccia (percorso interpolato e inserimento manuale) si aggiungono qui come
-/// nuove varianti, senza toccare chi consuma le posizioni.
+/// parametri, [`SourceKind::build`] costruisce l'oggetto. Chi consuma le posizioni vede
+/// solo [`PositionSource`], quindi aggiungere una strategia non lo tocca.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceKind {
     /// Percorso registrato su file CSV, riprodotto da [`FileSource`].
@@ -483,35 +945,83 @@ pub enum SourceKind {
         /// Seme del generatore: a parita' di seme il cammino si ripete identico.
         seed: u64,
     },
+    /// Rotta a velocita' costante fra due punti, percorsa da [`RouteSource`].
+    Route {
+        /// Punto di partenza del tragitto.
+        partenza: Coordinate,
+        /// Punto di arrivo, dove il veicolo resta fermo a tragitto finito.
+        arrivo: Coordinate,
+        /// Velocita' di percorrenza in chilometri orari.
+        velocita_kmh: f64,
+        /// Soste programmate lungo il tragitto, in qualsiasi ordine.
+        pause: Vec<Pausa>,
+    },
+    /// Posizione decisa dall'operatore su un canale, servita da [`ManualSource`].
+    Manual {
+        /// Coordinata su cui il veicolo si trova prima di ogni invio.
+        iniziale: Coordinate,
+    },
 }
 
 impl SourceKind {
     /// Costruisce la sorgente descritta da questa variante.
     ///
+    /// Il canale di [`SorgenteCostruita::comandi`] e' valorizzato solo da
+    /// [`SourceKind::Manual`]: e' l'unica strategia che si guida da fuori.
+    ///
     /// # Errori
     ///
     /// Gli errori di [`FileSource::from_path`], che qui non vengono assorbiti: un
     /// percorso illeggibile o senza punti deve fermare l'avvio del client, non
-    /// trasformarsi in un veicolo che non si muove. [`SourceKind::RandomWalk`] non puo'
-    /// fallire e restituisce sempre `Ok`.
-    pub fn build(&self) -> io::Result<Box<dyn PositionSource>> {
-        match self {
+    /// trasformarsi in un veicolo che non si muove. Le altre varianti normalizzano i
+    /// parametri assurdi con un warn e restituiscono sempre `Ok`.
+    pub fn build(&self) -> io::Result<SorgenteCostruita> {
+        let costruita = match self {
             Self::File {
                 percorso,
                 loop_forever,
-            } => Ok(Box::new(FileSource::from_path(percorso, *loop_forever)?)),
+            } => SorgenteCostruita {
+                sorgente: Box::new(FileSource::from_path(percorso, *loop_forever)?),
+                comandi: None,
+            },
             Self::RandomWalk {
                 partenza,
                 raggio_massimo_m,
                 passo_massimo_m,
                 seed,
-            } => Ok(Box::new(RandomWalkSource::new(
-                *partenza,
-                *raggio_massimo_m,
-                *passo_massimo_m,
-                *seed,
-            ))),
-        }
+            } => SorgenteCostruita {
+                sorgente: Box::new(RandomWalkSource::new(
+                    *partenza,
+                    *raggio_massimo_m,
+                    *passo_massimo_m,
+                    *seed,
+                )),
+                comandi: None,
+            },
+            Self::Route {
+                partenza,
+                arrivo,
+                velocita_kmh,
+                pause,
+            } => SorgenteCostruita {
+                sorgente: Box::new(RouteSource::new(
+                    *partenza,
+                    *arrivo,
+                    *velocita_kmh,
+                    pause.clone(),
+                )),
+                comandi: None,
+            },
+            Self::Manual { iniziale } => {
+                let (sorgente, comandi) = ManualSource::new(*iniziale);
+                SorgenteCostruita {
+                    sorgente: Box::new(sorgente),
+                    comandi: Some(comandi),
+                }
+            }
+        };
+
+        Ok(costruita)
     }
 }
 
@@ -537,9 +1047,35 @@ mod tests {
         base + TimeDelta::try_seconds(secondi).expect("scarto valido")
     }
 
+    /// Istante di riferimento dei test piu' `secondi`, anche frazionari.
+    ///
+    /// I tempi di [`RouteSource`] escono da una divisione fra distanza e velocita', quindi
+    /// non cadono quasi mai su un secondo intero: la risoluzione al microsecondo basta a
+    /// campionare gli istanti che interessano senza doverli arrotondare.
+    fn af(secondi: f64) -> DateTime<Utc> {
+        a(0) + TimeDelta::microseconds((secondi * 1e6) as i64)
+    }
+
     /// Punto di partenza dei test sul cammino casuale: Piazza Castello, Torino.
     fn torino() -> Coordinate {
         coord(45.0703, 7.6869)
+    }
+
+    /// Arrivo dei test sulla rotta: Piazza Duomo, Milano, un centinaio di chilometri.
+    fn milano() -> Coordinate {
+        coord(45.4642, 9.1900)
+    }
+
+    /// Velocita' dei test sulla rotta: a 100 km/h il veicolo copre 27,8 m al secondo,
+    /// abbastanza da rendere leggibili gli scarti misurati in metri.
+    const VELOCITA_PROVA_KMH: f64 = 100.0;
+
+    /// Secondi di solo movimento fra due coordinate a [`VELOCITA_PROVA_KMH`].
+    ///
+    /// Ripete il conto che fa [`RouteSource::new`]: se i due divergessero, i test sui
+    /// tempi di arrivo non verificherebbero piu' nulla.
+    fn durata_movimento_s(partenza: Coordinate, arrivo: Coordinate) -> f64 {
+        haversine_meters(partenza, arrivo) / (VELOCITA_PROVA_KMH * 1_000.0 / 3_600.0)
     }
 
     /// File CSV di prova, cancellato quando il test finisce.
@@ -946,6 +1482,493 @@ mod tests {
         );
     }
 
+    // --- RouteSource ---
+
+    #[test]
+    fn una_rotta_senza_pause_arriva_al_tempo_atteso() {
+        let movimento_s = durata_movimento_s(torino(), milano());
+        let mut rotta = RouteSource::new(torino(), milano(), VELOCITA_PROVA_KMH, Vec::new());
+
+        assert_eq!(
+            rotta.next_position(af(0.0)),
+            Some(torino()),
+            "al tempo zero il veicolo e' ancora alla partenza"
+        );
+
+        let poco_prima = rotta
+            .next_position(af(movimento_s - 1.0))
+            .expect("la rotta non finisce mai");
+        assert_ne!(
+            poco_prima,
+            milano(),
+            "un secondo prima del tempo previsto il veicolo e' ancora in viaggio"
+        );
+        let mancanti = haversine_meters(poco_prima, milano());
+        assert!(
+            (20.0..40.0).contains(&mancanti),
+            "a un secondo dall'arrivo, a {VELOCITA_PROVA_KMH} km/h, mancano ~28 m: misurati {mancanti} m"
+        );
+
+        assert_eq!(
+            rotta.next_position(af(movimento_s)),
+            Some(milano()),
+            "il tempo di arrivo e' distanza / velocita'"
+        );
+    }
+
+    #[test]
+    fn l_arrivo_e_esattamente_la_coordinata_del_costruttore() {
+        let mut rotta = RouteSource::new(torino(), milano(), VELOCITA_PROVA_KMH, Vec::new());
+        rotta.next_position(af(0.0));
+
+        let dopo = rotta
+            .next_position(af(100_000.0))
+            .expect("la rotta non finisce mai");
+        // Non "un punto vicino calcolato per interpolazione": gli stessi bit passati al
+        // costruttore, altrimenti il server accumulerebbe errori di analisi.
+        assert_eq!(
+            (dopo.lat().to_bits(), dopo.lon().to_bits()),
+            (milano().lat().to_bits(), milano().lon().to_bits()),
+            "l'arrivo deve coincidere bit a bit con la coordinata di destinazione"
+        );
+    }
+
+    #[test]
+    fn il_tempo_zero_della_rotta_e_la_prima_chiamata() {
+        let movimento_s = durata_movimento_s(torino(), milano());
+        let mut rotta = RouteSource::new(torino(), milano(), VELOCITA_PROVA_KMH, Vec::new());
+
+        // Fra la costruzione e il primo uso passano la connessione e l'autenticazione:
+        // il tragitto non deve scorrere durante l'attesa.
+        assert_eq!(
+            rotta.next_position(af(3_600.0)),
+            Some(torino()),
+            "il tragitto comincia alla prima chiamata, non alla costruzione"
+        );
+        assert_eq!(
+            rotta.next_position(af(3_600.0 + movimento_s)),
+            Some(milano()),
+            "l'arrivo e' un tempo di movimento dopo la prima chiamata"
+        );
+    }
+
+    #[test]
+    fn una_pausa_a_meta_tragitto_congela_la_coordinata() {
+        const PAUSA_S: f64 = 600.0;
+        let movimento_s = durata_movimento_s(torino(), milano());
+        let mut rotta = RouteSource::new(
+            torino(),
+            milano(),
+            VELOCITA_PROVA_KMH,
+            vec![Pausa {
+                a_frazione: 0.5,
+                durata: Duration::from_secs(600),
+            }],
+        );
+        rotta.next_position(af(0.0));
+
+        // Il campione di riferimento sta dentro la pausa e non sull'istante esatto in cui
+        // comincia, che appartiene ancora al tratto di movimento.
+        let inizio_pausa = movimento_s / 2.0;
+        let in_sosta = rotta
+            .next_position(af(inizio_pausa + 0.5))
+            .expect("la rotta non finisce mai");
+
+        let percorsi = haversine_meters(torino(), in_sosta);
+        let meta = haversine_meters(torino(), milano()) / 2.0;
+        assert!(
+            (percorsi - meta).abs() < 1.0,
+            "la pausa a 0.5 cade a meta' tragitto: attesi {meta} m, percorsi {percorsi} m"
+        );
+
+        for istante in [1.0, 60.0, 300.0, PAUSA_S - 0.001] {
+            assert_eq!(
+                rotta.next_position(af(inizio_pausa + istante)),
+                Some(in_sosta),
+                "durante la pausa la coordinata non cambia (a {istante} s dall'inizio)"
+            );
+        }
+
+        assert_ne!(
+            rotta.next_position(af(inizio_pausa + PAUSA_S + 1.0)),
+            Some(in_sosta),
+            "finita la pausa il veicolo riprende a muoversi"
+        );
+    }
+
+    #[test]
+    fn durante_le_pause_il_tempo_del_movimento_si_ferma() {
+        let movimento_s = durata_movimento_s(torino(), milano());
+        let mut rotta = RouteSource::new(
+            torino(),
+            milano(),
+            VELOCITA_PROVA_KMH,
+            vec![
+                Pausa {
+                    a_frazione: 0.25,
+                    durata: Duration::from_secs(300),
+                },
+                Pausa {
+                    a_frazione: 0.75,
+                    durata: Duration::from_secs(180),
+                },
+            ],
+        );
+        rotta.next_position(af(0.0));
+
+        assert_ne!(
+            rotta.next_position(af(movimento_s)),
+            Some(milano()),
+            "trascorso il solo tempo di movimento il veicolo non e' ancora arrivato"
+        );
+
+        let totale_s = movimento_s + 480.0;
+        assert_ne!(
+            rotta.next_position(af(totale_s - 1.0)),
+            Some(milano()),
+            "un secondo prima del totale il veicolo e' ancora in viaggio"
+        );
+        assert_eq!(
+            rotta.next_position(af(totale_s)),
+            Some(milano()),
+            "il tragitto dura il movimento piu' la durata di tutte le pause"
+        );
+    }
+
+    #[test]
+    fn due_pause_separate_da_movimento_stanno_in_punti_diversi() {
+        let movimento_s = durata_movimento_s(torino(), milano());
+        let mut rotta = RouteSource::new(
+            torino(),
+            milano(),
+            VELOCITA_PROVA_KMH,
+            vec![
+                Pausa {
+                    a_frazione: 0.25,
+                    durata: Duration::from_secs(300),
+                },
+                Pausa {
+                    a_frazione: 0.75,
+                    durata: Duration::from_secs(300),
+                },
+            ],
+        );
+        rotta.next_position(af(0.0));
+
+        let prima_sosta = rotta
+            .next_position(af(movimento_s * 0.25 + 10.0))
+            .expect("la rotta non finisce mai");
+        let in_mezzo = rotta
+            .next_position(af(movimento_s * 0.5 + 300.0))
+            .expect("la rotta non finisce mai");
+        let seconda_sosta = rotta
+            .next_position(af(movimento_s * 0.75 + 310.0))
+            .expect("la rotta non finisce mai");
+
+        assert_ne!(
+            in_mezzo, prima_sosta,
+            "fra le due pause il veicolo si muove"
+        );
+        assert_ne!(
+            in_mezzo, seconda_sosta,
+            "il tratto centrale e' un altro punto"
+        );
+        assert_ne!(
+            prima_sosta, seconda_sosta,
+            "le due soste sono in punti diversi"
+        );
+
+        let da_torino = |punto| haversine_meters(torino(), punto);
+        assert!(
+            da_torino(prima_sosta) < da_torino(in_mezzo)
+                && da_torino(in_mezzo) < da_torino(seconda_sosta),
+            "i tre punti si susseguono lungo il tragitto"
+        );
+    }
+
+    #[test]
+    fn le_pause_vengono_ordinate_per_frazione_crescente() {
+        let movimento_s = durata_movimento_s(torino(), milano());
+        let pause = vec![
+            Pausa {
+                a_frazione: 0.75,
+                durata: Duration::from_secs(300),
+            },
+            Pausa {
+                a_frazione: 0.25,
+                durata: Duration::from_secs(300),
+            },
+        ];
+        let mut disordinate =
+            RouteSource::new(torino(), milano(), VELOCITA_PROVA_KMH, pause.clone());
+        let mut ordinate = RouteSource::new(
+            torino(),
+            milano(),
+            VELOCITA_PROVA_KMH,
+            pause.into_iter().rev().collect(),
+        );
+
+        for passo in 0..40 {
+            let istante = af(f64::from(passo) * movimento_s / 20.0);
+            assert_eq!(
+                disordinate.next_position(istante),
+                ordinate.next_position(istante),
+                "l'ordine in cui le pause sono elencate non cambia il tragitto (passo {passo})"
+            );
+        }
+    }
+
+    #[test]
+    fn due_pause_sulla_stessa_frazione_diventano_una_sosta_piu_lunga() {
+        let movimento_s = durata_movimento_s(torino(), milano());
+        let mut rotta = RouteSource::new(
+            torino(),
+            milano(),
+            VELOCITA_PROVA_KMH,
+            vec![
+                Pausa {
+                    a_frazione: 0.5,
+                    durata: Duration::from_secs(120),
+                },
+                Pausa {
+                    a_frazione: 0.5,
+                    durata: Duration::from_secs(180),
+                },
+            ],
+        );
+        rotta.next_position(af(0.0));
+
+        let inizio_pausa = movimento_s / 2.0;
+        let in_sosta = rotta
+            .next_position(af(inizio_pausa + 1.0))
+            .expect("la rotta non finisce mai");
+        assert_eq!(
+            rotta.next_position(af(inizio_pausa + 299.0)),
+            Some(in_sosta),
+            "le due pause nello stesso punto valgono una sosta di 300 s"
+        );
+        assert_ne!(
+            rotta.next_position(af(inizio_pausa + 301.0)),
+            Some(in_sosta),
+            "scaduta la sosta fusa il veicolo riparte"
+        );
+        assert_eq!(
+            rotta.next_position(af(movimento_s + 300.0)),
+            Some(milano()),
+            "il tragitto si allunga della somma delle due pause"
+        );
+    }
+
+    #[test]
+    fn dopo_l_arrivo_la_rotta_ripete_l_arrivo_e_non_finisce_mai() {
+        let mut rotta = RouteSource::new(torino(), milano(), VELOCITA_PROVA_KMH, Vec::new());
+        rotta.next_position(af(0.0));
+
+        // Una rotta conclusa resta un veicolo che esiste e sta fermo a destinazione:
+        // a differenza di FileSource non ciclico non restituisce mai `None`.
+        for ora in 2..26 {
+            assert_eq!(
+                rotta.next_position(af(3_600.0 * f64::from(ora))),
+                Some(milano()),
+                "dopo l'arrivo la rotta ripete la destinazione (ora {ora})"
+            );
+        }
+    }
+
+    #[test]
+    fn velocita_non_valida_lascia_il_veicolo_alla_partenza() {
+        for velocita_kmh in [0.0, -10.0, f64::NAN, f64::INFINITY] {
+            let mut rotta = RouteSource::new(
+                torino(),
+                milano(),
+                velocita_kmh,
+                vec![Pausa {
+                    a_frazione: 0.5,
+                    durata: Duration::from_secs(60),
+                }],
+            );
+
+            for istante in [0.0, 1.0, 10_000.0, 1e9] {
+                assert_eq!(
+                    rotta.next_position(af(istante)),
+                    Some(torino()),
+                    "velocita' {velocita_kmh}: il veicolo resta fermo alla partenza (istante {istante})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn una_pausa_fuori_intervallo_viene_riportata_agli_estremi() {
+        let movimento_s = durata_movimento_s(torino(), milano());
+        let mut rotta = RouteSource::new(
+            torino(),
+            milano(),
+            VELOCITA_PROVA_KMH,
+            vec![
+                Pausa {
+                    a_frazione: -1.0,
+                    durata: Duration::from_secs(60),
+                },
+                Pausa {
+                    a_frazione: 2.0,
+                    durata: Duration::from_secs(60),
+                },
+            ],
+        );
+        rotta.next_position(af(0.0));
+
+        assert_eq!(
+            rotta.next_position(af(30.0)),
+            Some(torino()),
+            "la frazione negativa diventa una sosta alla partenza"
+        );
+        assert_ne!(
+            rotta.next_position(af(59.0 + movimento_s)),
+            Some(milano()),
+            "il movimento comincia solo dopo la sosta iniziale"
+        );
+        assert_eq!(
+            rotta.next_position(af(60.0 + movimento_s)),
+            Some(milano()),
+            "la frazione oltre uno diventa una sosta all'arrivo"
+        );
+        assert_eq!(
+            rotta.next_position(af(200.0 + movimento_s)),
+            Some(milano()),
+            "che e' indistinguibile dal veicolo fermo a destinazione"
+        );
+    }
+
+    #[test]
+    fn una_pausa_con_frazione_non_finita_viene_scartata() {
+        let movimento_s = durata_movimento_s(torino(), milano());
+        let mut rotta = RouteSource::new(
+            torino(),
+            milano(),
+            VELOCITA_PROVA_KMH,
+            vec![Pausa {
+                a_frazione: f64::NAN,
+                durata: Duration::from_secs(600),
+            }],
+        );
+        rotta.next_position(af(0.0));
+
+        assert_eq!(
+            rotta.next_position(af(movimento_s)),
+            Some(milano()),
+            "una pausa con frazione non finita non allunga il tragitto"
+        );
+    }
+
+    #[test]
+    fn la_posizione_intermedia_sta_sulla_geodetica_non_sulla_media_dei_gradi() {
+        // Rotta lunga e ad alta latitudine: e' il caso in cui la media aritmetica di
+        // latitudine e longitudine sbaglia di parecchi chilometri, perche' la geodetica
+        // piega verso il polo mentre la media resta sul parallelo.
+        let partenza = coord(60.0, 0.0);
+        let arrivo = coord(60.0, 60.0);
+        let movimento_s = durata_movimento_s(partenza, arrivo);
+        let mut rotta = RouteSource::new(partenza, arrivo, VELOCITA_PROVA_KMH, Vec::new());
+        rotta.next_position(af(0.0));
+
+        let meta = rotta
+            .next_position(af(movimento_s / 2.0))
+            .expect("la rotta non finisce mai");
+
+        let mezza_distanza = haversine_meters(partenza, arrivo) / 2.0;
+        assert!(
+            (haversine_meters(partenza, meta) - mezza_distanza).abs() < 1.0
+                && (haversine_meters(meta, arrivo) - mezza_distanza).abs() < 1.0,
+            "a meta' tempo il veicolo e' equidistante dagli estremi: {meta:?}"
+        );
+        assert!(
+            meta.lat() > 60.5,
+            "la media aritmetica darebbe latitudine 60: la geodetica passa a nord, {}",
+            meta.lat()
+        );
+    }
+
+    // --- ManualSource ---
+
+    #[test]
+    fn prima_di_ogni_invio_ripete_la_coordinata_iniziale() {
+        let (mut sorgente, _comandi) = ManualSource::new(torino());
+
+        for chiamata in 0..10 {
+            assert_eq!(
+                sorgente.next_position(a(chiamata)),
+                Some(torino()),
+                "il veicolo esiste fin dall'inizio, sulla coordinata iniziale (chiamata {chiamata})"
+            );
+        }
+    }
+
+    #[test]
+    fn dopo_un_invio_la_nuova_coordinata_resta_finche_non_ne_arriva_un_altra() {
+        let (mut sorgente, comandi) = ManualSource::new(torino());
+
+        comandi.send(milano()).expect("il ricevitore e' vivo");
+        assert_eq!(sorgente.next_position(a(0)), Some(milano()));
+        assert_eq!(
+            sorgente.next_position(a(1)),
+            Some(milano()),
+            "senza nuovi invii la coordinata si ripete"
+        );
+
+        let roma = coord(41.9028, 12.4964);
+        comandi.send(roma).expect("il ricevitore e' vivo");
+        assert_eq!(sorgente.next_position(a(2)), Some(roma));
+        assert_eq!(sorgente.next_position(a(3)), Some(roma));
+    }
+
+    #[test]
+    fn di_piu_coordinate_in_coda_vale_solo_l_ultima() {
+        let (mut sorgente, comandi) = ManualSource::new(torino());
+        let ultima = coord(41.9028, 12.4964);
+
+        // Nessuna chiamata a next_position fra un invio e l'altro: a differenza di
+        // FileSource la coda non si smaltisce un elemento per volta, l'operatore ha
+        // corretto la posizione due volte e vale l'ultima parola.
+        comandi
+            .send(coord(43.0, 7.0))
+            .expect("il ricevitore e' vivo");
+        comandi.send(milano()).expect("il ricevitore e' vivo");
+        comandi.send(ultima).expect("il ricevitore e' vivo");
+
+        assert_eq!(
+            sorgente.next_position(a(0)),
+            Some(ultima),
+            "il canale viene svuotato: vale l'ultima coordinata disponibile"
+        );
+        assert_eq!(
+            sorgente.next_position(a(1)),
+            Some(ultima),
+            "e non resta nulla di arretrato da consegnare"
+        );
+    }
+
+    #[test]
+    fn il_mittente_caduto_non_ferma_la_sorgente() {
+        let (mut sorgente, comandi) = ManualSource::new(torino());
+
+        comandi.send(milano()).expect("il ricevitore e' vivo");
+        drop(comandi);
+
+        assert_eq!(
+            sorgente.next_position(a(0)),
+            Some(milano()),
+            "le coordinate gia' inviate arrivano anche a mittente caduto"
+        );
+        for chiamata in 1..10 {
+            assert_eq!(
+                sorgente.next_position(a(chiamata)),
+                Some(milano()),
+                "senza mittente la sorgente ripete l'ultima nota (chiamata {chiamata})"
+            );
+        }
+    }
+
     // --- SourceKind ---
 
     #[test]
@@ -958,7 +1981,11 @@ mod tests {
         }
         .build()
         .expect("costruzione riuscita");
-        assert_eq!(da_file.name(), "file");
+        assert_eq!(da_file.sorgente.name(), "file");
+        assert!(
+            da_file.comandi.is_none(),
+            "solo la sorgente manuale ha un canale"
+        );
 
         let casuale = SourceKind::RandomWalk {
             partenza: torino(),
@@ -968,7 +1995,59 @@ mod tests {
         }
         .build()
         .expect("il cammino casuale non puo' fallire");
-        assert_eq!(casuale.name(), "random-walk");
+        assert_eq!(casuale.sorgente.name(), "random-walk");
+        assert!(casuale.comandi.is_none());
+    }
+
+    #[test]
+    fn la_factory_costruisce_la_rotta() {
+        let movimento_s = durata_movimento_s(torino(), milano());
+        let mut rotta = SourceKind::Route {
+            partenza: torino(),
+            arrivo: milano(),
+            velocita_kmh: VELOCITA_PROVA_KMH,
+            pause: vec![Pausa {
+                a_frazione: 0.5,
+                durata: Duration::from_secs(300),
+            }],
+        }
+        .build()
+        .expect("la rotta non puo' fallire");
+
+        assert_eq!(rotta.sorgente.name(), "route");
+        assert!(rotta.comandi.is_none(), "la rotta non si guida da fuori");
+
+        rotta.sorgente.next_position(af(0.0));
+        assert_eq!(
+            rotta.sorgente.next_position(af(movimento_s + 300.0)),
+            Some(milano()),
+            "la factory passa davvero pause e velocita' alla sorgente"
+        );
+    }
+
+    #[test]
+    fn la_factory_costruisce_la_sorgente_manuale_col_suo_canale() {
+        let mut manuale = SourceKind::Manual { iniziale: torino() }
+            .build()
+            .expect("la sorgente manuale non puo' fallire");
+
+        assert_eq!(manuale.sorgente.name(), "manual");
+        assert_eq!(
+            manuale.sorgente.next_position(a(0)),
+            Some(torino()),
+            "la coordinata iniziale e' quella della configurazione"
+        );
+
+        let comandi = manuale
+            .comandi
+            .take()
+            .expect("la variante manuale restituisce il capo trasmittente");
+        comandi.send(milano()).expect("il ricevitore e' vivo");
+        assert_eq!(
+            manuale.sorgente.next_position(a(1)),
+            Some(milano()),
+            "il canale restituito alimenta davvero la sorgente costruita"
+        );
     }
 
     #[test]
