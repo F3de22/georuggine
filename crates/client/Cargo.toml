@@ -20,6 +20,7 @@ georuggine-common = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
@@ -29,3 +30,8 @@ tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+
+[dev-dependencies]
+# Serve solo ai test: `tokio::time::pause`/`advance` per verificare il ticker delle
+# posizioni senza aspettare i tempi reali. Non e' abilitata nella build di produzione.
+tokio = { workspace = true, features = ["test-util"] }

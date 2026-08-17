@@ -571,6 +571,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "futures-util",
  "georuggine-common",
  "rand 0.10.2",
  "ratatui",
