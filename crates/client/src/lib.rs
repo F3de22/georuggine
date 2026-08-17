@@ -6,4 +6,5 @@
 //! Valgono le invarianti del progetto: errori con `thiserror`, niente
 //! `unwrap`/`expect`/`panic!` sui percorsi di produzione e nessun `unsafe`.
 
+pub mod core;
 pub mod sources;
