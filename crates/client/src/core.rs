@@ -23,6 +23,18 @@
 //! invece non si ripete da solo: emette [`ClientEvent::Error`] e il task termina,
 //! perche' riprovare con la stessa password sbagliata non cambierebbe esito.
 //!
+//! # Sessione sostituita
+//!
+//! C'e' un terzo percorso di uscita, distinto da entrambi. Il server ammette una sola
+//! sessione per utente: se lo stesso account si collega altrove, chiude questa
+//! connessione dopo aver mandato un [`ServerMessage::Error`] con il testo
+//! [`SESSION_REPLACED_MESSAGE`]. E' una chiusura voluta, non una caduta di rete, e va
+//! trattata diversamente: il task emette [`ClientEvent::Disconnected`] con quel motivo e
+//! **termina senza riconnettersi**. Riprovare rimetterebbe fuori la connessione che ha
+//! preso il posto di questa, la quale a sua volta si riconnetterebbe, in un ciclo che non
+//! finisce piu'; sta all'utente decidere se rilanciare il client. Il percorso della
+//! riconnessione per errore di rete resta invece quello di sopra, immutato.
+//!
 //! # Posizioni mentre la connessione e' caduta
 //!
 //! Il ticker delle posizioni interroga la sorgente ogni trenta secondi **anche senza
@@ -44,7 +56,8 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use georuggine_common::clock::{Clock, SystemClock};
 use georuggine_common::codec::{ClientCodec, ServerCodec};
 use georuggine_common::protocol::{
-    AnalysisRange, ClientMessage, ErrorCode, MovementSummary, PROTOCOL_VERSION, ServerMessage,
+    AnalysisRange, ClientMessage, ErrorCode, MovementSummary, PROTOCOL_VERSION,
+    SESSION_REPLACED_MESSAGE, ServerMessage,
 };
 use georuggine_common::types::{Coordinate, UserState, Username, UsernameError};
 use thiserror::Error;
@@ -434,7 +447,9 @@ pub enum ClientEvent {
     /// La sessione e' aperta: handshake, autenticazione e messaggi in attesa consegnati.
     Connected,
     /// La connessione e' caduta; il campo descrive il motivo. Un tentativo di
-    /// riconnessione e' gia' in corso, salvo che il task stia per terminare.
+    /// riconnessione e' gia' in corso, salvo che il task stia per terminare: e' il caso
+    /// della sessione sostituita, dove il motivo e' [`SESSION_REPLACED_MESSAGE`] e non
+    /// segue nessun tentativo. Vedi la nota nel modulo.
     Disconnected(String),
     /// Testo ricevuto dal server: `direct` distingue un messaggio diretto da un
     /// broadcast.
@@ -531,6 +546,17 @@ enum MotivoFallimento {
 enum EsitoFase {
     /// La connessione e' caduta: il chiamante riprova con il backoff.
     Riconnetti(String),
+    /// Il server ha chiuso la sessione apposta, perche' lo stesso utente si e' collegato
+    /// da un'altra parte: il chiamante emette [`ClientEvent::Disconnected`] con il motivo
+    /// e il task termina **senza** riprovare.
+    ///
+    /// E' una variante a se' e non un [`EsitoFase::Riconnetti`] proprio perche' la
+    /// differenza sta tutta nel seguito: riconnettersi qui espellerebbe la connessione
+    /// che ha preso il posto di questa, la quale a sua volta si riconnetterebbe,
+    /// generando un ciclo perpetuo fra i due client. Non e' nemmeno un
+    /// [`EsitoFase::Termina`], che e' l'uscita silenziosa di [`ClientCommand::Quit`]:
+    /// qui l'utente va avvisato di cosa e' successo.
+    SessioneSostituita(String),
     /// [`ClientCommand::Quit`] o la caduta del canale dei comandi: il task termina.
     Termina,
 }
@@ -689,6 +715,12 @@ async fn esegui(
                 .await
                 {
                     EsitoFase::Termina => return,
+                    // Chiusura voluta dal server: si avvisa e si esce dal ciclo, senza
+                    // passare dal backoff. Rilanciare il client tocca all'utente.
+                    EsitoFase::SessioneSostituita(motivo) => {
+                        let _ = event_tx.send(ClientEvent::Disconnected(motivo)).await;
+                        return;
+                    }
                     EsitoFase::Riconnetti(motivo) => {
                         let _ = event_tx.send(ClientEvent::Disconnected(motivo)).await;
                     }
@@ -905,6 +937,15 @@ async fn fase_connessa(
                     }
                     Some(Ok(ServerMessage::AnalysisReport(riepilogo))) => {
                         let _ = event_tx.send(ClientEvent::AnalysisReceived(riepilogo)).await;
+                    }
+                    // La sostituzione di sessione si riconosce dal testo e non dal
+                    // codice: il protocollo non ha un `ErrorCode` dedicato, vedi
+                    // `SESSION_REPLACED_MESSAGE`. Il ramo precede quello generale
+                    // apposta, perche' altrimenti finirebbe fra gli errori qualunque.
+                    Some(Ok(ServerMessage::Error { message, .. }))
+                        if message == SESSION_REPLACED_MESSAGE =>
+                    {
+                        return EsitoFase::SessioneSostituita(message);
                     }
                     Some(Ok(ServerMessage::Error { message, .. })) => {
                         let _ = event_tx.send(ClientEvent::Error(message)).await;
@@ -1135,6 +1176,16 @@ mod tests {
                 .expect("il client deve collegarsi entro l'attesa")
                 .expect("connessione accettata");
             ConnessioneFinta::da_stream(stream)
+        }
+
+        /// Vero se entro `durata` nessuno prova a collegarsi.
+        ///
+        /// E' l'opposto di [`accetta`](Self::accetta): serve a verificare che un
+        /// tentativo di riconnessione **non** parta. Va usata con un backoff di prova
+        /// molto piu' corto della durata attesa, altrimenti direbbe vero anche di un
+        /// client che si sta semplicemente ancora preparando a riprovare.
+        async fn nessuna_connessione_entro(&self, durata: Duration) -> bool {
+            timeout(durata, self.listener.accept()).await.is_err()
         }
     }
 
@@ -1539,6 +1590,60 @@ mod tests {
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
+    }
+
+    #[tokio::test]
+    async fn la_sessione_sostituita_non_fa_ripartire_la_riconnessione() {
+        let finto = ServerFinto::avvia().await;
+        // Backoff cortissimo e invio periodico lasciato a trenta secondi: se il client
+        // provasse a riconnettersi lo farebbe entro pochi decine di millisecondi, ben
+        // dentro l'attesa qui sotto, e nel frattempo il ticker delle posizioni non
+        // interferisce con la sequenza degli eventi.
+        let tempi = Tempi {
+            intervallo_posizione: Duration::from_secs(30),
+            backoff: [Duration::from_millis(20); 4],
+            backoff_massimo: Duration::from_millis(20),
+        };
+        let mut handle = avvia_con(config(finto.indirizzo), Arc::new(SystemClock), tempi);
+
+        let mut connessione = finto.accetta().await;
+        connessione.accetta_login().await;
+        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
+
+        // Il server non chiude di brutto: annuncia la sostituzione, come fa il server
+        // vero prima di lasciar cadere il canale della connessione precedente.
+        connessione
+            .invia(ServerMessage::Error {
+                code: ErrorCode::NotAuthenticated,
+                message: SESSION_REPLACED_MESSAGE.to_owned(),
+            })
+            .await;
+
+        assert_eq!(
+            prossimo_evento(&mut handle).await,
+            ClientEvent::Disconnected(SESSION_REPLACED_MESSAGE.to_owned()),
+            "la sostituzione e' una disconnessione con un motivo, non un errore qualunque"
+        );
+
+        // Il punto del test: a differenza di
+        // `alla_disconnessione_il_client_si_riconnette_da_solo`, qui nessun nuovo
+        // handshake deve arrivare. Riconnettersi espellerebbe la connessione che ha
+        // preso il posto di questa, che a sua volta si riconnetterebbe, e cosi' via.
+        assert!(
+            finto
+                .nessuna_connessione_entro(Duration::from_millis(500))
+                .await,
+            "dopo una sostituzione di sessione il client non deve ritentare da solo"
+        );
+
+        // Il task e' terminato: tocca all'utente decidere se rilanciare il client.
+        assert_eq!(
+            timeout(ATTESA, handle.event_rx.recv())
+                .await
+                .expect("il task deve essere gia' terminato"),
+            None,
+            "il canale degli eventi si chiude con il task"
+        );
     }
 
     #[tokio::test]

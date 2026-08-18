@@ -39,6 +39,28 @@ use crate::types::{Coordinate, PositionRecord, UserState, Username};
 /// Versione del protocollo implementata da questo crate, scambiata nell'handshake.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// Testo di [`ServerMessage::Error`] con cui il server annuncia che la sessione e' stata
+/// sostituita da una nuova connessione dello stesso utente.
+///
+/// # Perche' un messaggio e non un codice
+///
+/// La sostituzione di sessione non ha un [`ErrorCode`] proprio: aggiungerne uno vorrebbe
+/// dire toccare l'enum, e con postcard una variante nuova puo' solo andare in coda, con
+/// quel che comporta per i peer gia' in giro (vedi la nota sulla compatibilita' del
+/// formato in cima al modulo). Si usa percio' il codice esistente piu' vicino nel
+/// significato, [`ErrorCode::NotAuthenticated`] — dopo la sostituzione questa
+/// connessione non ha piu' una sessione — e il testo fa da discriminante.
+///
+/// La costante sta qui e non nei due binari perche' il discriminante e' parte del
+/// contratto fra server e client: il server manda esattamente questo testo prima di
+/// chiudere la connessione precedente, e il client lo riconosce per non riconnettersi.
+/// Duplicare il letterale nei due crate lo lascerebbe divergere in silenzio.
+///
+/// Quando il protocollo potra' cambiare versione, questo diventera' un [`ErrorCode`]
+/// dedicato e la costante sparira'.
+pub const SESSION_REPLACED_MESSAGE: &str =
+    "sessione sostituita da un'altra connessione dello stesso utente";
+
 /// Messaggio inviato dal client al server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -418,6 +440,16 @@ mod tests {
         let rifiutato =
             postcard::to_stdvec(&(1_u32, "ab", "segreto")).expect("serializzazione riuscita");
         assert!(postcard::from_bytes::<ClientMessage>(&rifiutato).is_err());
+    }
+
+    #[test]
+    fn il_messaggio_di_sessione_sostituita_e_un_testo_stabile() {
+        // Server e client si accordano su questo letterale e non su un codice d'errore:
+        // il test lo fissa perche' una modifica su un solo lato non passi inosservata.
+        assert_eq!(
+            SESSION_REPLACED_MESSAGE,
+            "sessione sostituita da un'altra connessione dello stesso utente"
+        );
     }
 
     #[test]

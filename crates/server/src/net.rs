@@ -32,6 +32,12 @@
 //! tenesse un mittente forte, il canale resterebbe vivo e la vecchia connessione non si
 //! chiuderebbe mai.
 //!
+//! La sostituzione non e' pero' muta: prima di lasciar cadere il mittente precedente,
+//! [`concludi_autenticazione`] gli accoda un [`ServerMessage::Error`] con il testo
+//! [`SESSION_REPLACED_MESSAGE`]. Senza, il client sostituito vedrebbe solo la fine del
+//! flusso — indistinguibile da una caduta di rete — e si riconnetterebbe da solo,
+//! espellendo a sua volta la connessione nuova.
+//!
 //! # Stato condiviso e stato di una connessione
 //!
 //! Le dipendenze che tutte le connessioni usano stanno in [`ConnectionContext`], dietro
@@ -67,7 +73,8 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use georuggine_common::clock::Clock;
 use georuggine_common::codec::{ClientCodec, ServerCodec};
 use georuggine_common::protocol::{
-    AckKind, AnalysisRange, ClientMessage, ErrorCode, PROTOCOL_VERSION, ServerMessage,
+    AckKind, AnalysisRange, ClientMessage, ErrorCode, PROTOCOL_VERSION, SESSION_REPLACED_MESSAGE,
+    ServerMessage,
 };
 use georuggine_common::types::{Coordinate, PositionRecord, UserId, Username};
 use thiserror::Error;
@@ -1376,12 +1383,31 @@ async fn concludi_autenticazione(
     let precedente = contesto.registry.register(user_id, per_il_registro).await;
     *uscita = Uscita::NelRegistro(debole);
 
-    if precedente.is_some() {
+    if let Some(precedente) = precedente {
         // Lasciando cadere il mittente precedente si chiude la connessione che l'utente
-        // aveva aperto prima: una sola sessione per utente.
+        // aveva aperto prima: una sola sessione per utente. Prima pero' si annuncia il
+        // motivo, altrimenti quel client vedrebbe solo la fine del flusso, non
+        // distinguibile da una caduta di rete: si riconnetterebbe da solo, espellendo a
+        // sua volta questa connessione, in un ciclo senza fine fra i due.
+        //
+        // L'ordine e' obbligato: l'avviso va accodato **prima** che il canale cada. Il
+        // task di scrittura svuota la coda prima di chiudere il socket, quindi un
+        // messaggio accodato qui parte davvero; uno accodato dopo il `drop` non
+        // troverebbe piu' un canale su cui passare.
+        //
+        // L'accodamento non attende, come in `broadcast_all`: se la coda della vecchia
+        // connessione e' piena il client non sta leggendo, e restare in attesa qui
+        // terrebbe fermo l'accesso di quella nuova. In quel caso l'avviso si perde e
+        // resta la sola chiusura, che e' il comportamento di prima.
+        let avviso = ServerMessage::Error {
+            code: ErrorCode::NotAuthenticated,
+            message: SESSION_REPLACED_MESSAGE.to_owned(),
+        };
+        let annunciata = precedente.try_send(avviso).is_ok();
         tracing::info!(
             %peer,
             utente = username.as_str(),
+            annunciata,
             "sessione precedente dello stesso utente sostituita"
         );
         drop(precedente);
@@ -3190,6 +3216,10 @@ mod tests {
         let mut secondo = Cliente::connetti(banco.indirizzo).await;
         secondo.accedi("veicolo_01").await;
 
+        // L'avviso di sostituzione precede la chiusura: va consumato, altrimenti
+        // `e_chiusa` lo leggerebbe al posto dell'EOF. Che ci sia, e che arrivi prima
+        // della fine del flusso, e' l'oggetto del test qui sotto.
+        assert!(matches!(primo.ricevi().await, ServerMessage::Error { .. }));
         assert!(
             primo.e_chiusa().await,
             "la connessione precedente dello stesso utente va chiusa"
@@ -3201,6 +3231,42 @@ mod tests {
             banco.contesto.registry.connected_users().await,
             vec![UserId(1)],
             "resta registrata una sola connessione per utente"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_sessione_sostituita_riceve_l_avviso_prima_della_chiusura() {
+        let banco = avvia_banco().await;
+
+        let mut primo = Cliente::connetti(banco.indirizzo).await;
+        primo.registra("veicolo_01").await;
+
+        let mut secondo = Cliente::connetti(banco.indirizzo).await;
+        secondo.accedi("veicolo_01").await;
+
+        // La lettura avviene prima di qualunque controllo sulla chiusura: se l'avviso
+        // partisse dopo aver lasciato cadere il canale non arriverebbe mai, e qui si
+        // vedrebbe l'EOF al posto del messaggio. E' la differenza fra una chiusura che
+        // il client sa spiegare e una caduta di rete qualunque, che lo farebbe
+        // riconnettere in un ciclo con la connessione nuova.
+        match primo.ricevi().await {
+            ServerMessage::Error { code, message } => {
+                assert_eq!(
+                    code,
+                    ErrorCode::NotAuthenticated,
+                    "il codice piu' vicino nel significato, in mancanza di uno dedicato"
+                );
+                assert_eq!(
+                    message, SESSION_REPLACED_MESSAGE,
+                    "il testo e' il discriminante su cui il client si regola"
+                );
+            }
+            altro => panic!("atteso l'avviso di sessione sostituita, ottenuto {altro:?}"),
+        }
+
+        assert!(
+            primo.e_chiusa().await,
+            "dopo l'avviso la connessione precedente va comunque chiusa"
         );
     }
 
