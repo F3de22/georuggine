@@ -51,10 +51,11 @@ use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
-use tokio::time::{Interval, MissedTickBehavior};
+use tokio::task::JoinHandle;
+use tokio::time::{Interval, MissedTickBehavior, timeout};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use crate::sources::{PositionSource, SourceKind};
+use crate::sources::{PositionSource, SorgenteCostruita, SourceKind};
 
 /// Frazione massima di `base` aggiunta come jitter a un ritardo di backoff.
 const JITTER_FRAZIONE: f64 = 0.2;
@@ -68,6 +69,13 @@ const CAPACITA_COMANDI: usize = 32;
 
 /// Capacita' del canale degli eventi dal task di rete.
 const CAPACITA_EVENTI: usize = 32;
+
+/// Attesa massima concessa al task di rete per chiudersi in modo ordinato.
+///
+/// E' la stessa scadenza che il server concede alla chiusura di una connessione: pochi
+/// secondi bastano a mandare un `Logout` e chiudere il socket, e oltre non si aspetta,
+/// perche' un server che non risponde non deve tenere appeso il client in uscita.
+const ATTESA_CHIUSURA: Duration = Duration::from_secs(5);
 
 /// Testo mostrato da `--help`.
 pub const USO: &str = "\
@@ -543,17 +551,33 @@ enum EsitoAttesa {
 /// canale degli eventi si chiude (restituendo `None`) quando il task termina, per
 /// esempio dopo [`ClientCommand::Quit`] o dopo un fallimento non ripetibile
 /// dell'autenticazione.
+///
+/// Chi lo avvia deve chiuderlo con [`ClientHandle::chiudi`]: lasciar cadere l'handle non
+/// basta, per il motivo spiegato li'.
 pub struct ClientHandle {
     /// Comandi da mandare al task di rete.
     pub command_tx: mpsc::Sender<ClientCommand>,
     /// Eventi che il task di rete produce.
     pub event_rx: mpsc::Receiver<ClientEvent>,
+    /// Task di rete, atteso da [`ClientHandle::chiudi`].
+    ///
+    /// Non e' pubblico: chi usa l'handle non deve poter attendere o interrompere il task
+    /// se non passando dalla chiusura ordinata.
+    task: JoinHandle<()>,
 }
 
 impl ClientHandle {
     /// Avvia il task di rete con l'orologio e i tempi di produzione.
-    pub fn spawn(config: ClientConfig) -> Self {
-        Self::spawn_con(config, Arc::new(SystemClock), Tempi::default())
+    ///
+    /// `sorgente` arriva gia' costruita da [`SourceKind::build`] e non viene costruita
+    /// qui. Una sorgente che non si inizializza (il file di un percorso mancante o
+    /// illeggibile) e' un errore di configurazione: va scoperto dal chiamante **prima**
+    /// di aprire qualunque connessione, non dentro un task gia' avviato, dove
+    /// diventerebbe un evento di errore su un canale che l'interfaccia non ha ancora
+    /// avuto il tempo di leggere. Cosi' la lettura del file resta inoltre fuori da un
+    /// task async, dove sarebbe un'operazione bloccante.
+    pub fn spawn(config: ClientConfig, sorgente: SorgenteCostruita) -> Self {
+        Self::spawn_con(config, sorgente, Arc::new(SystemClock), Tempi::default())
     }
 
     /// Avvia il task di rete con orologio e tempi scelti dal chiamante.
@@ -561,38 +585,73 @@ impl ClientHandle {
     /// Non e' pubblica: serve ai test per accorciare l'intervallo di invio e il
     /// backoff senza aspettare i valori di produzione, come `ConnectionTimeouts` nel
     /// server.
-    fn spawn_con(config: ClientConfig, clock: Arc<dyn Clock>, tempi: Tempi) -> Self {
+    fn spawn_con(
+        config: ClientConfig,
+        sorgente: SorgenteCostruita,
+        clock: Arc<dyn Clock>,
+        tempi: Tempi,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::channel(CAPACITA_COMANDI);
         let (event_tx, event_rx) = mpsc::channel(CAPACITA_EVENTI);
-        tokio::spawn(esegui(config, clock, tempi, command_rx, event_tx));
+        let task = tokio::spawn(esegui(config, sorgente, clock, tempi, command_rx, event_tx));
         Self {
             command_tx,
             event_rx,
+            task,
         }
+    }
+
+    /// Chiude la sessione e attende che il task di rete sia davvero terminato.
+    ///
+    /// Restituisce vero se il task si e' chiuso entro [`ATTESA_CHIUSURA`], falso se la
+    /// scadenza e' passata per prima.
+    ///
+    /// Lasciar cadere l'handle non basta: al ritorno di `main` il runtime viene distrutto
+    /// e i task ancora vivi spariscono, quindi il `Logout` e la chiusura del socket
+    /// andrebbero persi in una corsa e il server libererebbe la sessione solo alla
+    /// scadenza di inattivita'. L'ordine delle operazioni conta:
+    ///
+    /// 1. cade il ricevitore degli eventi, altrimenti un task fermo su un canale degli
+    ///    eventi pieno — nessuno lo drena piu' — non arriverebbe mai a leggere il comando
+    ///    di chiusura;
+    /// 2. parte [`ClientCommand::Quit`], che fa inviare `Logout` e chiudere il lato di
+    ///    scrittura;
+    /// 3. cade anche il mittente dei comandi, cosi' un task che fosse gia' oltre la
+    ///    lettura del comando termina comunque sul canale chiuso;
+    /// 4. si attende la fine del task, con un tetto complessivo sulle tre attese.
+    pub async fn chiudi(self) -> bool {
+        let Self {
+            command_tx,
+            event_rx,
+            task,
+        } = self;
+        drop(event_rx);
+
+        timeout(ATTESA_CHIUSURA, async move {
+            let _ = command_tx.send(ClientCommand::Quit).await;
+            drop(command_tx);
+            // L'errore di join significa che il task e' andato in panico: non c'e'
+            // nulla da fare oltre a smettere di aspettarlo, e il chiamante sta gia'
+            // uscendo.
+            let _ = task.await;
+        })
+        .await
+        .is_ok()
     }
 }
 
-/// Corpo del task di rete: costruisce la sorgente, poi alterna connessione e attesa di
-/// riconnessione finche' non arriva [`ClientCommand::Quit`] o un fallimento non
-/// ripetibile dell'autenticazione.
+/// Corpo del task di rete: alterna connessione e attesa di riconnessione finche' non
+/// arriva [`ClientCommand::Quit`] o un fallimento non ripetibile dell'autenticazione.
+///
+/// La sorgente arriva gia' costruita dal chiamante: vedi [`ClientHandle::spawn`].
 async fn esegui(
     config: ClientConfig,
+    costruita: SorgenteCostruita,
     clock: Arc<dyn Clock>,
     tempi: Tempi,
     mut command_rx: mpsc::Receiver<ClientCommand>,
     event_tx: mpsc::Sender<ClientEvent>,
 ) {
-    let costruita = match config.source.build() {
-        Ok(costruita) => costruita,
-        Err(errore) => {
-            let _ = event_tx
-                .send(ClientEvent::Error(format!(
-                    "sorgente non inizializzata: {errore}"
-                )))
-                .await;
-            return;
-        }
-    };
     let mut sorgente = costruita.sorgente;
     let manual_tx = costruita.comandi;
     let mut coda: VecDeque<(Coordinate, DateTime<Utc>)> = VecDeque::new();
@@ -775,8 +834,20 @@ async fn fase_connessa(
         tokio::select! {
             _ = stato.ticker.tick() => {
                 let ora = stato.clock.now();
-                if let Some(coordinate) = stato.sorgente.next_position(ora) {
-                    accoda(stato.coda, coordinate, ora);
+                match stato.sorgente.next_position(ora) {
+                    Some(coordinate) => accoda(stato.coda, coordinate, ora),
+                    // Sorgente esaurita: un percorso da file arrivato in fondo senza
+                    // ripetizione non produrra' piu' nulla, e una connessione muta viene
+                    // chiusa dal server alla scadenza di inattivita'. Senza questo ramo
+                    // il client entrerebbe in un ciclo perpetuo di riconnessioni che non
+                    // porta nessuna posizione nuova; un `Ping` al ritmo del ticker, ben
+                    // dentro quella scadenza, tiene invece viva la sessione e lascia il
+                    // veicolo raggiungibile dai messaggi del server.
+                    None => {
+                        if uscita.send(ClientMessage::Ping).await.is_err() {
+                            return EsitoFase::Riconnetti("scrittura fallita".to_owned());
+                        }
+                    }
                 }
                 if let Err(errore) = svuota_coda(stato.coda, uscita, event_tx).await {
                     return EsitoFase::Riconnetti(errore);
@@ -983,6 +1054,50 @@ mod tests {
                 seed: 7,
             },
             ..config(indirizzo)
+        }
+    }
+
+    /// Avvia il task di rete costruendo la sorgente dalla configurazione, come fa il
+    /// binario prima di chiamare [`ClientHandle::spawn`].
+    fn avvia(config: ClientConfig) -> ClientHandle {
+        let sorgente = config.source.build().expect("sorgente di test costruibile");
+        ClientHandle::spawn(config, sorgente)
+    }
+
+    /// Come [`avvia`], con orologio e tempi scelti dal test.
+    fn avvia_con(config: ClientConfig, clock: Arc<dyn Clock>, tempi: Tempi) -> ClientHandle {
+        let sorgente = config.source.build().expect("sorgente di test costruibile");
+        ClientHandle::spawn_con(config, sorgente, clock, tempi)
+    }
+
+    /// File CSV di prova, cancellato quando il test finisce.
+    ///
+    /// Serve al solo test sulla sorgente esaurita: e' l'unica strategia che, finito il
+    /// percorso, smette davvero di produrre posizioni.
+    struct FileDiProva {
+        /// Percorso del file creato.
+        percorso: PathBuf,
+    }
+
+    impl FileDiProva {
+        /// Scrive `contenuto` in un file temporaneo unico per esecuzione.
+        fn nuovo(nome: &str, contenuto: &str) -> Self {
+            let unico = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|scarto| scarto.as_nanos())
+                .unwrap_or(0);
+            let percorso = std::env::temp_dir().join(format!(
+                "georuggine-core-{nome}-{}-{unico}.csv",
+                std::process::id()
+            ));
+            std::fs::write(&percorso, contenuto).expect("scrittura del file di prova riuscita");
+            Self { percorso }
+        }
+    }
+
+    impl Drop for FileDiProva {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.percorso);
         }
     }
 
@@ -1353,7 +1468,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_completo_produce_evento_connesso() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = ClientHandle::spawn(config(finto.indirizzo));
+        let mut handle = avvia(config(finto.indirizzo));
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
@@ -1364,7 +1479,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn il_ticker_invia_una_posizione_ogni_trenta_secondi_simulati() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = ClientHandle::spawn(config_con_random(finto.indirizzo));
+        let mut handle = avvia(config_con_random(finto.indirizzo));
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
@@ -1385,7 +1500,7 @@ mod tests {
     #[tokio::test]
     async fn send_text_produce_text_to_server() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = ClientHandle::spawn(config(finto.indirizzo));
+        let mut handle = avvia(config(finto.indirizzo));
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
@@ -1406,7 +1521,7 @@ mod tests {
     #[tokio::test]
     async fn alla_disconnessione_il_client_si_riconnette_da_solo() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = ClientHandle::spawn(config(finto.indirizzo));
+        let mut handle = avvia(config(finto.indirizzo));
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
@@ -1430,7 +1545,7 @@ mod tests {
     async fn le_posizioni_accumulate_durante_la_disconnessione_arrivano_in_ordine() {
         let finto = ServerFinto::avvia().await;
         let indirizzo = finto.indirizzo;
-        let mut handle = ClientHandle::spawn_con(
+        let mut handle = avvia_con(
             config_con_random(indirizzo),
             Arc::new(SystemClock),
             tempi_di_prova(),
@@ -1492,7 +1607,7 @@ mod tests {
     #[tokio::test]
     async fn quit_chiude_il_task_e_il_canale_eventi_si_chiude() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = ClientHandle::spawn(config(finto.indirizzo));
+        let mut handle = avvia(config(finto.indirizzo));
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
@@ -1516,5 +1631,76 @@ mod tests {
             chiuso, None,
             "il ricevitore degli eventi deve vedere None dopo Quit"
         );
+    }
+
+    #[tokio::test]
+    async fn chiudi_manda_logout_e_attende_la_fine_del_task() {
+        let finto = ServerFinto::avvia().await;
+        let mut handle = avvia(config(finto.indirizzo));
+
+        let mut connessione = finto.accetta().await;
+        connessione.accetta_login().await;
+        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
+
+        assert!(
+            handle.chiudi().await,
+            "il task di rete deve chiudersi entro l'attesa"
+        );
+
+        // Il `Logout` e' partito prima che il task terminasse: `chiudi` ha atteso la
+        // chiusura ordinata invece di abbandonare il task a meta'.
+        match connessione.ricevi().await {
+            ClientMessage::Logout => {}
+            altro => panic!("atteso Logout, ottenuto {altro:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chiudi_termina_anche_senza_connessione_aperta() {
+        // Nessuno in ascolto sull'indirizzo: il task resta nel ciclo di riconnessione,
+        // dove la chiusura deve funzionare esattamente come a connessione aperta.
+        let indirizzo: SocketAddr = "127.0.0.1:1".parse().expect("indirizzo di test valido");
+        let handle = avvia_con(config(indirizzo), Arc::new(SystemClock), tempi_di_prova());
+
+        assert!(
+            handle.chiudi().await,
+            "anche senza connessione il task deve chiudersi entro l'attesa"
+        );
+    }
+
+    #[tokio::test]
+    async fn una_sorgente_esaurita_manda_ping_invece_di_restare_muta() {
+        // Un percorso di un solo punto, senza ripetizione: dopo il primo invio la
+        // sorgente e' esaurita e non produrra' mai piu' una posizione.
+        let file = FileDiProva::nuovo("esaurita", "lat,lon,offset_secs\n45.07,7.68,0\n");
+        let finto = ServerFinto::avvia().await;
+        let config = ClientConfig {
+            source: SourceKind::File {
+                percorso: file.percorso.clone(),
+                loop_forever: false,
+            },
+            ..config(finto.indirizzo)
+        };
+        let mut handle = avvia_con(config, Arc::new(SystemClock), tempi_di_prova());
+
+        let mut connessione = finto.accetta().await;
+        connessione.accetta_login().await;
+        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
+
+        match connessione.ricevi().await {
+            ClientMessage::Position { .. } => {}
+            altro => panic!("atteso il punto del percorso, ottenuto {altro:?}"),
+        }
+
+        // Da qui la sorgente restituisce sempre `None`: senza il `Ping` la connessione
+        // resterebbe muta fino alla scadenza di inattivita' del server.
+        match connessione.ricevi().await {
+            ClientMessage::Ping => {}
+            altro => panic!("atteso Ping a sorgente esaurita, ottenuto {altro:?}"),
+        }
+        match connessione.ricevi().await {
+            ClientMessage::Ping => {}
+            altro => panic!("atteso un secondo Ping, ottenuto {altro:?}"),
+        }
     }
 }

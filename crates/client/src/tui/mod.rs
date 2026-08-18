@@ -14,15 +14,21 @@
 //!
 //! # Ciclo di rendering ed eventi di rete
 //!
-//! [`ciclo_principale`] ridisegna a circa 20 fps: ogni giro chiama
-//! [`crossterm::event::poll`] con un'attesa di [`INTERVALLO_POLL`] (50 ms) per gli
-//! eventi di tastiera, invece di un poll piu' frequente che brucerebbe CPU senza motivo
-//! (la CPU del client entra nelle misure di prestazioni del progetto). Gli eventi di
-//! rete non condividono un `tokio::select!` con quell'attesa: `crossterm::event::poll` e'
-//! sincrono e bloccante, quindi non e' un ramo che si possa attendere insieme a un
-//! canale async senza spostarlo su `spawn_blocking`. Si drena percio' `event_rx` con
-//! `try_recv` in un ciclo interno a ogni giro di rendering: non blocca mai, e con un
-//! giro ogni 50 ms la latenza percepita e' la stessa di un vero `select!`.
+//! [`ciclo_principale`] ridisegna a circa 20 fps: ogni giro attende fino a
+//! [`INTERVALLO_POLL`] (50 ms) un tasto, invece di un poll piu' frequente che
+//! brucerebbe CPU senza motivo (la CPU del client entra nelle misure di prestazioni del
+//! progetto).
+//!
+//! [`crossterm::event::poll`] e [`crossterm::event::read`] sono pero' sincroni e
+//! bloccanti: chiamarli qui bloccherebbe per 50 ms alla volta un thread dell'esecutore,
+//! contro l'invariante del progetto che vieta le operazioni bloccanti in un task async.
+//! Su un esecutore con un solo thread di lavoro sarebbe il task di rete a rimanerne
+//! affamato. Passano percio' da [`tokio::task::spawn_blocking`], in
+//! [`prossimo_tasto`], che li sposta sul pool dei blocchi lasciando libero l'esecutore.
+//!
+//! Gli eventi di rete non condividono comunque un `tokio::select!` con quell'attesa: si
+//! drena `event_rx` con `try_recv` in un ciclo interno a ogni giro di rendering, che non
+//! blocca mai e, con un giro ogni 50 ms, ha la stessa latenza percepita di un `select!`.
 
 mod input;
 mod render;
@@ -32,7 +38,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use chrono::Utc;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -60,14 +66,19 @@ const INTERVALLO_POLL: Duration = Duration::from_millis(50);
 /// all'uscita normale, non solo in caso di panico, perche' e' eseguito qui dopo
 /// [`ciclo_principale`] indipendentemente dal suo esito.
 ///
+/// L'handle arriva per riferimento e non per valore: chiuderlo e' responsabilita' di chi
+/// lo ha avviato, che al ritorno di questa funzione deve chiamare
+/// [`ClientHandle::chiudi`](crate::core::ClientHandle::chiudi) per far terminare il task
+/// di rete in modo ordinato. Consumarlo qui lo lascerebbe invece cadere senza attenderlo.
+///
 /// # Errori
 ///
 /// L'errore di I/O se l'inizializzazione del terminale, il disegno di un fotogramma o
 /// la lettura di un evento di tastiera falliscono.
-pub async fn esegui(mut handle: ClientHandle, mut stato: UiState) -> io::Result<()> {
+pub async fn esegui(handle: &mut ClientHandle, mut stato: UiState) -> io::Result<()> {
     let mut terminal = ratatui::try_init()?;
 
-    let esito = ciclo_principale(&mut terminal, &mut handle, &mut stato).await;
+    let esito = ciclo_principale(&mut terminal, handle, &mut stato).await;
 
     ratatui::restore();
     esito
@@ -83,13 +94,13 @@ async fn ciclo_principale(
     loop {
         terminal.draw(|frame| render::disegna(frame, stato))?;
 
-        if event::poll(INTERVALLO_POLL)? {
-            if let Event::Key(tasto) = event::read()? {
-                if tasto.kind == KeyEventKind::Press
-                    && !gestisci_tasto(tasto, stato, &handle.command_tx).await
-                {
-                    return Ok(());
-                }
+        if let Some(tasto) = prossimo_tasto().await? {
+            // Su Windows crossterm segnala anche il rilascio di un tasto: senza questo
+            // filtro ogni battuta conterebbe due volte.
+            if tasto.kind == KeyEventKind::Press
+                && !gestisci_tasto(tasto, stato, &handle.command_tx).await
+            {
+                return Ok(());
             }
         }
 
@@ -106,6 +117,36 @@ async fn ciclo_principale(
     }
 }
 
+/// Attende fino a [`INTERVALLO_POLL`] un tasto premuto, senza bloccare l'esecutore.
+///
+/// L'attesa e la lettura sono sincrone e vivono percio' su
+/// [`tokio::task::spawn_blocking`] (vedi la documentazione del modulo). Restituisce
+/// `None` se l'attesa scade senza eventi o se l'evento non e' di tastiera (un
+/// ridimensionamento della finestra, per esempio): in entrambi i casi al chiamante basta
+/// ridisegnare e riprovare.
+///
+/// # Errori
+///
+/// L'errore di I/O della lettura dal terminale, o il fallimento del task bloccante, che
+/// si verifica solo se quest'ultimo va in panico.
+async fn prossimo_tasto() -> io::Result<Option<KeyEvent>> {
+    let letto = tokio::task::spawn_blocking(|| -> io::Result<Option<KeyEvent>> {
+        if !event::poll(INTERVALLO_POLL)? {
+            return Ok(None);
+        }
+        match event::read()? {
+            Event::Key(tasto) => Ok(Some(tasto)),
+            _ => Ok(None),
+        }
+    })
+    .await;
+
+    match letto {
+        Ok(esito) => esito,
+        Err(errore) => Err(io::Error::other(errore)),
+    }
+}
+
 /// Applica un tasto premuto allo stato dell'input, mandando un comando quando Invio
 /// conferma una riga valida.
 ///
@@ -116,13 +157,29 @@ async fn ciclo_principale(
 /// Gli altri tasti speciali (frecce, Tab, ...) non hanno un effetto definito in questa
 /// TUI e vengono ignorati.
 ///
-/// Restituisce falso solo quando l'operatore ha chiesto di uscire con `/quit`: il
-/// chiamante deve allora interrompere il ciclo di rendering.
+/// Restituisce falso solo quando l'operatore ha chiesto di uscire, con `/quit` o con
+/// Ctrl+C: il chiamante deve allora interrompere il ciclo di rendering.
 async fn gestisci_tasto(
     tasto: KeyEvent,
     stato: &mut UiState,
     command_tx: &mpsc::Sender<ClientCommand>,
 ) -> bool {
+    // In modalita' raw il terminale non traduce piu' Ctrl+C in un segnale di
+    // interruzione: la combinazione arriva qui come un tasto qualunque. Senza questo
+    // caso Ctrl+C scriverebbe una `c` nella riga di input, e l'operatore che prova la
+    // via consueta per uscire troverebbe un'interfaccia che sembra bloccata.
+    if tasto.modifiers.contains(KeyModifiers::CONTROL) {
+        return match tasto.code {
+            KeyCode::Char('c') => {
+                let _ = command_tx.send(ClientCommand::Quit).await;
+                false
+            }
+            // Le altre combinazioni con Ctrl non hanno un effetto definito in questa
+            // TUI: vanno ignorate, non scritte nella riga di input.
+            _ => true,
+        };
+    }
+
     match tasto.code {
         KeyCode::Enter => {
             let riga = std::mem::take(&mut stato.riga_di_input);
