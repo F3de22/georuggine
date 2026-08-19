@@ -326,6 +326,21 @@ impl Osservazione {
     }
 }
 
+/// Parametri con cui [`run_con`] monta ogni connessione: costo dell'hashing e scadenze.
+///
+/// Stanno insieme, e sono un parametro invece di due `default()` presi da dentro [`run`],
+/// per la stessa ragione per cui [`ConnectionTimeouts`] non e' un gruppo di costanti: chi
+/// verifica il server dall'esterno deve poter accorciare le scadenze e abbassare il costo
+/// di Argon2 senza aspettare i valori di produzione. In produzione non si costruisce a
+/// mano: [`run`] usa [`Regolazioni::default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Regolazioni {
+    /// Parametri di costo dell'hashing delle password.
+    pub auth: AuthConfig,
+    /// Scadenze del ciclo di vita di una connessione e battito della macchina a stati.
+    pub timeouts: ConnectionTimeouts,
+}
+
 /// Risorse condivise che il chiamante costruisce e [`run`] passa alle connessioni.
 ///
 /// Sono i pezzi che vivono quanto il processo e che hanno un esemplare solo: cambiarli
@@ -625,6 +640,34 @@ pub async fn run(
     osservazione: Osservazione,
     shutdown: broadcast::Sender<()>,
 ) -> io::Result<()> {
+    run_con(
+        config,
+        dipendenze,
+        osservazione,
+        Regolazioni::default(),
+        shutdown,
+    )
+    .await
+}
+
+/// Come [`run`], con costo dell'hashing e scadenze scelti dal chiamante.
+///
+/// Serve a chi monta il server dall'esterno — i test di integrazione a livello di
+/// workspace — e ha bisogno di un battito della macchina a stati piu' fitto dei dieci
+/// secondi di produzione e di un Argon2 che non costi decine di millisecondi a ogni
+/// accesso. Il comportamento e' per il resto identico, [`Regolazioni::default`] compresa.
+///
+/// # Errori
+///
+/// Gli stessi di [`run`]: [`io::Error`] se non si riesce ad ascoltare su
+/// `config.bind_addr`.
+pub async fn run_con(
+    config: ServerConfig,
+    dipendenze: Dipendenze,
+    osservazione: Osservazione,
+    regolazioni: Regolazioni,
+    shutdown: broadcast::Sender<()>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
     let indirizzo = listener.local_addr()?;
     tracing::info!(%indirizzo, "server in ascolto");
@@ -645,8 +688,8 @@ pub async fn run(
         clock,
         observer,
         ticker,
-        auth: AuthConfig::default(),
-        timeouts: ConnectionTimeouts::default(),
+        auth: regolazioni.auth,
+        timeouts: regolazioni.timeouts,
     });
     let mut spegnimento = shutdown.subscribe();
 
@@ -755,7 +798,9 @@ pub async fn handle_connection(
     let mut uscita = Uscita::Propria(mittente);
     let mut stato = StatoConnessione::nuovo(contesto.clock.now());
 
-    if handshake(&mut ingresso, &uscita, &contesto, peer).await {
+    // Un handshake fallito non tocca il task di scrittura: se il dialogo non parte, il
+    // task e' per forza ancora vivo.
+    let scrittore_a_fine_dialogo = if handshake(&mut ingresso, &uscita, &contesto, peer).await {
         dialogo(
             &mut ingresso,
             &mut uscita,
@@ -765,23 +810,41 @@ pub async fn handle_connection(
             &mut scrittore,
             peer,
         )
-        .await;
-    }
+        .await
+    } else {
+        StatoScrittore::Vivo
+    };
 
     // La sessione va sganciata qualunque sia il motivo della chiusura: logout, silenzio,
     // spegnimento o errore. `chiudi_sessione` non fa nulla se e' gia' stata sganciata.
     chiudi_sessione(&mut stato.sessione, &uscita, &contesto).await;
 
-    // Caduto anche l'ultimo mittente, il task di scrittura svuota la coda e chiude il
-    // socket in modo ordinato. Si aspetta, ma non oltre la scadenza: un peer che non
-    // legge piu' non deve tenere vivo un task.
+    // Come si chiude il task di scrittura dipende da quale dei due percorsi ha terminato
+    // il dialogo, e i due non si trattano allo stesso modo.
+    //
+    // Nel percorso normale — EOF del client, logout, inattivita', spegnimento — il task
+    // e' ancora vivo perche' il canale ha ancora un mittente: cade qui con `drop(uscita)`
+    // e con la voce del registro rilasciata da `chiudi_sessione`. Solo allora il task
+    // svuota la coda e chiude il socket in modo ordinato, e lo si aspetta, ma non oltre
+    // la scadenza: un peer che non legge piu' non deve tenere vivo un task.
+    //
+    // Nell'altro percorso il task era gia' morto per conto suo — peer irraggiungibile o
+    // sessione sostituita — e il `select!` di `dialogo` ne ha gia' consumato il
+    // `JoinHandle`. Li' non c'e' niente da attendere ne' da abortire, e ripollare quel
+    // `JoinHandle` farebbe andare in panico tokio con "JoinHandle polled after
+    // completion": e' il motivo per cui `dialogo` riporta quale dei due casi si e' dato.
     drop(uscita);
-    if timeout(contesto.timeouts.shutdown, &mut scrittore)
-        .await
-        .is_err()
-    {
-        tracing::warn!(%peer, "chiusura non completata entro la scadenza");
-        scrittore.abort();
+    match scrittore_a_fine_dialogo {
+        StatoScrittore::Concluso => {}
+        StatoScrittore::Vivo => {
+            if timeout(contesto.timeouts.shutdown, &mut scrittore)
+                .await
+                .is_err()
+            {
+                tracing::warn!(%peer, "chiusura non completata entro la scadenza");
+                scrittore.abort();
+            }
+        }
     }
 
     tracing::info!(%peer, "connessione chiusa");
@@ -865,7 +928,27 @@ async fn handshake(
     }
 }
 
+/// Come sta il task di scrittura quando il ciclo di dialogo termina.
+///
+/// Un [`JoinHandle`] va in panico se lo si polla dopo che ha gia' restituito
+/// `Poll::Ready`, e in questa connessione quel `JoinHandle` ha due posti in cui puo'
+/// essere pollato: il `select!` di [`dialogo`] e la pulizia finale di
+/// [`handle_connection`]. Questo esito dice al secondo se il primo lo ha gia' risolto,
+/// cosi' non lo si polla due volte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatoScrittore {
+    /// Il task non e' mai stato visto terminare: il suo `JoinHandle` e' ancora da
+    /// risolvere, e chi chiude la connessione deve attenderlo.
+    Vivo,
+    /// Il task e' finito da se' e il `select!` di [`dialogo`] ne ha gia' consumato il
+    /// `JoinHandle`: non c'e' piu' niente da attendere ne' da abortire.
+    Concluso,
+}
+
 /// Ciclo principale: serve i messaggi del client finche' la connessione resta viva.
+///
+/// Restituisce lo stato in cui lascia il task di scrittura, che il chiamante usa per
+/// decidere se attenderlo: vedi [`StatoScrittore`].
 async fn dialogo(
     ingresso: &mut FramedRead<OwnedReadHalf, ClientCodec>,
     uscita: &mut Uscita,
@@ -874,38 +957,39 @@ async fn dialogo(
     shutdown: &mut broadcast::Receiver<()>,
     scrittore: &mut JoinHandle<()>,
     peer: SocketAddr,
-) {
+) -> StatoScrittore {
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
                 tracing::info!(%peer, "spegnimento: chiusura della connessione");
-                return;
+                return StatoScrittore::Vivo;
             }
             _ = &mut *scrittore => {
                 // Il task di scrittura e' finito da se': o il peer non e' piu'
                 // raggiungibile, o questa sessione e' stata sostituita da una nuova
-                // connessione dello stesso utente.
+                // connessione dello stesso utente. Questo ramo ha appena risolto il suo
+                // `JoinHandle`: da qui in poi non lo si polla piu'.
                 tracing::info!(%peer, "canale di scrittura chiuso");
-                return;
+                return StatoScrittore::Concluso;
             }
             ricevuto = timeout(contesto.timeouts.idle, ingresso.next()) => {
                 let messaggio = match ricevuto {
                     Err(_) => {
                         tracing::info!(%peer, "nessun messaggio entro la scadenza di inattivita'");
-                        return;
+                        return StatoScrittore::Vivo;
                     }
-                    Ok(None) => return,
+                    Ok(None) => return StatoScrittore::Vivo,
                     Ok(Some(Err(errore))) => {
                         // FrameTooLarge e Serialization lasciano il flusso disallineato
                         // rispetto ai confini dei frame: proseguire leggerebbe spazzatura.
                         tracing::warn!(%peer, %errore, "frame non valido: chiusura");
-                        return;
+                        return StatoScrittore::Vivo;
                     }
                     Ok(Some(Ok(messaggio))) => messaggio,
                 };
 
                 if !servi(messaggio, uscita, stato, contesto, peer).await {
-                    return;
+                    return StatoScrittore::Vivo;
                 }
             }
         }

@@ -597,6 +597,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "georuggine-e2e"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "georuggine-client",
+ "georuggine-common",
+ "georuggine-server",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "georuggine-server"
 version = "0.1.0"
 dependencies = [

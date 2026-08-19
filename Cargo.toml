@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/server", "crates/client"]
+members = ["crates/common", "crates/server", "crates/client", "tests"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,10 @@ repository = "https://github.com/G37/georuggine"
 [workspace.dependencies]
 # --- crate interni ---
 georuggine-common = { path = "crates/common" }
+# Server e client sono binari, ma espongono anche una libreria: i test end-to-end del
+# crate `tests` montano l'uno e l'altro nello stesso processo, senza lanciare processi.
+georuggine-server = { path = "crates/server" }
+georuggine-client = { path = "crates/client" }
 
 # --- runtime asincrono ---
 tokio = { version = "1.53", features = [

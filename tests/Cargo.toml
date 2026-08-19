@@ -1,0 +1,49 @@
+[package]
+name = "georuggine-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Test end-to-end di Georuggine: client e server veri che si parlano via TCP"
+publish = false
+
+# Il crate non ha nessun target di libreria ne' di binario: esiste solo per ospitare i
+# sei scenari end-to-end, dichiarati qui sotto uno per file con il path esplicito.
+# Gli helper condivisi (`TestServer`, `TestClient`) vivono in `support/mod.rs`, incluso
+# da ogni scenario con `mod support;`.
+
+[dev-dependencies]
+georuggine-common = { workspace = true }
+georuggine-server = { workspace = true }
+georuggine-client = { workspace = true }
+
+chrono = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+tracing = { workspace = true }
+
+[[test]]
+name = "accesso_e_analisi"
+path = "accesso_e_analisi.rs"
+
+[[test]]
+name = "messaggistica"
+path = "messaggistica.rs"
+
+[[test]]
+name = "stati"
+path = "stati.rs"
+
+[[test]]
+name = "riconnessione"
+path = "riconnessione.rs"
+
+[[test]]
+name = "sicurezza"
+path = "sicurezza.rs"
+
+[[test]]
+name = "sessione"
+path = "sessione.rs"

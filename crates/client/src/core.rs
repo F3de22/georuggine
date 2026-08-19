@@ -473,16 +473,21 @@ pub enum ClientEvent {
 /// Parametri temporali del task di rete: intervallo di invio periodico e progressione
 /// del backoff di riconnessione.
 ///
-/// Sono un parametro interno e non costanti fisse per lo stesso motivo di
-/// `ConnectionTimeouts` nel server: i test devono poter verificare backoff e invii
-/// periodici senza aspettare i valori di produzione.
-struct Tempi {
+/// Sono un parametro e non costanti fisse per lo stesso motivo di `ConnectionTimeouts`
+/// nel server: chi verifica backoff e invii periodici deve poterlo fare senza aspettare i
+/// valori di produzione. Sono percio' pubblici, come `ConnectionTimeouts` e per lo stesso
+/// destinatario: i test di integrazione a livello di workspace, che montano client e
+/// server veri e non possono permettersi trenta secondi di attesa per ogni posizione.
+///
+/// In produzione non si costruisce a mano: [`ClientHandle::spawn`] usa [`Tempi::default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tempi {
     /// Intervallo fra due interrogazioni della sorgente di posizione.
-    intervallo_posizione: Duration,
+    pub intervallo_posizione: Duration,
     /// Ritardo dei primi tentativi di riconnessione, in ordine.
-    backoff: [Duration; 4],
+    pub backoff: [Duration; 4],
     /// Ritardo a cui il backoff resta una volta esaurita la progressione.
-    backoff_massimo: Duration,
+    pub backoff_massimo: Duration,
 }
 
 impl Default for Tempi {
@@ -608,10 +613,17 @@ impl ClientHandle {
 
     /// Avvia il task di rete con orologio e tempi scelti dal chiamante.
     ///
-    /// Non e' pubblica: serve ai test per accorciare l'intervallo di invio e il
-    /// backoff senza aspettare i valori di produzione, come `ConnectionTimeouts` nel
-    /// server.
-    fn spawn_con(
+    /// Serve ai test per accorciare l'intervallo di invio e il backoff senza aspettare i
+    /// valori di produzione, e per iniettare un [`FakeClock`] al posto di [`SystemClock`]:
+    /// l'istante di ogni [`ClientMessage::Position`] viene da qui, quindi con un orologio
+    /// finto il `recorded_at` che arriva al server e' deciso dal test invece che
+    /// dall'ora di sistema.
+    ///
+    /// In produzione si usa [`ClientHandle::spawn`], che passa [`SystemClock`] e
+    /// [`Tempi::default`].
+    ///
+    /// [`FakeClock`]: georuggine_common::clock::FakeClock
+    pub fn spawn_con(
         config: ClientConfig,
         sorgente: SorgenteCostruita,
         clock: Arc<dyn Clock>,
