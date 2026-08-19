@@ -115,6 +115,14 @@ async fn il_riepilogo_dei_movimenti_arriva_al_veicolo_che_lo_chiede() {
     ));
     invia_e_conferma(&mut veicolo, a_cinquanta_metri(), &server).await;
 
+    // La terza posizione lascia il veicolo in movimento oltre la soglia del requisito R5:
+    // da qui il battito della macchina a stati e' nel suo diritto di annunciare il ritorno
+    // a fermo, e lo accoda dove il test si aspetta l'`Ack` del logout. Non e' un difetto
+    // del server, ma un messaggio legittimo che questo scenario non sta verificando:
+    // quello di stati e' `stati`. Lo si toglie di mezzo qui, dove la coda non puo'
+    // contenere altro perche' nessuna richiesta e' in volo.
+    veicolo.scarta_ritorno_a_fermo().await;
+
     veicolo.invia(ClientMessage::Logout).await;
     assert_eq!(
         veicolo.ricevi().await,

@@ -116,6 +116,20 @@ pub const PASSWORD_DEBOLE: &str = "corta";
 /// di produzione, perche' e' tempo di dominio e la si supera muovendo il [`FakeClock`].
 const BATTITO: Duration = Duration::from_millis(20);
 
+/// Attesa concessa a un cambio di stato che puo' esserci oppure no.
+///
+/// La usa [`ClientGrezzo::scarta_ritorno_a_fermo`] dove il battito della macchina a stati
+/// e' nel suo diritto di accodare un [`ServerMessage::StateChanged`] ma non e' detto che
+/// lo abbia gia' fatto: l'assenza di un messaggio entro questa finestra e' un esito
+/// normale e non un fallimento, quindi la scadenza e' breve invece che generosa come
+/// [`ATTESA`], che si paga solo quando uno scenario sta gia' fallendo.
+///
+/// Sono tre periodi di [`BATTITO`] e non uno solo perche' il battito e' tempo vero: su una
+/// macchina carica uno scatto puo' arrivare in ritardo sul proprio periodo, e una finestra
+/// larga quanto il periodo lo mancherebbe. Restano poche decine di millisecondi, pagate
+/// una volta per scenario e solo nel caso in cui il cambio non arrivi.
+const ATTESA_DEL_BATTITO: Duration = BATTITO.saturating_mul(3);
+
 /// Istante su cui parte l'orologio finto: 2024-01-01T12:00:00Z.
 ///
 /// E' mezzogiorno e non mezzanotte perche' gli intervalli di calendario delle analisi si
@@ -1060,6 +1074,45 @@ impl ClientGrezzo {
         match self.ricevi().await {
             ServerMessage::SessionToken { .. } => {}
             altro => panic!("risposta inattesa all'accesso: {altro:?}"),
+        }
+    }
+
+    /// Scarta il ritorno a fermo che il battito della macchina a stati puo' avere gia'
+    /// accodato, senza pretendere che ci sia.
+    ///
+    /// Serve dove uno scenario porta il veicolo oltre la soglia di [`STILL_AFTER_SECS`]
+    /// lasciandolo in movimento e poi asserisce su un messaggio preciso. Da quel punto in
+    /// avanti il task periodico del server e' nel suo diritto di segnalare
+    /// [`UserState::Still`], e lo accoda sullo stesso canale delle risposte alle
+    /// richieste: quale dei due messaggi arrivi per primo dipende da dove cade uno scatto
+    /// di [`BATTITO`], che e' tempo vero e che nessun orologio finto governa. Consumandolo
+    /// qui l'assert successivo torna a leggere una sequenza sola.
+    ///
+    /// Il cambio si scarta una volta sola perche' e' unico: il tracciatore segnala solo
+    /// chi passa da [`UserState::Moving`] a fermo, quindi appena consumato non ne produce
+    /// altri finche' il veicolo non torna a spostarsi.
+    ///
+    /// Va chiamata dove la coda non puo' contenere altro, cioe' prima di mandare la
+    /// richiesta successiva: cosi' l'unico messaggio che puo' presentarsi e' il cambio di
+    /// stato, e una lettura che scarta non rischia di mangiare una risposta attesa.
+    ///
+    /// [`STILL_AFTER_SECS`]: georuggine_common::types::STILL_AFTER_SECS
+    pub async fn scarta_ritorno_a_fermo(&mut self) {
+        match timeout(ATTESA_DEL_BATTITO, self.ingresso.next()).await {
+            // Lo scatto e' gia' avvenuto: il cambio esce dalla coda e cio' che si attende
+            // torna a essere il primo messaggio.
+            Ok(Some(Ok(ServerMessage::StateChanged {
+                state: UserState::Still,
+            }))) => {}
+            Ok(Some(Ok(altro))) => {
+                panic!("in coda c'e' altro oltre al ritorno a fermo: {altro:?}")
+            }
+            Ok(Some(Err(errore))) => panic!("frame non valido dal server: {errore}"),
+            Ok(None) => panic!("il server ha chiuso il flusso invece di restare in attesa"),
+            // Nessun messaggio entro la finestra: o lo scatto era gia' stato consumato da
+            // una lettura precedente, o non aveva nulla da segnalare. In nessuno dei due
+            // casi e' un fallimento, ed e' per questo che la scadenza non e' generosa.
+            Err(_) => {}
         }
     }
 }
