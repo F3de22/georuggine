@@ -1064,6 +1064,7 @@ mod tests {
     use super::*;
 
     use std::net::SocketAddr;
+    use std::time::Instant;
 
     use georuggine_common::protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
     use tokio::net::{TcpListener, TcpStream};
@@ -1539,25 +1540,56 @@ mod tests {
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn il_ticker_invia_una_posizione_ogni_trenta_secondi_simulati() {
+    /// Il ticker scatta a ogni intervallo, non solo una volta.
+    ///
+    /// Il tempo qui e' vero, solo accorciato da [`tempi_di_prova`]: `start_paused` non
+    /// puo' convivere con il [`TcpListener`] vero di [`ServerFinto`]. Con l'orologio in
+    /// pausa tokio lo fa avanzare da solo appena tutti i task sono sospesi, e prima del
+    /// salto guarda l'I/O una volta sola, con una poll a timeout zero: su macOS una
+    /// connessione di loopback non e' mai pronta in quell'istante — la consegna passa
+    /// per il thread di input di `lo0` e costa qualche decina di microsecondi — quindi
+    /// l'orologio saltava di colpo a fine [`ATTESA`] e l'handshake risultava scaduto
+    /// prima di essere arrivato. Non riguardava solo l'`accept`: ogni attesa su I/O
+    /// reale sotto orologio in pausa correva lo stesso rischio. Su Linux la `connect`
+    /// di loopback completa dentro la syscall, quindi la corsa non si vedeva.
+    #[tokio::test]
+    async fn il_ticker_invia_una_posizione_a_ogni_intervallo() {
+        let intervallo = tempi_di_prova().intervallo_posizione;
         let finto = ServerFinto::avvia().await;
-        let mut handle = avvia(config_con_random(finto.indirizzo));
+        let avvio = Instant::now();
+        let mut handle = avvia_con(
+            config_con_random(finto.indirizzo),
+            Arc::new(SystemClock),
+            tempi_di_prova(),
+        );
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
 
-        tokio::time::advance(Duration::from_secs(30)).await;
+        // Due scatti di fila: uno solo direbbe che il ticker parte, non che si ripete.
+        for numero in 1..=2u32 {
+            let coordinate = match connessione.ricevi().await {
+                ClientMessage::Position { coordinate, .. } => coordinate,
+                altro => panic!("atteso Position, ottenuto {altro:?}"),
+            };
+            assert_eq!(
+                prossimo_evento(&mut handle).await,
+                ClientEvent::PositionSent(coordinate)
+            );
 
-        let coordinate = match connessione.ricevi().await {
-            ClientMessage::Position { coordinate, .. } => coordinate,
-            altro => panic!("atteso Position, ottenuto {altro:?}"),
-        };
-        assert_eq!(
-            prossimo_evento(&mut handle).await,
-            ClientEvent::PositionSent(coordinate)
-        );
+            // Solo un minimo. Il primo tick dell'`interval` e' consumato all'avvio del
+            // task, quindi lo scatto n-esimo non puo' maturare prima di n intervalli:
+            // e' questo a dire che le posizioni seguono il ritmo dell'intervallo invece
+            // di partire tutte insieme. Un massimo sarebbe invece instabile, perche' su
+            // una macchina carica uno scatto puo' arrivare in ritardo sul suo periodo.
+            let trascorso = avvio.elapsed();
+            assert!(
+                trascorso >= intervallo * numero,
+                "lo scatto {numero} e' arrivato dopo {trascorso:?}, \
+                 prima dei {numero} intervalli da {intervallo:?} che deve attendere"
+            );
+        }
     }
 
     #[tokio::test]
