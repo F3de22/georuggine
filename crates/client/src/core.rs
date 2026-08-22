@@ -702,10 +702,24 @@ async fn esegui(
     ticker.tick().await;
 
     let mut tentativo: u32 = 0;
+    // `config.register` dice come aprire la *prima* sessione, non tutte: una volta
+    // registrato, l'utente esiste, e ripresentare `Register` a ogni riconnessione si
+    // prenderebbe `UsernameTaken`, che e' terminale e farebbe uscire il task. Vale la
+    // pena dirlo ad alta voce: il ciclo qui sotto ricontrolla lo stato a ogni giro, e
+    // quello ha sempre funzionato; il difetto era che nulla aggiornava quello stato
+    // dopo il primo successo, perche' la scelta rileggeva ogni volta `config.register`.
+    // Il flag vive quindi nel ciclo e `config` resta la configurazione originale,
+    // immutata. Lo abbassa solo un `Register` a cui il server ha risposto
+    // `SessionToken`: un `Register` rifiutato resta terminale, perche' non sappiamo se
+    // la password data corrisponde davvero all'utente che esiste gia'.
+    let mut da_registrare = config.register;
 
     loop {
-        match connetti_e_autentica(&config).await {
+        match connetti_e_autentica(&config, da_registrare).await {
             Ok((mut ingresso, mut uscita)) => {
+                // L'autenticazione e' andata a buon fine: se era una registrazione,
+                // da qui in poi si accede e basta.
+                da_registrare = false;
                 tentativo = 0;
                 let _ = event_tx.send(ClientEvent::Connected).await;
 
@@ -770,6 +784,10 @@ async fn esegui(
 
 /// Apre la connessione ed esegue l'handshake e l'autenticazione.
 ///
+/// `registra` decide fra [`ClientMessage::Register`] e [`ClientMessage::Login`]. Non
+/// e' `config.register` perche' quel campo vale per la prima sessione e non per le
+/// successive: la scelta tentativo per tentativo sta nel ciclo di [`esegui`].
+///
 /// # Errori
 ///
 /// [`MotivoFallimento::Rete`] per ogni guasto di rete o violazione del protocollo, da
@@ -777,6 +795,7 @@ async fn esegui(
 /// rifiutate o versione di protocollo incompatibile, che riprovare non risolverebbe.
 async fn connetti_e_autentica(
     config: &ClientConfig,
+    registra: bool,
 ) -> Result<
     (
         FramedRead<OwnedReadHalf, ServerCodec>,
@@ -808,7 +827,7 @@ async fn connetti_e_autentica(
         }
     }
 
-    let richiesta = if config.register {
+    let richiesta = if registra {
         ClientMessage::Register {
             username: config.username.clone(),
             password: config.password.clone(),
@@ -1097,6 +1116,26 @@ mod tests {
         }
     }
 
+    /// Configurazione di test che apre la sessione registrando l'utente, come fa un
+    /// client avviato con `--register`.
+    fn config_con_register(indirizzo: SocketAddr) -> ClientConfig {
+        ClientConfig {
+            register: true,
+            ..config(indirizzo)
+        }
+    }
+
+    /// Tempi per i test sulla scelta fra Register e Login: backoff cortissimo, cosi'
+    /// la riconnessione arriva subito, e invio periodico lasciato a trenta secondi,
+    /// cosi' il ticker non infila messaggi in mezzo alla sequenza osservata.
+    fn tempi_di_riconnessione() -> Tempi {
+        Tempi {
+            intervallo_posizione: Duration::from_secs(30),
+            backoff: [Duration::from_millis(20); 4],
+            backoff_massimo: Duration::from_millis(20),
+        }
+    }
+
     /// Configurazione di test con un cammino casuale, per i test sull'invio periodico:
     /// produce posizioni diverse a ogni chiamata.
     fn config_con_random(indirizzo: SocketAddr) -> ClientConfig {
@@ -1234,8 +1273,12 @@ mod tests {
                 .expect("il frame ricevuto deve essere valido")
         }
 
-        /// Risponde Welcome a Hello e SessionToken a Login o Register.
-        async fn accetta_login(&mut self) {
+        /// Risponde Welcome a Hello e restituisce il messaggio di autenticazione che
+        /// segue, lasciando al chiamante la risposta.
+        ///
+        /// Restituirlo invece di scartarlo serve ai test che devono distinguere
+        /// `Register` da `Login` tentativo per tentativo.
+        async fn handshake(&mut self) -> ClientMessage {
             match self.ricevi().await {
                 ClientMessage::Hello { protocol_version } => {
                     assert_eq!(protocol_version, PROTOCOL_VERSION);
@@ -1248,13 +1291,32 @@ mod tests {
             .await;
 
             match self.ricevi().await {
-                ClientMessage::Login { .. } | ClientMessage::Register { .. } => {}
+                autenticazione @ (ClientMessage::Login { .. } | ClientMessage::Register { .. }) => {
+                    autenticazione
+                }
                 altro => panic!("atteso Login o Register, ottenuto {altro:?}"),
             }
+        }
+
+        /// Handshake completo seguito da SessionToken: la sessione si apre.
+        async fn accetta_login(&mut self) -> ClientMessage {
+            let autenticazione = self.handshake().await;
             self.invia(ServerMessage::SessionToken {
                 token: "a".repeat(64),
             })
             .await;
+            autenticazione
+        }
+
+        /// Handshake completo seguito da un errore: l'autenticazione e' rifiutata.
+        async fn rifiuta_login(&mut self, code: ErrorCode, message: &str) -> ClientMessage {
+            let autenticazione = self.handshake().await;
+            self.invia(ServerMessage::Error {
+                code,
+                message: message.to_owned(),
+            })
+            .await;
+            autenticazione
         }
     }
 
@@ -1634,6 +1696,155 @@ mod tests {
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
+    }
+
+    #[tokio::test]
+    async fn il_primo_tentativo_con_register_manda_register() {
+        let finto = ServerFinto::avvia().await;
+        let mut handle = avvia_con(
+            config_con_register(finto.indirizzo),
+            Arc::new(SystemClock),
+            tempi_di_riconnessione(),
+        );
+
+        let mut connessione = finto.accetta().await;
+        match connessione.accetta_login().await {
+            ClientMessage::Register { username, password } => {
+                assert_eq!(username.as_str(), "veicolo_01");
+                assert_eq!(password, "scorta12");
+            }
+            altro => panic!("atteso Register al primo tentativo, ottenuto {altro:?}"),
+        }
+
+        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
+    }
+
+    /// Regressione: con `--register` il client rimandava `Register` a ogni
+    /// riconnessione, si prendeva `UsernameTaken` — errore terminale — e il task
+    /// usciva. Dopo una registrazione riuscita l'utente esiste: i tentativi seguenti
+    /// devono accedere.
+    #[tokio::test]
+    async fn dopo_una_registrazione_riuscita_la_riconnessione_manda_login() {
+        let finto = ServerFinto::avvia().await;
+        let mut handle = avvia_con(
+            config_con_register(finto.indirizzo),
+            Arc::new(SystemClock),
+            tempi_di_riconnessione(),
+        );
+
+        let mut connessione = finto.accetta().await;
+        assert!(
+            matches!(
+                connessione.accetta_login().await,
+                ClientMessage::Register { .. }
+            ),
+            "il primo tentativo con register deve ancora registrare"
+        );
+        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
+
+        // Caduta brusca lato server: il banco resta in ascolto sullo stesso
+        // indirizzo, pronto ad accettare la riconnessione automatica.
+        drop(connessione);
+        assert!(matches!(
+            prossimo_evento(&mut handle).await,
+            ClientEvent::Disconnected(_)
+        ));
+
+        let mut connessione = finto.accetta().await;
+        match connessione.accetta_login().await {
+            ClientMessage::Login { username, password } => {
+                assert_eq!(username.as_str(), "veicolo_01");
+                assert_eq!(password, "scorta12");
+            }
+            altro => panic!(
+                "dopo una registrazione riuscita il secondo tentativo deve accedere con Login, \
+                 ottenuto {altro:?}"
+            ),
+        }
+        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
+    }
+
+    #[tokio::test]
+    async fn senza_register_ogni_tentativo_manda_login() {
+        let finto = ServerFinto::avvia().await;
+        let mut handle = avvia_con(
+            config(finto.indirizzo),
+            Arc::new(SystemClock),
+            tempi_di_riconnessione(),
+        );
+
+        let mut connessione = finto.accetta().await;
+        assert!(
+            matches!(
+                connessione.accetta_login().await,
+                ClientMessage::Login { .. }
+            ),
+            "senza register il primo tentativo accede"
+        );
+        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
+
+        drop(connessione);
+        assert!(matches!(
+            prossimo_evento(&mut handle).await,
+            ClientEvent::Disconnected(_)
+        ));
+
+        let mut connessione = finto.accetta().await;
+        assert!(
+            matches!(
+                connessione.accetta_login().await,
+                ClientMessage::Login { .. }
+            ),
+            "senza register anche la riconnessione accede"
+        );
+        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
+    }
+
+    /// Solo un `Register` **riuscito** abbassa il flag. Se il primo tentativo si
+    /// prende `UsernameTaken` — l'operatore ha passato `--register` su un utente che
+    /// esiste gia' — l'errore resta terminale: non sappiamo se la password data
+    /// corrisponde davvero a quell'utente, quindi ricadere su `Login` sarebbe un
+    /// tentativo alla cieca sulle credenziali di qualcun altro.
+    #[tokio::test]
+    async fn un_register_rifiutato_resta_terminale_e_non_ricade_su_login() {
+        let finto = ServerFinto::avvia().await;
+        let mut handle = avvia_con(
+            config_con_register(finto.indirizzo),
+            Arc::new(SystemClock),
+            tempi_di_riconnessione(),
+        );
+
+        let mut connessione = finto.accetta().await;
+        assert!(
+            matches!(
+                connessione
+                    .rifiuta_login(ErrorCode::UsernameTaken, "nome utente gia' in uso")
+                    .await,
+                ClientMessage::Register { .. }
+            ),
+            "il primo tentativo con register deve registrare"
+        );
+
+        assert_eq!(
+            prossimo_evento(&mut handle).await,
+            ClientEvent::Error("nome utente gia' in uso".to_owned()),
+            "le credenziali rifiutate sono un errore, non una disconnessione"
+        );
+
+        assert!(
+            finto
+                .nessuna_connessione_entro(Duration::from_millis(500))
+                .await,
+            "dopo UsernameTaken il client non deve ritentare, ne' con Register ne' con Login"
+        );
+
+        assert_eq!(
+            timeout(ATTESA, handle.event_rx.recv())
+                .await
+                .expect("il task deve essere gia' terminato"),
+            None,
+            "il canale degli eventi si chiude con il task"
+        );
     }
 
     #[tokio::test]
