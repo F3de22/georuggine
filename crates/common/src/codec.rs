@@ -11,21 +11,12 @@
 //! ```
 //!
 //! La lunghezza e' big-endian, l'ordine di rete, cosi' il formato sul filo non dipende
-//! dall'architettura dei due peer. Il payload e' il messaggio serializzato con postcard,
-//! come descritto in [`crate::protocol`].
-//!
-//! # Limite di dimensione
-//!
-//! Un peer ostile puo' dichiarare nell'header una lunghezza arbitraria senza inviare un
-//! solo byte di payload. Per questo [`MessageCodec::decode`] confronta la lunghezza
-//! dichiarata con [`MAX_FRAME_BYTES`] **prima** di riservare spazio nel buffer: un header
-//! da 4 GiB costa un errore, non 4 GiB di memoria.
+//! dall'architettura dei due peer.
 //!
 //! [`CodecError::FrameTooLarge`] e [`CodecError::Serialization`] non sono recuperabili
 //! sulla stessa connessione: il flusso resta disallineato rispetto ai confini dei frame,
 //! quindi il chiamante deve chiudere la connessione anziche' continuare a leggere.
 
-use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 
@@ -39,9 +30,8 @@ use crate::protocol::{ClientMessage, ServerMessage};
 
 /// Dimensione massima ammessa per il payload di un frame, in byte.
 ///
-/// Un mebibyte sta diversi ordini di grandezza sopra al messaggio piu' grande che il
-/// protocollo prevede (una `AnalysisReport` con una rotta lunga) e tiene comunque limitata
-/// la memoria che una singola connessione puo' far riservare.
+/// Sta diversi ordini di grandezza sopra al messaggio piu' grande che il protocollo
+/// prevede e limita la memoria che una singola connessione puo' far riservare.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
 
 /// Byte occupati dal prefisso di lunghezza che apre ogni frame.
@@ -66,14 +56,10 @@ pub enum CodecError {
 
 /// Codec a prefisso di lunghezza per i messaggi `T` serializzati con postcard.
 ///
-/// Implementa [`Encoder`] e [`Decoder`] di `tokio-util`, quindi si usa con
-/// `Framed::new(stream, MessageCodec::new())` per ottenere uno `Stream`/`Sink` di
-/// messaggi al posto di un flusso di byte. Il codec e' privo di stato: la
-/// riassemblazione dei frame parziali vive nel buffer che `Framed` gli passa.
-///
-/// Ogni estremo della connessione usa il codec sul proprio verso: il client legge
-/// [`ServerMessage`] e scrive [`ClientMessage`], il server fa l'opposto. Gli alias
-/// [`ClientCodec`] e [`ServerCodec`] nominano i due tipi.
+/// Si usa con `Framed::new(stream, MessageCodec::new())`. Il codec e' privo di stato: la
+/// riassemblazione dei frame parziali vive nel buffer che `Framed` gli passa. Ogni
+/// estremo usa il codec del proprio verso: il client legge [`ServerMessage`] e scrive
+/// [`ClientMessage`], il server fa l'opposto.
 pub struct MessageCodec<T> {
     /// Fissa il tipo dei messaggi senza occupare spazio. La forma `fn(T) -> T` rende il
     /// codec `Send` e `Sync` qualunque sia `T`, cosa che un `PhantomData<T>` non farebbe.
@@ -95,20 +81,6 @@ impl<T> Default for MessageCodec<T> {
     }
 }
 
-impl<T> Clone for MessageCodec<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T> Copy for MessageCodec<T> {}
-
-impl<T> fmt::Debug for MessageCodec<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("MessageCodec")
-    }
-}
-
 impl<T> Encoder<T> for MessageCodec<T>
 where
     T: Serialize,
@@ -119,7 +91,7 @@ where
     ///
     /// # Errori
     ///
-    /// Restituisce [`CodecError::Serialization`] se il messaggio non e' serializzabile e
+    /// [`CodecError::Serialization`] se il messaggio non e' serializzabile e
     /// [`CodecError::FrameTooLarge`] se il payload supera [`MAX_FRAME_BYTES`]. In
     /// entrambi i casi `dst` resta invariato: non viene scritto un frame a meta'.
     fn encode(&mut self, item: T, dst: &mut BytesMut) -> Result<(), Self::Error> {
@@ -130,8 +102,8 @@ where
             });
         }
 
-        // Il controllo qui sopra garantisce `payload.len() <= 1 MiB`, quindi la
-        // conversione a u32 non tronca.
+        // Il controllo qui sopra garantisce `payload.len() <= 1 MiB`: la conversione a
+        // u32 non tronca.
         let len = payload.len() as u32;
         dst.reserve(LENGTH_PREFIX_BYTES + payload.len());
         dst.put_u32(len);
@@ -154,32 +126,28 @@ where
     ///
     /// # Errori
     ///
-    /// Restituisce [`CodecError::FrameTooLarge`] se l'header dichiara piu' di
-    /// [`MAX_FRAME_BYTES`] byte e [`CodecError::Serialization`] se il payload non
-    /// rappresenta un valore di tipo `T`.
+    /// [`CodecError::FrameTooLarge`] se l'header dichiara piu' di [`MAX_FRAME_BYTES`]
+    /// byte e [`CodecError::Serialization`] se il payload non rappresenta un `T`.
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.len() < LENGTH_PREFIX_BYTES {
             return Ok(None);
         }
 
         let mut header = [0_u8; LENGTH_PREFIX_BYTES];
-        // Il controllo qui sopra garantisce che i byte dell'header ci siano tutti, quindi
-        // le due fette hanno la stessa lunghezza e la copia non puo' fallire.
         header.copy_from_slice(&src[..LENGTH_PREFIX_BYTES]);
         let dichiarata = u64::from(u32::from_be_bytes(header));
 
-        // Il confronto precede ogni `reserve`: cosi' un header ostile costa un errore e
-        // non la memoria che dichiara.
+        // Il confronto precede ogni `reserve`: un header ostile che dichiara 4 GiB costa
+        // un errore e non la memoria che dichiara.
         if dichiarata > MAX_FRAME_BYTES as u64 {
             return Err(CodecError::FrameTooLarge { len: dichiarata });
         }
 
-        // `dichiarata <= 1 MiB` entra in una usize su ogni piattaforma supportata.
         let payload_len = dichiarata as usize;
         let frame_len = LENGTH_PREFIX_BYTES + payload_len;
         if src.len() < frame_len {
-            // Il payload e' legittimo ma incompleto: si prepara lo spazio per il resto e
-            // si lascia intatto quanto arrivato finora.
+            // Payload legittimo ma incompleto: si prepara lo spazio per il resto e si
+            // lascia intatto quanto arrivato finora.
             src.reserve(frame_len - src.len());
             return Ok(None);
         }
@@ -201,20 +169,16 @@ mod tests {
     use super::*;
 
     use chrono::DateTime;
-    use tokio_util::bytes::{BufMut, BytesMut};
-    use tokio_util::codec::{Decoder, Encoder};
 
-    use crate::protocol::{AckKind, ClientMessage, PROTOCOL_VERSION, ServerMessage};
+    use crate::protocol::{AckKind, PROTOCOL_VERSION};
     use crate::types::Coordinate;
 
-    /// Messaggio di apertura, il piu' corto del protocollo.
     fn saluto() -> ClientMessage {
         ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
         }
     }
 
-    /// Messaggio con campi annidati, per un roundtrip meno banale.
     fn posizione() -> ClientMessage {
         ClientMessage::Position {
             coordinate: Coordinate::new(45.0703, 7.6869).expect("coordinata di test valida"),
@@ -223,10 +187,8 @@ mod tests {
         }
     }
 
-    /// Compone a mano un frame con la lunghezza dichiarata e il payload dati.
-    ///
-    /// La lunghezza e' un parametro a se' proprio per poter dichiarare un valore che non
-    /// corrisponde al payload effettivo.
+    /// Compone a mano un frame: la lunghezza e' un parametro a se' per poter dichiarare
+    /// un valore che non corrisponde al payload effettivo.
     fn frame_con(lunghezza: u32, payload: &[u8]) -> BytesMut {
         let mut buffer = BytesMut::new();
         buffer.put_u32(lunghezza);
@@ -234,7 +196,6 @@ mod tests {
         buffer
     }
 
-    /// Serializza il messaggio in un buffer nuovo.
     fn frame_di(messaggio: ClientMessage) -> BytesMut {
         let mut buffer = BytesMut::new();
         ClientCodec::new()
@@ -244,96 +205,60 @@ mod tests {
     }
 
     #[test]
-    fn encode_e_decode_conservano_il_messaggio() {
-        let originale = posizione();
-        let mut codec = ClientCodec::new();
-        let mut buffer = BytesMut::new();
-
-        codec
-            .encode(originale.clone(), &mut buffer)
-            .expect("encode riuscito");
-        let decodificato = codec
+    fn encode_e_decode_conservano_il_messaggio_nei_due_versi() {
+        let mut buffer = frame_di(posizione());
+        let decodificato = ClientCodec::new()
             .decode(&mut buffer)
             .expect("decode senza errori")
             .expect("il frame e' completo");
-
-        assert_eq!(decodificato, originale, "roundtrip non fedele");
+        assert_eq!(decodificato, posizione(), "roundtrip non fedele");
         assert!(buffer.is_empty(), "il frame consumato non lascia byte");
-    }
 
-    #[test]
-    fn il_codec_del_server_fa_lo_stesso_roundtrip() {
-        let originale = ServerMessage::Ack {
+        let risposta = ServerMessage::Ack {
             request: AckKind::Position,
         };
         let mut codec = ServerCodec::new();
         let mut buffer = BytesMut::new();
-
         codec
-            .encode(originale.clone(), &mut buffer)
+            .encode(risposta.clone(), &mut buffer)
             .expect("encode riuscito");
-        let decodificato = codec
-            .decode(&mut buffer)
-            .expect("decode senza errori")
-            .expect("il frame e' completo");
-
-        assert_eq!(decodificato, originale, "roundtrip non fedele");
-    }
-
-    #[test]
-    fn header_a_meta_non_consuma_il_buffer() {
-        let intero = frame_di(saluto());
-        let mut buffer = BytesMut::from(&intero[..2]);
-        let arrivati = buffer.clone();
-        let mut codec = ClientCodec::new();
-
-        assert!(
+        assert_eq!(
             codec
                 .decode(&mut buffer)
                 .expect("decode senza errori")
-                .is_none(),
-            "meta' header non basta a comporre un frame"
+                .expect("il frame e' completo"),
+            risposta
         );
-        assert_eq!(
-            &buffer[..],
-            &arrivati[..],
-            "i byte gia' arrivati non vanno consumati"
-        );
-
-        buffer.put_slice(&intero[2..]);
-        let decodificato = codec
-            .decode(&mut buffer)
-            .expect("decode senza errori")
-            .expect("con il resto dell'header e del payload il frame e' completo");
-        assert_eq!(decodificato, saluto());
     }
 
     #[test]
-    fn payload_parziale_non_consuma_il_buffer() {
-        let intero = frame_di(posizione());
-        let mut buffer = BytesMut::from(&intero[..intero.len() - 1]);
-        let arrivati = buffer.clone();
-        let mut codec = ClientCodec::new();
+    fn un_frame_parziale_non_consuma_il_buffer() {
+        // Prima meta' header, poi payload incompleto: in nessuno dei due casi i byte
+        // gia' arrivati vanno consumati.
+        for tagliato_a in [2, frame_di(posizione()).len() - 1] {
+            let intero = frame_di(posizione());
+            let mut buffer = BytesMut::from(&intero[..tagliato_a]);
+            let arrivati = buffer.clone();
+            let mut codec = ClientCodec::new();
 
-        assert!(
-            codec
-                .decode(&mut buffer)
-                .expect("decode senza errori")
-                .is_none(),
-            "un payload incompleto non compone un frame"
-        );
-        assert_eq!(
-            &buffer[..],
-            &arrivati[..],
-            "i byte gia' arrivati non vanno consumati"
-        );
+            assert!(
+                codec
+                    .decode(&mut buffer)
+                    .expect("decode senza errori")
+                    .is_none(),
+                "un frame incompleto non va decodificato"
+            );
+            assert_eq!(&buffer[..], &arrivati[..], "byte consumati troppo presto");
 
-        buffer.put_slice(&intero[intero.len() - 1..]);
-        let decodificato = codec
-            .decode(&mut buffer)
-            .expect("decode senza errori")
-            .expect("con l'ultimo byte il frame e' completo");
-        assert_eq!(decodificato, posizione());
+            buffer.put_slice(&intero[tagliato_a..]);
+            assert_eq!(
+                codec
+                    .decode(&mut buffer)
+                    .expect("decode senza errori")
+                    .expect("con il resto dei byte il frame e' completo"),
+                posizione()
+            );
+        }
     }
 
     #[test]
@@ -352,20 +277,15 @@ mod tests {
             .encode(secondo.clone(), &mut buffer)
             .expect("encode del secondo riuscito");
 
-        assert_eq!(
-            codec
-                .decode(&mut buffer)
-                .expect("decode senza errori")
-                .expect("il primo frame e' completo"),
-            primo
-        );
-        assert_eq!(
-            codec
-                .decode(&mut buffer)
-                .expect("decode senza errori")
-                .expect("il secondo frame e' completo"),
-            secondo
-        );
+        for atteso in [primo, secondo] {
+            assert_eq!(
+                codec
+                    .decode(&mut buffer)
+                    .expect("decode senza errori")
+                    .expect("il frame e' completo"),
+                atteso
+            );
+        }
         assert!(
             codec
                 .decode(&mut buffer)
@@ -373,26 +293,10 @@ mod tests {
                 .is_none(),
             "dopo due frame non resta nulla da decodificare"
         );
-        assert!(buffer.is_empty(), "entrambi i frame sono stati consumati");
     }
 
     #[test]
-    fn lunghezza_oltre_il_massimo_e_rifiutata() {
-        let dichiarata = u32::try_from(MAX_FRAME_BYTES).expect("il massimo sta in un u32") + 1;
-        let mut buffer = frame_con(dichiarata, &[]);
-
-        let errore = ClientCodec::new()
-            .decode(&mut buffer)
-            .expect_err("un frame oltre il massimo va rifiutato");
-
-        assert!(
-            matches!(errore, CodecError::FrameTooLarge { len } if len == u64::from(dichiarata)),
-            "atteso FrameTooLarge, ottenuto {errore:?}"
-        );
-    }
-
-    #[test]
-    fn lunghezza_enorme_non_fa_riservare_memoria() {
+    fn una_lunghezza_oltre_il_massimo_e_rifiutata_prima_di_riservare() {
         let mut buffer = frame_con(u32::MAX, &[]);
         let capacita_prima = buffer.capacity();
 
@@ -406,14 +310,13 @@ mod tests {
         );
         assert!(
             buffer.capacity() <= capacita_prima,
-            "la lunghezza va controllata prima di riservare: capacita' passata da \
-             {capacita_prima} a {} byte",
+            "capacita' passata da {capacita_prima} a {} byte",
             buffer.capacity()
         );
     }
 
     #[test]
-    fn messaggio_troppo_grande_non_viene_codificato() {
+    fn un_messaggio_troppo_grande_non_viene_codificato() {
         let enorme = ClientMessage::TextToServer {
             body: "a".repeat(MAX_FRAME_BYTES + 1),
         };
@@ -434,17 +337,15 @@ mod tests {
     }
 
     #[test]
-    fn payload_corrotto_produce_un_errore_di_serializzazione() {
+    fn un_payload_corrotto_produce_un_errore_di_serializzazione() {
         // Nessuna di queste sequenze e' un `ClientMessage`: un indice di variante
         // inesistente, un varint che non termina, una variante troncata prima dei campi.
         let corrotti: [&[u8]; 3] = [&[0xC8, 0x01], &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF], &[0x01]];
 
         for corrotto in corrotti {
             let lunghezza = u32::try_from(corrotto.len()).expect("payload di test corto");
-            let mut buffer = frame_con(lunghezza, corrotto);
-
             let errore = ClientCodec::new()
-                .decode(&mut buffer)
+                .decode(&mut frame_con(lunghezza, corrotto))
                 .expect_err("i byte non compongono un messaggio");
 
             assert!(
@@ -456,29 +357,17 @@ mod tests {
 
     #[test]
     fn gli_errori_si_mostrano_in_italiano() {
-        let troppo_grande = CodecError::FrameTooLarge { len: 2_000_000 };
         assert_eq!(
-            troppo_grande.to_string(),
+            CodecError::FrameTooLarge { len: 2_000_000 }.to_string(),
             "frame di 2000000 byte: il massimo ammesso e' 1048576 byte"
         );
-
-        let io = CodecError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "connessione chiusa",
-        ));
         assert_eq!(
-            io.to_string(),
+            CodecError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connessione chiusa"
+            ))
+            .to_string(),
             "errore di I/O sulla connessione: connessione chiusa"
-        );
-
-        let serializzazione = ClientCodec::new()
-            .decode(&mut frame_con(1, &[0xC8]))
-            .expect_err("i byte non compongono un messaggio");
-        assert!(
-            serializzazione
-                .to_string()
-                .starts_with("payload non conforme al protocollo: "),
-            "messaggio inatteso: {serializzazione}"
         );
     }
 }

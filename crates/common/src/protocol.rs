@@ -1,4 +1,4 @@
-//! Protocollo applicativo fra client e server Georuggine.
+//! Protocollo applicativo fra client e server.
 //!
 //! # Sequenza attesa
 //!
@@ -8,15 +8,6 @@
 //!       -> Logout
 //! ```
 //!
-//! Il client apre sempre con [`ClientMessage::Hello`] dichiarando la propria
-//! [`PROTOCOL_VERSION`]; il server risponde con [`ServerMessage::Welcome`] se la accetta,
-//! altrimenti con [`ServerMessage::Error`] di codice [`ErrorCode::UnsupportedVersion`].
-//! Segue esattamente una fra [`ClientMessage::Register`] e [`ClientMessage::Login`], a cui
-//! il server replica con [`ServerMessage::SessionToken`]. Solo a sessione aperta il client
-//! puo' inviare messaggi operativi, ripetibili in qualsiasi ordine e numero; ognuno riceve
-//! [`ServerMessage::Ack`] o una risposta dedicata. La sessione si chiude con
-//! [`ClientMessage::Logout`].
-//!
 //! Fuori sequenza il server risponde con [`ErrorCode::NotAuthenticated`]. Oltre al flusso
 //! guidato dal client, il server puo' inviare in qualsiasi momento
 //! [`ServerMessage::Broadcast`], [`ServerMessage::Direct`] e
@@ -24,11 +15,10 @@
 //!
 //! # Compatibilita' del formato
 //!
-//! postcard non e' auto-descrittivo e codifica le varianti con il loro indice
-//! posizionale: **aggiungere varianti in coda e' compatibile, riordinarle o rimuoverle
-//! rompe i peer gia' in giro**. Per lo stesso motivo la versione si negozia a livello
-//! applicativo con [`PROTOCOL_VERSION`] e non tramite il formato: un valore sconosciuto
-//! si deserializza senza errori, e sta al server decidere se proseguire.
+//! postcard codifica le varianti con il loro indice posizionale: aggiungerne in coda e'
+//! compatibile, riordinarle o rimuoverle rompe i peer gia' in giro. Per questo la
+//! versione si negozia a livello applicativo con [`PROTOCOL_VERSION`], che un peer
+//! sconosciuto deserializza senza errori.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -39,25 +29,13 @@ use crate::types::{Coordinate, PositionRecord, UserState, Username};
 /// Versione del protocollo implementata da questo crate, scambiata nell'handshake.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Testo di [`ServerMessage::Error`] con cui il server annuncia che la sessione e' stata
-/// sostituita da una nuova connessione dello stesso utente.
+/// Testo con cui il server annuncia che la sessione e' stata sostituita da una nuova
+/// connessione dello stesso utente.
 ///
-/// # Perche' un messaggio e non un codice
-///
-/// La sostituzione di sessione non ha un [`ErrorCode`] proprio: aggiungerne uno vorrebbe
-/// dire toccare l'enum, e con postcard una variante nuova puo' solo andare in coda, con
-/// quel che comporta per i peer gia' in giro (vedi la nota sulla compatibilita' del
-/// formato in cima al modulo). Si usa percio' il codice esistente piu' vicino nel
-/// significato, [`ErrorCode::NotAuthenticated`] — dopo la sostituzione questa
-/// connessione non ha piu' una sessione — e il testo fa da discriminante.
-///
-/// La costante sta qui e non nei due binari perche' il discriminante e' parte del
-/// contratto fra server e client: il server manda esattamente questo testo prima di
-/// chiudere la connessione precedente, e il client lo riconosce per non riconnettersi.
-/// Duplicare il letterale nei due crate lo lascerebbe divergere in silenzio.
-///
-/// Quando il protocollo potra' cambiare versione, questo diventera' un [`ErrorCode`]
-/// dedicato e la costante sparira'.
+/// Non c'e' un [`ErrorCode`] dedicato: si usa il piu' vicino nel significato,
+/// [`ErrorCode::NotAuthenticated`], e il testo fa da discriminante. La costante sta qui
+/// perche' e' parte del contratto: il client lo riconosce per non riconnettersi, e un
+/// letterale duplicato nei due crate divergerebbe in silenzio.
 pub const SESSION_REPLACED_MESSAGE: &str =
     "sessione sostituita da un'altra connessione dello stesso utente";
 
@@ -144,7 +122,7 @@ pub enum ServerMessage {
         /// Dettaglio leggibile, gia' in italiano.
         message: String,
     },
-    /// Consegna il token di sessione dopo un [`ClientMessage::Register`] o
+    /// Conferma l'apertura della sessione dopo un [`ClientMessage::Register`] o
     /// [`ClientMessage::Login`] riuscito.
     SessionToken {
         /// Token opaco che identifica la sessione.
@@ -239,17 +217,14 @@ mod tests {
 
     use crate::types::UserId;
 
-    /// Istante UTC deterministico a partire da un timestamp in secondi.
     fn istante(secondi: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(secondi, 0).expect("istante di test valido")
     }
 
-    /// Username che il test da' per valido.
     fn username(raw: &str) -> Username {
         Username::new(raw).expect("username di test valido")
     }
 
-    /// Coordinata che il test da' per valida.
     fn coordinata(lat: f64, lon: f64) -> Coordinate {
         Coordinate::new(lat, lon).expect("coordinata di test valida")
     }
@@ -264,7 +239,6 @@ mod tests {
         assert_eq!(&decodificato, valore, "roundtrip non fedele");
     }
 
-    /// Riepilogo di esempio, con una rotta non vuota.
     fn riepilogo() -> MovementSummary {
         MovementSummary {
             total_distance_meters: 12_345.6,
@@ -282,7 +256,17 @@ mod tests {
 
     #[test]
     fn ogni_client_message_sopravvive_al_roundtrip() {
-        let messaggi = [
+        let intervalli = [
+            AnalysisRange::Today,
+            AnalysisRange::CurrentWeek,
+            AnalysisRange::CurrentMonth,
+            AnalysisRange::Custom {
+                from: istante(1_700_000_000),
+                to: istante(1_700_086_400),
+            },
+        ];
+
+        let mut messaggi = vec![
             ClientMessage::Hello {
                 protocol_version: PROTOCOL_VERSION,
             },
@@ -301,12 +285,14 @@ mod tests {
             ClientMessage::TextToServer {
                 body: "in arrivo al deposito".to_owned(),
             },
-            ClientMessage::RequestAnalysis {
-                range: AnalysisRange::Today,
-            },
             ClientMessage::Logout,
             ClientMessage::Ping,
         ];
+        messaggi.extend(
+            intervalli
+                .into_iter()
+                .map(|range| ClientMessage::RequestAnalysis { range }),
+        );
 
         for messaggio in &messaggi {
             roundtrip(messaggio);
@@ -314,34 +300,10 @@ mod tests {
     }
 
     #[test]
-    fn ogni_analysis_range_sopravvive_al_roundtrip() {
-        let intervalli = [
-            AnalysisRange::Today,
-            AnalysisRange::CurrentWeek,
-            AnalysisRange::CurrentMonth,
-            AnalysisRange::Custom {
-                from: istante(1_700_000_000),
-                to: istante(1_700_086_400),
-            },
-        ];
-
-        for intervallo in &intervalli {
-            roundtrip(intervallo);
-        }
-    }
-
-    #[test]
     fn ogni_server_message_sopravvive_al_roundtrip() {
-        let messaggi = [
+        let mut messaggi = vec![
             ServerMessage::Welcome {
                 protocol_version: PROTOCOL_VERSION,
-            },
-            ServerMessage::Ack {
-                request: AckKind::Position,
-            },
-            ServerMessage::Error {
-                code: ErrorCode::InvalidCredentials,
-                message: "credenziali non valide".to_owned(),
             },
             ServerMessage::SessionToken {
                 token: "3f9a2c".to_owned(),
@@ -355,11 +317,31 @@ mod tests {
                 sent_at: istante(1_700_000_000),
             },
             ServerMessage::AnalysisReport(riepilogo()),
-            ServerMessage::StateChanged {
-                state: UserState::Moving,
-            },
             ServerMessage::Pong,
         ];
+        messaggi.extend(
+            [AckKind::Position, AckKind::TextToServer, AckKind::Logout]
+                .map(|request| ServerMessage::Ack { request }),
+        );
+        messaggi.extend(
+            [
+                ErrorCode::UnsupportedVersion,
+                ErrorCode::InvalidCredentials,
+                ErrorCode::UsernameTaken,
+                ErrorCode::NotAuthenticated,
+                ErrorCode::MalformedMessage,
+                ErrorCode::RateLimited,
+                ErrorCode::Internal,
+            ]
+            .map(|code| ServerMessage::Error {
+                code,
+                message: code.to_string(),
+            }),
+        );
+        messaggi.extend(
+            [UserState::Disconnected, UserState::Still, UserState::Moving]
+                .map(|state| ServerMessage::StateChanged { state }),
+        );
 
         for messaggio in &messaggi {
             roundtrip(messaggio);
@@ -367,66 +349,22 @@ mod tests {
     }
 
     #[test]
-    fn ogni_ack_kind_sopravvive_al_roundtrip() {
-        for tipo in &[AckKind::Position, AckKind::TextToServer, AckKind::Logout] {
-            roundtrip(tipo);
-        }
-    }
-
-    #[test]
-    fn ogni_error_code_sopravvive_al_roundtrip() {
-        for codice in &[
-            ErrorCode::UnsupportedVersion,
-            ErrorCode::InvalidCredentials,
-            ErrorCode::UsernameTaken,
-            ErrorCode::NotAuthenticated,
-            ErrorCode::MalformedMessage,
-            ErrorCode::RateLimited,
-            ErrorCode::Internal,
-        ] {
-            roundtrip(codice);
-        }
-    }
-
-    #[test]
-    fn ogni_user_state_sopravvive_al_roundtrip_nel_messaggio() {
-        for stato in &[UserState::Disconnected, UserState::Still, UserState::Moving] {
-            roundtrip(&ServerMessage::StateChanged { state: *stato });
-        }
-    }
-
-    #[test]
-    fn hello_con_versione_sconosciuta_resta_deserializzabile() {
+    fn una_versione_sconosciuta_resta_deserializzabile() {
         let sconosciuta = PROTOCOL_VERSION + 41;
-        let messaggio = ClientMessage::Hello {
+
+        roundtrip(&ClientMessage::Hello {
             protocol_version: sconosciuta,
-        };
-        let bytes = postcard::to_stdvec(&messaggio).expect("serializzazione riuscita");
-
-        let decodificato: ClientMessage =
-            postcard::from_bytes(&bytes).expect("una versione sconosciuta non rompe il formato");
-
-        assert_eq!(decodificato, messaggio);
-    }
-
-    #[test]
-    fn welcome_con_versione_sconosciuta_resta_deserializzabile() {
-        let messaggio = ServerMessage::Welcome {
-            protocol_version: PROTOCOL_VERSION + 41,
-        };
-        let bytes = postcard::to_stdvec(&messaggio).expect("serializzazione riuscita");
-
-        let decodificato: ServerMessage =
-            postcard::from_bytes(&bytes).expect("una versione sconosciuta non rompe il formato");
-
-        assert_eq!(decodificato, messaggio);
+        });
+        roundtrip(&ServerMessage::Welcome {
+            protocol_version: sconosciuta,
+        });
     }
 
     #[test]
     fn username_invalido_nel_messaggio_e_rifiutato_in_deserializzazione() {
         // postcard codifica una variante come indice varint seguito dai campi: `Register`
-        // e' la variante 1 di `ClientMessage`. La prima meta' del test fissa questa
-        // assunzione sul formato, la seconda verifica il rifiuto.
+        // e' la variante 1. La prima meta' del test fissa questa assunzione sul formato,
+        // la seconda verifica il rifiuto.
         let ammesso = postcard::to_stdvec(&(1_u32, "veicolo_01", "segreto"))
             .expect("serializzazione riuscita");
         assert_eq!(
@@ -444,8 +382,8 @@ mod tests {
 
     #[test]
     fn il_messaggio_di_sessione_sostituita_e_un_testo_stabile() {
-        // Server e client si accordano su questo letterale e non su un codice d'errore:
-        // il test lo fissa perche' una modifica su un solo lato non passi inosservata.
+        // Server e client si accordano su questo letterale: il test lo fissa perche' una
+        // modifica su un solo lato non passi inosservata.
         assert_eq!(
             SESSION_REPLACED_MESSAGE,
             "sessione sostituita da un'altra connessione dello stesso utente"
@@ -458,23 +396,7 @@ mod tests {
             ErrorCode::UnsupportedVersion.to_string(),
             "versione di protocollo non supportata"
         );
-        assert_eq!(
-            ErrorCode::InvalidCredentials.to_string(),
-            "credenziali non valide"
-        );
         assert_eq!(ErrorCode::UsernameTaken.to_string(), "username gia' in uso");
-        assert_eq!(
-            ErrorCode::NotAuthenticated.to_string(),
-            "sessione non autenticata"
-        );
-        assert_eq!(
-            ErrorCode::MalformedMessage.to_string(),
-            "messaggio malformato"
-        );
-        assert_eq!(
-            ErrorCode::RateLimited.to_string(),
-            "troppe richieste in poco tempo"
-        );
         assert_eq!(ErrorCode::Internal.to_string(), "errore interno del server");
     }
 }

@@ -1,44 +1,33 @@
 //! Impalcatura condivisa dai sei scenari end-to-end.
 //!
-//! # Che cosa monta
-//!
-//! [`TestServer`] avvia il server vero, cioe' [`net::run_con`] con le stesse dipendenze
-//! che costruisce il binario, su una porta effimera del loopback; [`TestClient`] avvia il
-//! client vero, cioe' [`ClientHandle::spawn_con`], e lo pilota dai suoi due canali di
-//! comandi ed eventi. Fra i due passa un socket TCP e il protocollo di
-//! `georuggine-common`: nessuno dei due sa di essere dentro un test. Dove serve parlare
-//! al server fuori dalla sequenza che il client rispetta — una versione di protocollo
-//! sbagliata, una richiesta prima dell'accesso — c'e' [`ClientGrezzo`], che scrive i
-//! messaggi a mano sugli stessi codec.
+//! [`TestServer`] avvia il server vero, cioe' [`net::run`] con le stesse dipendenze che
+//! costruisce il binario, su una porta effimera del loopback; [`TestClient`] avvia il
+//! client vero e lo pilota dai suoi due canali. Fra i due passa un socket TCP e il
+//! protocollo di `georuggine-common`: nessuno dei due sa di essere dentro un test. Dove
+//! serve parlare al server fuori dalla sequenza che il client rispetta c'e'
+//! [`ClientGrezzo`], che scrive i messaggi a mano sugli stessi codec.
 //!
 //! # I due tempi
 //!
-//! Nei test convivono due tempi diversi, e confonderli porta a scenari lenti o instabili.
-//!
-//! Il **tempo di dominio** e' quello che server e client leggono dal [`Clock`]: ci
-//! finiscono il `recorded_at` di ogni posizione, la scadenza dei tre minuti della
-//! macchina a stati, gli estremi delle analisi e la finestra del limitatore di frequenza.
-//! Qui l'orologio e' un [`FakeClock`] **condiviso fra i due programmi**, che lo scenario
-//! sposta con [`TestServer::avanza`]: cosi' l'istante che il client scrive nella posizione
-//! e quello con cui il server la giudica sono lo stesso, e tre minuti di requisito costano
+//! Il **tempo di dominio** e' quello che server e client leggono dal [`Clock`]: il
+//! `recorded_at` delle posizioni, la scadenza dei tre minuti, gli estremi delle analisi,
+//! la finestra del limitatore. Qui e' un [`FakeClock`] **condiviso fra i due programmi**,
+//! che lo scenario sposta con [`TestServer::avanza`]: tre minuti di requisito costano
 //! microsecondi invece di tre minuti di attesa.
 //!
-//! Il **tempo vero** e' quello dei timer di tokio: l'intervallo del ticker delle
-//! posizioni, il backoff di riconnessione, le scadenze di una connessione e il battito
-//! del task periodico. Nessun orologio finto lo puo' saltare, quindi lo si accorcia:
-//! [`ConnectionTimeouts`] e [`Tempi`] sono parametri proprio per questo.
+//! Il **tempo vero** e' quello dei timer di tokio: l'intervallo del ticker, il backoff, le
+//! scadenze di una connessione, il battito del task periodico. Nessun orologio finto lo
+//! puo' saltare, quindi lo si accorcia — ed e' per questo che [`ConnectionTimeouts`] e
+//! [`Tempi`] sono parametri.
 //!
 //! # Perche' la registrazione sta fuori dal client
 //!
-//! [`TestClient::accedi`] apre sempre la sessione con `Login`, mai con `Register`. Il
-//! motivo e' la riconnessione: il task di rete ripete la stessa richiesta di
-//! autenticazione a ogni tentativo, e un client nato con `register: true` che perde la
-//! connessione si ritroverebbe con [`ErrorCode::UsernameTaken`], che e' un fallimento
-//! terminale, e smetterebbe di riprovare invece di rientrare. L'utente si crea percio'
-//! prima, con [`TestServer::registra`]. Fa eccezione [`TestClient::registrandosi`], che
-//! verifica la registrazione dal filo e va usata solo dove nessuna caduta e' prevista.
-//!
-//! [`ErrorCode::UsernameTaken`]: georuggine_common::protocol::ErrorCode::UsernameTaken
+//! [`TestClient::accedi`] apre sempre la sessione con `Login`. Il motivo e' la
+//! riconnessione: un client nato con `register: true` che perde la connessione
+//! ripresenterebbe `Register` e si prenderebbe `UsernameTaken`, che e' terminale, e
+//! smetterebbe di riprovare. L'utente si crea percio' prima, con [`TestServer::registra`].
+//! Fa eccezione [`TestClient::registrandosi`], che verifica la registrazione dal filo e va
+//! usata dove nessuna caduta e' prevista.
 
 // Ogni scenario e' un binario di test a se' e compila questo modulo per intero, ma ne usa
 // solo la parte che gli serve: senza questo permesso cio' che un singolo scenario non
@@ -62,11 +51,10 @@ use georuggine_common::protocol::{
     ClientMessage, MovementSummary, PROTOCOL_VERSION, ServerMessage,
 };
 use georuggine_common::types::{Coordinate, PositionRecord, UserId, UserState, Username};
-use georuggine_server::auth::{self, AuthConfig, SessionStore};
+use georuggine_server::auth::{self, AuthConfig};
 use georuggine_server::messaging::MessageHub;
 use georuggine_server::net::{
-    self, ConnectionRegistry, ConnectionTimeouts, Dipendenze, Osservazione, Regolazioni,
-    ServerConfig,
+    self, ConnectionRegistry, ConnectionTimeouts, Dipendenze, Regolazioni, ServerConfig,
 };
 use georuggine_server::state::StateTracker;
 use georuggine_server::storage::{
@@ -360,24 +348,14 @@ impl Repository for RepositorySpia {
 
 // --- spia sui panic dei task del server ---
 //
-// Il server vive in task `tokio::spawn`ati di cui nessuno tiene la `JoinHandle`: le
-// connessioni, il loro task di scrittura, il battito della macchina a stati. Un panic
-// dentro uno di quei task non fa fallire niente — tokio lo cattura, il task muore e lo
-// scenario prosegue — e in piu' libtest cattura lo stderr per test, quindi senza
-// `--nocapture` non se ne vede nemmeno la traccia. E' cosi' che il doppio poll della
-// `JoinHandle` del task di scrittura in `handle_connection` e' rimasto invisibile pur
-// scattando a ogni riconnessione.
-//
-// Il gancio qui sotto lo rende un fallimento vero. Non serve raggiungere le handle dei
-// task — cosa che non si puo' fare da fuori senza allargare l'API di `net` — perche' ogni
-// `#[tokio::test]` gira su un runtime `current_thread` sul proprio thread: i task del
-// server di quello scenario sono eseguiti su quel thread, e un panic al loro interno
-// porta l'identita' di quel thread. Registrandola si attribuisce ogni panic allo scenario
-// che lo ha provocato, anche con i test in parallelo.
-//
-// Restano fuori i soli `spawn_blocking`, che girano sul pool dei thread bloccanti e non
-// hanno l'identita' dello scenario: la' dentro c'e' pero' solo l'accesso allo SQLite, che
-// gia' propaga i suoi errori come `Result`.
+// Il server vive in task di cui nessuno tiene la `JoinHandle`: le connessioni, il loro
+// task di scrittura, il battito della macchina a stati. Un panic li dentro non fa fallire
+// niente — tokio lo cattura e lo scenario prosegue — e libtest ne nasconde anche la
+// traccia. Il gancio qui sotto lo rende un fallimento vero: ogni `#[tokio::test]` gira su
+// un runtime `current_thread` sul proprio thread, quindi un panic nei task di quel server
+// porta l'identita' di quel thread e si attribuisce allo scenario giusto anche con i test
+// in parallelo. Restano fuori i soli `spawn_blocking`, dove c'e' pero' solo l'accesso a
+// SQLite, che gia' propaga i suoi errori come `Result`.
 
 /// Un panic osservato dal gancio globale.
 struct PanicSpiato {
@@ -469,7 +447,7 @@ fn pretendi_nessun_panic_nei_task() {
 
 /// Il server vero, in ascolto su una porta effimera del loopback.
 ///
-/// Tiene un riferimento a tutto cio' che ha passato a [`net::run_con`], cosi' lo scenario
+/// Tiene un riferimento a tutto cio' che ha passato a [`net::run`], cosi' lo scenario
 /// puo' guardare il server da dentro — chi e' connesso, in che stato e' un veicolo, che
 /// cosa e' finito a storico — mentre lo interroga da fuori attraverso il protocollo.
 pub struct TestServer {
@@ -479,8 +457,6 @@ pub struct TestServer {
     pub orologio: Arc<FakeClock>,
     /// Persistenza, con la spia sui messaggi.
     pub archivio: Arc<RepositorySpia>,
-    /// Token di sessione attivi.
-    pub sessioni: Arc<SessionStore>,
     /// Connessioni aperte, una per utente.
     pub registro: Arc<ConnectionRegistry>,
     /// Messaggistica: e' da qui che lo scenario fa parlare il server.
@@ -506,7 +482,7 @@ impl TestServer {
     /// Avvia il server con le scadenze indicate.
     ///
     /// Il ritorno avviene solo quando la porta accetta davvero connessioni: senza questa
-    /// attesa il primo client potrebbe presentarsi prima che [`net::run_con`] abbia aperto
+    /// attesa il primo client potrebbe presentarsi prima che [`net::run`] abbia aperto
     /// l'ascolto e vedersi rifiutare la connessione.
     pub async fn con_timeouts(timeouts: ConnectionTimeouts) -> Self {
         // Prima di far partire qualunque task del server: da qui in poi un panic al loro
@@ -518,7 +494,6 @@ impl TestServer {
 
         let archivio = Arc::new(RepositorySpia::nuova(Arc::clone(&sorgente_ora)));
         let repo: Arc<dyn Repository> = Arc::clone(&archivio) as Arc<dyn Repository>;
-        let sessioni = Arc::new(SessionStore::new());
         let registro = Arc::new(ConnectionRegistry::new());
         // La messaggistica riceve lo stesso registro del livello di rete, come nel
         // binario: un secondo registro non vedrebbe nessuno dei veicoli collegati.
@@ -533,21 +508,20 @@ impl TestServer {
         let indirizzo = porta_libera();
         let configurazione = ServerConfig {
             bind_addr: indirizzo,
-            // Nessuno dei due percorsi viene aperto da `run_con`: il database e' gia'
+            // Nessuno dei due percorsi viene aperto da `run`: il database e' gia'
             // aperto qui sopra, e il log del tempo di CPU vive nel binario.
             db_path: PathBuf::from(":memory:"),
             log_dir: PathBuf::from("logs"),
         };
-        let ciclo = tokio::spawn(net::run_con(
+        let ciclo = tokio::spawn(net::run(
             configurazione,
             Dipendenze {
                 repo,
-                sessions: Arc::clone(&sessioni),
                 registry: Arc::clone(&registro),
                 messaging: Arc::clone(&messaggistica),
                 clock: Arc::clone(&sorgente_ora),
+                stati: Arc::clone(&stati),
             },
-            Osservazione::con_stati(Arc::clone(&stati)),
             Regolazioni {
                 auth: autenticazione_rapida(),
                 timeouts,
@@ -561,7 +535,6 @@ impl TestServer {
             indirizzo,
             orologio,
             archivio,
-            sessioni,
             registro,
             messaggistica,
             stati,
@@ -663,7 +636,7 @@ impl Drop for TestServer {
 
 /// Indirizzo di loopback su una porta che il sistema dichiara libera.
 ///
-/// [`net::run_con`] non restituisce l'indirizzo a cui si e' legato, quindi con la porta 0
+/// [`net::run`] non restituisce l'indirizzo a cui si e' legato, quindi con la porta 0
 /// non sarebbe piu' ricostruibile dall'esterno: la si fa assegnare qui da un ascolto
 /// temporaneo, chiuso subito dopo. Fra la chiusura e il legame del server resta una
 /// finestra in cui un altro processo potrebbe prendersi quella porta; sul loopback di una
@@ -786,7 +759,7 @@ impl TestClient {
         let orologio: Arc<dyn Clock> = Arc::clone(&server.orologio) as Arc<dyn Clock>;
 
         Self {
-            handle: ClientHandle::spawn_con(
+            handle: ClientHandle::spawn(
                 ClientConfig {
                     server_addr: server.indirizzo,
                     username: utente(nome),
@@ -1080,23 +1053,12 @@ impl ClientGrezzo {
     /// Scarta il ritorno a fermo che il battito della macchina a stati puo' avere gia'
     /// accodato, senza pretendere che ci sia.
     ///
-    /// Serve dove uno scenario porta il veicolo oltre la soglia di [`STILL_AFTER_SECS`]
-    /// lasciandolo in movimento e poi asserisce su un messaggio preciso. Da quel punto in
-    /// avanti il task periodico del server e' nel suo diritto di segnalare
-    /// [`UserState::Still`], e lo accoda sullo stesso canale delle risposte alle
-    /// richieste: quale dei due messaggi arrivi per primo dipende da dove cade uno scatto
-    /// di [`BATTITO`], che e' tempo vero e che nessun orologio finto governa. Consumandolo
-    /// qui l'assert successivo torna a leggere una sequenza sola.
-    ///
-    /// Il cambio si scarta una volta sola perche' e' unico: il tracciatore segnala solo
-    /// chi passa da [`UserState::Moving`] a fermo, quindi appena consumato non ne produce
-    /// altri finche' il veicolo non torna a spostarsi.
-    ///
-    /// Va chiamata dove la coda non puo' contenere altro, cioe' prima di mandare la
-    /// richiesta successiva: cosi' l'unico messaggio che puo' presentarsi e' il cambio di
-    /// stato, e una lettura che scarta non rischia di mangiare una risposta attesa.
-    ///
-    /// [`STILL_AFTER_SECS`]: georuggine_common::types::STILL_AFTER_SECS
+    /// Serve dove uno scenario porta il veicolo oltre la soglia dei tre minuti lasciandolo
+    /// in movimento e poi asserisce su un messaggio preciso: da li' in avanti il task
+    /// periodico e' nel suo diritto di accodare un ritorno a fermo sullo stesso canale, e
+    /// quale dei due arrivi prima dipende da dove cade uno scatto di [`BATTITO`], che e'
+    /// tempo vero. Il cambio si scarta una volta sola perche' e' unico, e va fatto prima
+    /// di mandare la richiesta successiva, quando la coda non puo' contenere altro.
     pub async fn scarta_ritorno_a_fermo(&mut self) {
         match timeout(ATTESA_DEL_BATTITO, self.ingresso.next()).await {
             // Lo scatto e' gia' avvenuto: il cambio esce dalla coda e cio' che si attende

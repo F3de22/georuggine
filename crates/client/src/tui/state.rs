@@ -1,5 +1,5 @@
-//! Stato dell'interfaccia testuale del client (requisito P20), separato dal rendering
-//! perche' sia verificabile senza aprire un terminale.
+//! Stato dell'interfaccia testuale del client, separato dal rendering perche' sia
+//! verificabile senza aprire un terminale.
 //!
 //! [`UiState::applica_evento`] e' l'unico punto in cui un [`ClientEvent`] arrivato da
 //! [`ClientHandle`](crate::core::ClientHandle) aggiorna lo stato: il ciclo di rendering
@@ -48,12 +48,9 @@ pub struct UiState {
     pub riga_di_input: String,
     /// Ultimo motivo di disconnessione o ultimo errore non fatale ricevuto dal server.
     ///
-    /// Il campo e' condiviso fra [`ClientEvent::Disconnected`] e [`ClientEvent::Error`]:
-    /// per l'operatore davanti alla TUI entrambi sono "l'ultima cosa andata storta", e
-    /// separarli in due campi costringerebbe il rendering a decidere quale mostrare
-    /// quando sono entrambi valorizzati. Si azzera a ogni [`ClientEvent::Connected`],
-    /// perche' un errore di rete precedente non ha piu' senso da mostrare a connessione
-    /// ristabilita.
+    /// Un solo campo per entrambi: per chi guarda la TUI sono entrambi "l'ultima cosa
+    /// andata storta", e separarli costringerebbe il rendering a scegliere quale mostrare.
+    /// Si azzera a ogni [`ClientEvent::Connected`].
     pub ultimo_errore: Option<String>,
 }
 
@@ -77,10 +74,7 @@ impl UiState {
     /// Aggiorna lo stato in base a un evento ricevuto da `ClientHandle::event_rx`.
     ///
     /// `adesso` e' l'istante da registrare per gli eventi che non portano gia' un proprio
-    /// orario ([`ClientEvent::PositionSent`] e [`ClientEvent::ServerText`], a differenza
-    /// di `ClientMessage::Position` che porta un `recorded_at` sul filo): come nel resto
-    /// del progetto la TUI non chiama mai `Utc::now()` da sola, ma riceve il tempo dal
-    /// chiamante.
+    /// orario: come nel resto del progetto la TUI non chiama mai `Utc::now()` da sola.
     pub fn applica_evento(&mut self, evento: ClientEvent, adesso: DateTime<Utc>) {
         match evento {
             ClientEvent::Connected => {
@@ -122,8 +116,7 @@ impl UiState {
 
 /// Accoda un elemento, scartando il piu' vecchio se la coda e' gia' al limite.
 ///
-/// Stessa forma di `accoda` in `core.rs`: qui e' generica perche' la usano sia lo storico
-/// delle posizioni sia quello dei messaggi, con elementi di tipo diverso.
+/// E' generica perche' la usano sia lo storico delle posizioni sia quello dei messaggi.
 fn accoda<T>(coda: &mut VecDeque<T>, elemento: T, capacita: usize) {
     if coda.len() >= capacita {
         coda.pop_front();

@@ -1,59 +1,28 @@
-//! Nucleo di connessione del client Georuggine (requisito R3).
+//! Nucleo di rete del client: configurazione, sessione e ciclo di invio delle posizioni.
 //!
-//! # Disaccoppiamento da una futura interfaccia
+//! [`ClientHandle::spawn`] avvia un task che apre la connessione, si autentica e resta in
+//! ascolto. L'interfaccia non conosce il socket: le manda [`ClientCommand`] e ne legge
+//! [`ClientEvent`], attraverso due canali.
 //!
-//! Nessuna interfaccia utente (la TUI di P20) deve conoscere il socket: comunica solo
-//! attraverso [`ClientCommand`] e [`ClientEvent`], scambiati sui due canali di
-//! [`ClientHandle`]. Il task di rete vero e proprio vive dietro [`ClientHandle::spawn`]
-//! e non e' altrimenti raggiungibile.
+//! # Riconnessione
 //!
-//! # Ciclo di vita di una connessione
-//!
-//! ```text
-//! connetti -> Hello -> Welcome -> Register|Login -> SessionToken -> Connected
-//!   |                                                                  |
-//!   `------------------------- backoff -------------------------------'
-//!                        (Disconnected, poi si riprova)
-//! ```
-//!
-//! Un fallimento di rete (connessione rifiutata, frame corrotto, EOF) fa emettere
-//! [`ClientEvent::Disconnected`] e riprovare con un backoff esponenziale (1s, 2s, 4s,
-//! 8s, poi 30s fisso, con un piccolo jitter casuale per non far ricollegare piu' client
-//! nello stesso istante). Un fallimento di credenziali o di versione di protocollo
-//! invece non si ripete da solo: emette [`ClientEvent::Error`] e il task termina,
-//! perche' riprovare con la stessa password sbagliata non cambierebbe esito.
-//!
-//! # Sessione sostituita
-//!
-//! C'e' un terzo percorso di uscita, distinto da entrambi. Il server ammette una sola
-//! sessione per utente: se lo stesso account si collega altrove, chiude questa
-//! connessione dopo aver mandato un [`ServerMessage::Error`] con il testo
-//! [`SESSION_REPLACED_MESSAGE`]. E' una chiusura voluta, non una caduta di rete, e va
-//! trattata diversamente: il task emette [`ClientEvent::Disconnected`] con quel motivo e
-//! **termina senza riconnettersi**. Riprovare rimetterebbe fuori la connessione che ha
-//! preso il posto di questa, la quale a sua volta si riconnetterebbe, in un ciclo che non
-//! finisce piu'; sta all'utente decidere se rilanciare il client. Il percorso della
-//! riconnessione per errore di rete resta invece quello di sopra, immutato.
-//!
-//! # Posizioni mentre la connessione e' caduta
-//!
-//! Il ticker delle posizioni interroga la sorgente ogni trenta secondi **anche senza
-//! connessione attiva**, cosi' il ritmo del percorso non si perde durante un tentativo
-//! di riconnessione. Le posizioni prodotte in quella finestra si accumulano in una coda
-//! locale limitata a [`CAPACITA_CODA_POSIZIONI`] elementi (le piu' vecchie vengono
-//! scartate oltre il limite) e vengono inviate in ordine non appena la connessione
-//! torna disponibile, prima di riprendere l'invio periodico.
+//! Una connessione che cade non ferma il client: si riprova con un backoff crescente,
+//! continuando nel frattempo a interrogare la sorgente e ad accumulare in una coda locale
+//! le posizioni che non si possono inviare. Due casi fanno invece terminare il task:
+//! credenziali rifiutate o versione di protocollo incompatibile (riprovare darebbe lo
+//! stesso esito) e la sostituzione di sessione, dove riconnettersi espellerebbe la
+//! connessione che ha preso il posto di questa, in un ciclo perpetuo fra i due client.
 
 use std::collections::VecDeque;
 use std::net::{AddrParseError, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::Sender as SyncSender;
+use std::sync::mpsc::Sender as SorgenteManuale;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt as _, StreamExt as _};
-use georuggine_common::clock::{Clock, SystemClock};
+use georuggine_common::clock::Clock;
 use georuggine_common::codec::{ClientCodec, ServerCodec};
 use georuggine_common::protocol::{
     AnalysisRange, ClientMessage, ErrorCode, MovementSummary, PROTOCOL_VERSION,
@@ -73,8 +42,7 @@ use crate::sources::{PositionSource, SorgenteCostruita, SourceKind};
 /// Frazione massima di `base` aggiunta come jitter a un ritardo di backoff.
 const JITTER_FRAZIONE: f64 = 0.2;
 
-/// Posizioni che la coda di disconnessione puo' trattenere prima di scartare le piu'
-/// vecchie.
+/// Posizioni che la coda di disconnessione trattiene prima di scartare le piu' vecchie.
 const CAPACITA_CODA_POSIZIONI: usize = 200;
 
 /// Capacita' del canale dei comandi verso il task di rete.
@@ -84,10 +52,6 @@ const CAPACITA_COMANDI: usize = 32;
 const CAPACITA_EVENTI: usize = 32;
 
 /// Attesa massima concessa al task di rete per chiudersi in modo ordinato.
-///
-/// E' la stessa scadenza che il server concede alla chiusura di una connessione: pochi
-/// secondi bastano a mandare un `Logout` e chiudere il socket, e oltre non si aspetta,
-/// perche' un server che non risponde non deve tenere appeso il client in uscita.
 const ATTESA_CHIUSURA: Duration = Duration::from_secs(5);
 
 /// Testo mostrato da `--help`.
@@ -175,9 +139,8 @@ pub struct ClientConfig {
 
 /// Esito dell'analisi degli argomenti.
 ///
-/// Come per `ServerConfig::from_args` nel server, `--help` non stampa ne' esce da
-/// dentro l'analisi: la decisione torna al chiamante, cosi' la funzione resta pura e
-/// testabile.
+/// Come nel server, `--help` non stampa ne' esce da dentro l'analisi: la decisione torna
+/// al chiamante, cosi' la funzione resta pura e verificabile.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Avvio {
     /// Il client deve partire con questa configurazione.
@@ -202,18 +165,14 @@ struct SorgenteGrezza {
 }
 
 impl ClientConfig {
-    /// Analizza gli argomenti da riga di comando.
-    ///
-    /// Si aspetta i soli argomenti, senza il nome del programma: il chiamante passa
-    /// tipicamente `std::env::args().skip(1)`.
+    /// Analizza gli argomenti da riga di comando, senza il nome del programma.
     ///
     /// # Errori
     ///
-    /// [`ArgsError`] se un'opzione e' sconosciuta, se manca il valore di un'opzione che
-    /// lo richiede, se `--server` non e' un indirizzo valido, se `--user` non rispetta
-    /// il formato di [`Username`], se un parametro numerico o una coordinata sono
-    /// malformati, se `--source` non e' una delle quattro strategie ammesse o se manca
-    /// un'opzione obbligatoria, globale o della sorgente scelta.
+    /// [`ArgsError`] se un'opzione e' sconosciuta o le manca il valore, se `--server` non
+    /// e' un indirizzo valido, se `--user` non rispetta il formato di [`Username`], se un
+    /// parametro numerico o una coordinata sono malformati, se `--source` non e' una delle
+    /// quattro strategie o se manca un'opzione obbligatoria.
     pub fn from_args<I>(argomenti: I) -> Result<Avvio, ArgsError>
     where
         I: IntoIterator<Item = String>,
@@ -423,12 +382,11 @@ fn costruisci_source_kind(
     }
 }
 
-/// Comando che una futura interfaccia manda al task di rete.
+/// Comando che l'interfaccia manda al task di rete.
 ///
-/// Il task lo traduce in un messaggio di protocollo, salvo [`ClientCommand::SetManualPosition`]:
-/// quello alimenta direttamente la sorgente manuale (se la configurazione ne usa una) e
-/// non produce di per se' alcun messaggio verso il server, che arriva invece al
-/// prossimo giro del ticker delle posizioni.
+/// Il task lo traduce in un messaggio di protocollo, salvo
+/// [`ClientCommand::SetManualPosition`]: quello alimenta la sorgente manuale e non
+/// produce di per se' nessun messaggio, che parte invece al prossimo giro del ticker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientCommand {
     /// Manda un messaggio testuale al server.
@@ -441,18 +399,16 @@ pub enum ClientCommand {
     Quit,
 }
 
-/// Evento che il task di rete manda a una futura interfaccia.
+/// Evento che il task di rete manda all'interfaccia.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientEvent {
     /// La sessione e' aperta: handshake, autenticazione e messaggi in attesa consegnati.
     Connected,
     /// La connessione e' caduta; il campo descrive il motivo. Un tentativo di
     /// riconnessione e' gia' in corso, salvo che il task stia per terminare: e' il caso
-    /// della sessione sostituita, dove il motivo e' [`SESSION_REPLACED_MESSAGE`] e non
-    /// segue nessun tentativo. Vedi la nota nel modulo.
+    /// della sessione sostituita.
     Disconnected(String),
-    /// Testo ricevuto dal server: `direct` distingue un messaggio diretto da un
-    /// broadcast.
+    /// Testo ricevuto dal server.
     ServerText {
         /// Corpo del messaggio.
         body: String,
@@ -470,16 +426,12 @@ pub enum ClientEvent {
     Error(String),
 }
 
-/// Parametri temporali del task di rete: intervallo di invio periodico e progressione
-/// del backoff di riconnessione.
+/// Parametri temporali del task di rete: intervallo di invio periodico e progressione del
+/// backoff di riconnessione.
 ///
-/// Sono un parametro e non costanti fisse per lo stesso motivo di `ConnectionTimeouts`
-/// nel server: chi verifica backoff e invii periodici deve poterlo fare senza aspettare i
-/// valori di produzione. Sono percio' pubblici, come `ConnectionTimeouts` e per lo stesso
-/// destinatario: i test di integrazione a livello di workspace, che montano client e
-/// server veri e non possono permettersi trenta secondi di attesa per ogni posizione.
-///
-/// In produzione non si costruisce a mano: [`ClientHandle::spawn`] usa [`Tempi::default`].
+/// Sono un parametro e non costanti fisse per lo stesso motivo di `ConnectionTimeouts` nel
+/// server: chi verifica backoff e invii periodici deve poterlo fare senza aspettare i
+/// valori di produzione, dove i binari passano [`Tempi::default`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tempi {
     /// Intervallo fra due interrogazioni della sorgente di posizione.
@@ -491,8 +443,8 @@ pub struct Tempi {
 }
 
 impl Default for Tempi {
-    /// Trenta secondi fra un invio e il successivo; backoff 1s, 2s, 4s, 8s, poi 30s
-    /// fisso, come da requisito.
+    /// Trenta secondi fra un invio e il successivo, come chiede la traccia; backoff 1s,
+    /// 2s, 4s, 8s, poi 30s fisso.
     fn default() -> Self {
         Self {
             intervallo_posizione: Duration::from_secs(30),
@@ -509,8 +461,8 @@ impl Default for Tempi {
 
 impl Tempi {
     /// Ritardo del tentativo numero `tentativo` (il primo e' 1), con un jitter casuale
-    /// fino al 20% in piu' del valore base: senza, client diversi riavviati insieme
-    /// proverebbero a riconnettersi tutti nello stesso istante.
+    /// fino al 20% in piu': senza, client diversi riavviati insieme proverebbero a
+    /// riconnettersi tutti nello stesso istante.
     fn ritardo_di(&self, tentativo: u32) -> Duration {
         let indice = usize::try_from(tentativo.saturating_sub(1)).unwrap_or(usize::MAX);
         let base = self
@@ -523,15 +475,13 @@ impl Tempi {
     }
 }
 
-/// Stato che il task di rete porta attraverso le fasi connessa e disconnessa: la
-/// sorgente di posizione, il canale della sorgente manuale se c'e', la coda delle
-/// posizioni non ancora inviate, il ticker periodico e l'orologio.
+/// Stato che il task di rete porta attraverso le fasi connessa e disconnessa.
 ///
 /// E' una struttura di sole referenze e non un insieme di parametri separati perche'
 /// altrimenti le funzioni che la usano supererebbero il limite di argomenti di clippy.
 struct StatoRete<'a> {
     sorgente: &'a mut dyn PositionSource,
-    manuale: Option<&'a SyncSender<Coordinate>>,
+    manuale: Option<&'a SorgenteManuale<Coordinate>>,
     coda: &'a mut VecDeque<(Coordinate, DateTime<Utc>)>,
     ticker: &'a mut Interval,
     clock: &'a Arc<dyn Clock>,
@@ -541,9 +491,8 @@ struct StatoRete<'a> {
 enum MotivoFallimento {
     /// Un guasto di rete o un protocollo violato: vale la pena riprovare.
     Rete(String),
-    /// Credenziali rifiutate o versione di protocollo incompatibile: riprovare con la
-    /// stessa configurazione darebbe di nuovo lo stesso esito, quindi il task termina
-    /// invece di ripetere il login all'infinito con la stessa password sbagliata.
+    /// Credenziali rifiutate o versione incompatibile: riprovare con la stessa
+    /// configurazione darebbe di nuovo lo stesso esito, quindi il task termina.
     Terminale(String),
 }
 
@@ -552,15 +501,7 @@ enum EsitoFase {
     /// La connessione e' caduta: il chiamante riprova con il backoff.
     Riconnetti(String),
     /// Il server ha chiuso la sessione apposta, perche' lo stesso utente si e' collegato
-    /// da un'altra parte: il chiamante emette [`ClientEvent::Disconnected`] con il motivo
-    /// e il task termina **senza** riprovare.
-    ///
-    /// E' una variante a se' e non un [`EsitoFase::Riconnetti`] proprio perche' la
-    /// differenza sta tutta nel seguito: riconnettersi qui espellerebbe la connessione
-    /// che ha preso il posto di questa, la quale a sua volta si riconnetterebbe,
-    /// generando un ciclo perpetuo fra i due client. Non e' nemmeno un
-    /// [`EsitoFase::Termina`], che e' l'uscita silenziosa di [`ClientCommand::Quit`]:
-    /// qui l'utente va avvisato di cosa e' successo.
+    /// da un'altra parte: il task termina **senza** riprovare, ma l'utente va avvisato.
     SessioneSostituita(String),
     /// [`ClientCommand::Quit`] o la caduta del canale dei comandi: il task termina.
     Termina,
@@ -574,56 +515,35 @@ enum EsitoAttesa {
     Termina,
 }
 
-/// Nucleo di rete: avvia un task interno e lo disaccoppia dal resto del programma
-/// attraverso due canali.
+/// Nucleo di rete: avvia un task interno e lo disaccoppia dal resto del programma con due
+/// canali.
 ///
-/// Nessuna futura interfaccia deve conoscere il socket: comunica solo mandando
-/// [`ClientCommand`] su `command_tx` e leggendo [`ClientEvent`] da `event_rx`. Il
-/// canale degli eventi si chiude (restituendo `None`) quando il task termina, per
-/// esempio dopo [`ClientCommand::Quit`] o dopo un fallimento non ripetibile
-/// dell'autenticazione.
-///
-/// Chi lo avvia deve chiuderlo con [`ClientHandle::chiudi`]: lasciar cadere l'handle non
-/// basta, per il motivo spiegato li'.
+/// Il canale degli eventi si chiude (restituendo `None`) quando il task termina. Chi lo
+/// avvia deve chiuderlo con [`ClientHandle::chiudi`]: lasciar cadere l'handle non basta.
 pub struct ClientHandle {
     /// Comandi da mandare al task di rete.
     pub command_tx: mpsc::Sender<ClientCommand>,
     /// Eventi che il task di rete produce.
     pub event_rx: mpsc::Receiver<ClientEvent>,
-    /// Task di rete, atteso da [`ClientHandle::chiudi`].
-    ///
-    /// Non e' pubblico: chi usa l'handle non deve poter attendere o interrompere il task
-    /// se non passando dalla chiusura ordinata.
+    /// Task di rete, atteso da [`ClientHandle::chiudi`]. Non e' pubblico: chi usa
+    /// l'handle non deve poterlo interrompere se non passando dalla chiusura ordinata.
     task: JoinHandle<()>,
 }
 
 impl ClientHandle {
-    /// Avvia il task di rete con l'orologio e i tempi di produzione.
+    /// Avvia il task di rete.
     ///
-    /// `sorgente` arriva gia' costruita da [`SourceKind::build`] e non viene costruita
-    /// qui. Una sorgente che non si inizializza (il file di un percorso mancante o
-    /// illeggibile) e' un errore di configurazione: va scoperto dal chiamante **prima**
-    /// di aprire qualunque connessione, non dentro un task gia' avviato, dove
-    /// diventerebbe un evento di errore su un canale che l'interfaccia non ha ancora
-    /// avuto il tempo di leggere. Cosi' la lettura del file resta inoltre fuori da un
-    /// task async, dove sarebbe un'operazione bloccante.
-    pub fn spawn(config: ClientConfig, sorgente: SorgenteCostruita) -> Self {
-        Self::spawn_con(config, sorgente, Arc::new(SystemClock), Tempi::default())
-    }
-
-    /// Avvia il task di rete con orologio e tempi scelti dal chiamante.
+    /// `sorgente` arriva gia' costruita da [`SourceKind::build`]: una sorgente che non si
+    /// inizializza (il file di un percorso mancante o illeggibile) e' un errore di
+    /// configurazione, e va scoperto dal chiamante **prima** di aprire qualunque
+    /// connessione, non dentro un task gia' avviato dove diventerebbe un evento su un
+    /// canale che nessuno legge ancora.
     ///
-    /// Serve ai test per accorciare l'intervallo di invio e il backoff senza aspettare i
-    /// valori di produzione, e per iniettare un [`FakeClock`] al posto di [`SystemClock`]:
-    /// l'istante di ogni [`ClientMessage::Position`] viene da qui, quindi con un orologio
-    /// finto il `recorded_at` che arriva al server e' deciso dal test invece che
-    /// dall'ora di sistema.
-    ///
-    /// In produzione si usa [`ClientHandle::spawn`], che passa [`SystemClock`] e
-    /// [`Tempi::default`].
-    ///
-    /// [`FakeClock`]: georuggine_common::clock::FakeClock
-    pub fn spawn_con(
+    /// `clock` e `tempi` sono parametri e non valori fissi perche' i test possano
+    /// accorciare intervallo e backoff e iniettare un orologio deterministico: l'istante
+    /// di ogni [`ClientMessage::Position`] viene da li'. In produzione si passano
+    /// `SystemClock` e [`Tempi::default`].
+    pub fn spawn(
         config: ClientConfig,
         sorgente: SorgenteCostruita,
         clock: Arc<dyn Clock>,
@@ -639,23 +559,19 @@ impl ClientHandle {
         }
     }
 
-    /// Chiude la sessione e attende che il task di rete sia davvero terminato.
-    ///
-    /// Restituisce vero se il task si e' chiuso entro [`ATTESA_CHIUSURA`], falso se la
-    /// scadenza e' passata per prima.
+    /// Chiude la sessione e attende che il task di rete sia davvero terminato; falso se
+    /// la scadenza passa per prima.
     ///
     /// Lasciar cadere l'handle non basta: al ritorno di `main` il runtime viene distrutto
-    /// e i task ancora vivi spariscono, quindi il `Logout` e la chiusura del socket
-    /// andrebbero persi in una corsa e il server libererebbe la sessione solo alla
-    /// scadenza di inattivita'. L'ordine delle operazioni conta:
+    /// e i task ancora vivi spariscono, quindi il `Logout` andrebbe perso in una corsa e
+    /// il server libererebbe la sessione solo alla scadenza di inattivita'. L'ordine
+    /// conta:
     ///
-    /// 1. cade il ricevitore degli eventi, altrimenti un task fermo su un canale degli
-    ///    eventi pieno — nessuno lo drena piu' — non arriverebbe mai a leggere il comando
-    ///    di chiusura;
-    /// 2. parte [`ClientCommand::Quit`], che fa inviare `Logout` e chiudere il lato di
-    ///    scrittura;
-    /// 3. cade anche il mittente dei comandi, cosi' un task che fosse gia' oltre la
-    ///    lettura del comando termina comunque sul canale chiuso;
+    /// 1. cade il ricevitore degli eventi, altrimenti un task fermo su un canale pieno —
+    ///    nessuno lo drena piu' — non arriverebbe mai a leggere il comando di chiusura;
+    /// 2. parte [`ClientCommand::Quit`], che fa inviare `Logout` e chiudere la scrittura;
+    /// 3. cade anche il mittente dei comandi, cosi' un task gia' oltre la lettura del
+    ///    comando termina comunque sul canale chiuso;
     /// 4. si attende la fine del task, con un tetto complessivo sulle tre attese.
     pub async fn chiudi(self) -> bool {
         let Self {
@@ -668,9 +584,8 @@ impl ClientHandle {
         timeout(ATTESA_CHIUSURA, async move {
             let _ = command_tx.send(ClientCommand::Quit).await;
             drop(command_tx);
-            // L'errore di join significa che il task e' andato in panico: non c'e'
-            // nulla da fare oltre a smettere di aspettarlo, e il chiamante sta gia'
-            // uscendo.
+            // L'errore di join significa che il task e' andato in panico: non c'e' nulla
+            // da fare oltre a smettere di aspettarlo.
             let _ = task.await;
         })
         .await
@@ -680,8 +595,6 @@ impl ClientHandle {
 
 /// Corpo del task di rete: alterna connessione e attesa di riconnessione finche' non
 /// arriva [`ClientCommand::Quit`] o un fallimento non ripetibile dell'autenticazione.
-///
-/// La sorgente arriva gia' costruita dal chiamante: vedi [`ClientHandle::spawn`].
 async fn esegui(
     config: ClientConfig,
     costruita: SorgenteCostruita,
@@ -696,29 +609,21 @@ async fn esegui(
 
     let mut ticker = tokio::time::interval(tempi.intervallo_posizione);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // Il primo tick di un `interval` matura subito: lo si consuma qui, altrimenti la
-    // prima posizione partirebbe non appena la connessione si apre invece che trenta
-    // secondi dopo l'avvio del task.
+    // Il primo tick matura subito: lo si consuma qui, altrimenti la prima posizione
+    // partirebbe all'apertura della connessione invece che dopo un intervallo.
     ticker.tick().await;
 
     let mut tentativo: u32 = 0;
     // `config.register` dice come aprire la *prima* sessione, non tutte: una volta
-    // registrato, l'utente esiste, e ripresentare `Register` a ogni riconnessione si
-    // prenderebbe `UsernameTaken`, che e' terminale e farebbe uscire il task. Vale la
-    // pena dirlo ad alta voce: il ciclo qui sotto ricontrolla lo stato a ogni giro, e
-    // quello ha sempre funzionato; il difetto era che nulla aggiornava quello stato
-    // dopo il primo successo, perche' la scelta rileggeva ogni volta `config.register`.
-    // Il flag vive quindi nel ciclo e `config` resta la configurazione originale,
-    // immutata. Lo abbassa solo un `Register` a cui il server ha risposto
-    // `SessionToken`: un `Register` rifiutato resta terminale, perche' non sappiamo se
-    // la password data corrisponde davvero all'utente che esiste gia'.
+    // registrato l'utente esiste, e ripresentare `Register` a ogni riconnessione si
+    // prenderebbe `UsernameTaken`, che e' terminale e farebbe uscire il task. Il flag vive
+    // percio' nel ciclo, e lo abbassa solo un `Register` a cui il server ha risposto
+    // `SessionToken`.
     let mut da_registrare = config.register;
 
     loop {
         match connetti_e_autentica(&config, da_registrare).await {
             Ok((mut ingresso, mut uscita)) => {
-                // L'autenticazione e' andata a buon fine: se era una registrazione,
-                // da qui in poi si accede e basta.
                 da_registrare = false;
                 tentativo = 0;
                 let _ = event_tx.send(ClientEvent::Connected).await;
@@ -741,8 +646,8 @@ async fn esegui(
                 .await
                 {
                     EsitoFase::Termina => return,
-                    // Chiusura voluta dal server: si avvisa e si esce dal ciclo, senza
-                    // passare dal backoff. Rilanciare il client tocca all'utente.
+                    // Chiusura voluta dal server: si avvisa e si esce, senza passare dal
+                    // backoff. Rilanciare il client tocca all'utente.
                     EsitoFase::SessioneSostituita(motivo) => {
                         let _ = event_tx.send(ClientEvent::Disconnected(motivo)).await;
                         return;
@@ -782,17 +687,15 @@ async fn esegui(
     }
 }
 
-/// Apre la connessione ed esegue l'handshake e l'autenticazione.
+/// Apre la connessione ed esegue handshake e autenticazione.
 ///
-/// `registra` decide fra [`ClientMessage::Register`] e [`ClientMessage::Login`]. Non
-/// e' `config.register` perche' quel campo vale per la prima sessione e non per le
-/// successive: la scelta tentativo per tentativo sta nel ciclo di [`esegui`].
+/// `registra` decide fra [`ClientMessage::Register`] e [`ClientMessage::Login`], e non e'
+/// `config.register` perche' quel campo vale per la prima sessione e non per le successive.
 ///
 /// # Errori
 ///
-/// [`MotivoFallimento::Rete`] per ogni guasto di rete o violazione del protocollo, da
-/// cui vale la pena riprovare; [`MotivoFallimento::Terminale`] per credenziali
-/// rifiutate o versione di protocollo incompatibile, che riprovare non risolverebbe.
+/// [`MotivoFallimento::Rete`] per ogni guasto di rete o violazione del protocollo;
+/// [`MotivoFallimento::Terminale`] per credenziali rifiutate o versione incompatibile.
 async fn connetti_e_autentica(
     config: &ClientConfig,
     registra: bool,
@@ -866,8 +769,7 @@ async fn prossimo(
     }
 }
 
-/// Traduce un [`ServerMessage::Error`] ricevuto durante l'handshake o l'autenticazione
-/// in un [`MotivoFallimento`].
+/// Traduce un [`ServerMessage::Error`] ricevuto durante handshake o autenticazione.
 fn esito_errore(code: ErrorCode, message: String) -> MotivoFallimento {
     match code {
         ErrorCode::InvalidCredentials
@@ -877,9 +779,8 @@ fn esito_errore(code: ErrorCode, message: String) -> MotivoFallimento {
     }
 }
 
-/// Ciclo principale a connessione aperta: invii periodici, comandi in arrivo e
-/// messaggi dal server, finche' la connessione non cade o arriva
-/// [`ClientCommand::Quit`].
+/// Ciclo principale a connessione aperta: invii periodici, comandi in arrivo e messaggi
+/// dal server, finche' la connessione non cade o arriva [`ClientCommand::Quit`].
 async fn fase_connessa(
     ingresso: &mut FramedRead<OwnedReadHalf, ServerCodec>,
     uscita: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
@@ -887,8 +788,7 @@ async fn fase_connessa(
     command_rx: &mut mpsc::Receiver<ClientCommand>,
     event_tx: &mpsc::Sender<ClientEvent>,
 ) -> EsitoFase {
-    // Le posizioni accumulate durante una disconnessione precedente partono subito,
-    // prima di riprendere l'invio periodico.
+    // Le posizioni accumulate durante una disconnessione precedente partono subito.
     if let Err(errore) = svuota_coda(stato.coda, uscita, event_tx).await {
         return EsitoFase::Riconnetti(errore);
     }
@@ -901,11 +801,9 @@ async fn fase_connessa(
                     Some(coordinate) => accoda(stato.coda, coordinate, ora),
                     // Sorgente esaurita: un percorso da file arrivato in fondo senza
                     // ripetizione non produrra' piu' nulla, e una connessione muta viene
-                    // chiusa dal server alla scadenza di inattivita'. Senza questo ramo
-                    // il client entrerebbe in un ciclo perpetuo di riconnessioni che non
-                    // porta nessuna posizione nuova; un `Ping` al ritmo del ticker, ben
-                    // dentro quella scadenza, tiene invece viva la sessione e lascia il
-                    // veicolo raggiungibile dai messaggi del server.
+                    // chiusa dal server alla scadenza di inattivita'. Un `Ping` al ritmo
+                    // del ticker tiene viva la sessione e lascia il veicolo raggiungibile
+                    // dai messaggi del server.
                     None => {
                         if uscita.send(ClientMessage::Ping).await.is_err() {
                             return EsitoFase::Riconnetti("scrittura fallita".to_owned());
@@ -969,10 +867,9 @@ async fn fase_connessa(
                     Some(Ok(ServerMessage::AnalysisReport(riepilogo))) => {
                         let _ = event_tx.send(ClientEvent::AnalysisReceived(riepilogo)).await;
                     }
-                    // La sostituzione di sessione si riconosce dal testo e non dal
-                    // codice: il protocollo non ha un `ErrorCode` dedicato, vedi
-                    // `SESSION_REPLACED_MESSAGE`. Il ramo precede quello generale
-                    // apposta, perche' altrimenti finirebbe fra gli errori qualunque.
+                    // La sostituzione di sessione si riconosce dal testo e non dal codice:
+                    // il protocollo non ha un `ErrorCode` dedicato. Il ramo precede quello
+                    // generale apposta, altrimenti finirebbe fra gli errori qualunque.
                     Some(Ok(ServerMessage::Error { message, .. }))
                         if message == SESSION_REPLACED_MESSAGE =>
                     {
@@ -981,7 +878,7 @@ async fn fase_connessa(
                     Some(Ok(ServerMessage::Error { message, .. })) => {
                         let _ = event_tx.send(ClientEvent::Error(message)).await;
                     }
-                    // Welcome, SessionToken, Ack e Pong fuori sequenza: non c'e' nulla da fare.
+                    // Welcome, SessionToken, Ack e Pong fuori sequenza: nulla da fare.
                     Some(Ok(_)) => {}
                     Some(Err(errore)) => return EsitoFase::Riconnetti(errore.to_string()),
                     None => {
@@ -997,8 +894,7 @@ async fn fase_connessa(
 /// comandi che non richiedono una connessione.
 ///
 /// `SendText` e `RequestAnalysis` non vengono accodati: senza connessione non c'e' un
-/// server a cui recapitarli, e la coda locale e' riservata alle sole posizioni, come
-/// da requisito.
+/// server a cui recapitarli, e la coda locale e' riservata alle sole posizioni.
 async fn attesa_riconnessione(
     ritardo: Duration,
     stato: &mut StatoRete<'_>,
@@ -1050,13 +946,13 @@ fn accoda(
     coda.push_back((coordinate, quando));
 }
 
-/// Invia in ordine tutte le posizioni in coda, emettendo [`ClientEvent::PositionSent`]
-/// per ognuna.
+/// Invia in ordine tutte le posizioni in coda, emettendo [`ClientEvent::PositionSent`] per
+/// ognuna.
 ///
 /// # Errori
 ///
-/// La descrizione dell'errore di scrittura, se la connessione cade a meta': la
-/// posizione che non e' partita resta in testa alla coda per il prossimo tentativo.
+/// La descrizione dell'errore di scrittura, se la connessione cade a meta': la posizione
+/// che non e' partita resta in testa alla coda per il prossimo tentativo.
 async fn svuota_coda(
     coda: &mut VecDeque<(Coordinate, DateTime<Utc>)>,
     uscita: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
@@ -1082,18 +978,16 @@ async fn svuota_coda(
 mod tests {
     use super::*;
 
-    use std::net::SocketAddr;
     use std::time::Instant;
 
-    use georuggine_common::protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::time::timeout;
+    use georuggine_common::clock::SystemClock;
+    use tokio::net::TcpListener;
 
     /// Quanto un test aspetta un evento o un messaggio prima di considerarlo mancato.
     const ATTESA: Duration = Duration::from_secs(5);
 
-    /// Tempi accorciati per i test che riguardano backoff e invio periodico: reali,
-    /// ma troppo brevi perche' un test debba aspettare i valori di produzione.
+    /// Tempi accorciati per i test su backoff e invio periodico: reali, ma troppo brevi
+    /// perche' un test debba aspettare i valori di produzione.
     fn tempi_di_prova() -> Tempi {
         Tempi {
             intervallo_posizione: Duration::from_millis(80),
@@ -1102,32 +996,9 @@ mod tests {
         }
     }
 
-    /// Configurazione di test verso `indirizzo`, con una sorgente manuale che non
-    /// produce mai posizioni nuove da sola.
-    fn config(indirizzo: SocketAddr) -> ClientConfig {
-        ClientConfig {
-            server_addr: indirizzo,
-            username: Username::new("veicolo_01").expect("username di test valido"),
-            password: "scorta12".to_owned(),
-            register: false,
-            source: SourceKind::Manual {
-                iniziale: Coordinate::new(45.0703, 7.6869).expect("coordinata di test valida"),
-            },
-        }
-    }
-
-    /// Configurazione di test che apre la sessione registrando l'utente, come fa un
-    /// client avviato con `--register`.
-    fn config_con_register(indirizzo: SocketAddr) -> ClientConfig {
-        ClientConfig {
-            register: true,
-            ..config(indirizzo)
-        }
-    }
-
-    /// Tempi per i test sulla scelta fra Register e Login: backoff cortissimo, cosi'
-    /// la riconnessione arriva subito, e invio periodico lasciato a trenta secondi,
-    /// cosi' il ticker non infila messaggi in mezzo alla sequenza osservata.
+    /// Backoff cortissimo, cosi' la riconnessione arriva subito, e invio periodico lasciato
+    /// a trenta secondi, cosi' il ticker non infila messaggi in mezzo alla sequenza
+    /// osservata.
     fn tempi_di_riconnessione() -> Tempi {
         Tempi {
             intervallo_posizione: Duration::from_secs(30),
@@ -1136,12 +1007,29 @@ mod tests {
         }
     }
 
-    /// Configurazione di test con un cammino casuale, per i test sull'invio periodico:
-    /// produce posizioni diverse a ogni chiamata.
+    fn coordinata(lat: f64, lon: f64) -> Coordinate {
+        Coordinate::new(lat, lon).expect("coordinata di test valida")
+    }
+
+    /// Configurazione di test con una sorgente manuale, che non produce mai posizioni
+    /// nuove da sola.
+    fn config(indirizzo: SocketAddr) -> ClientConfig {
+        ClientConfig {
+            server_addr: indirizzo,
+            username: Username::new("veicolo_01").expect("username di test valido"),
+            password: "scorta12".to_owned(),
+            register: false,
+            source: SourceKind::Manual {
+                iniziale: coordinata(45.0703, 7.6869),
+            },
+        }
+    }
+
+    /// Configurazione con un cammino casuale: produce posizioni diverse a ogni chiamata.
     fn config_con_random(indirizzo: SocketAddr) -> ClientConfig {
         ClientConfig {
             source: SourceKind::RandomWalk {
-                partenza: Coordinate::new(45.0703, 7.6869).expect("coordinata di test valida"),
+                partenza: coordinata(45.0703, 7.6869),
                 raggio_massimo_m: 1_000.0,
                 passo_massimo_m: 50.0,
                 seed: 7,
@@ -1151,29 +1039,18 @@ mod tests {
     }
 
     /// Avvia il task di rete costruendo la sorgente dalla configurazione, come fa il
-    /// binario prima di chiamare [`ClientHandle::spawn`].
-    fn avvia(config: ClientConfig) -> ClientHandle {
+    /// binario.
+    fn avvia(config: ClientConfig, tempi: Tempi) -> ClientHandle {
         let sorgente = config.source.build().expect("sorgente di test costruibile");
-        ClientHandle::spawn(config, sorgente)
-    }
-
-    /// Come [`avvia`], con orologio e tempi scelti dal test.
-    fn avvia_con(config: ClientConfig, clock: Arc<dyn Clock>, tempi: Tempi) -> ClientHandle {
-        let sorgente = config.source.build().expect("sorgente di test costruibile");
-        ClientHandle::spawn_con(config, sorgente, clock, tempi)
+        ClientHandle::spawn(config, sorgente, Arc::new(SystemClock), tempi)
     }
 
     /// File CSV di prova, cancellato quando il test finisce.
-    ///
-    /// Serve al solo test sulla sorgente esaurita: e' l'unica strategia che, finito il
-    /// percorso, smette davvero di produrre posizioni.
     struct FileDiProva {
-        /// Percorso del file creato.
         percorso: PathBuf,
     }
 
     impl FileDiProva {
-        /// Scrive `contenuto` in un file temporaneo unico per esecuzione.
         fn nuovo(nome: &str, contenuto: &str) -> Self {
             let unico = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1202,8 +1079,8 @@ mod tests {
             .expect("il canale degli eventi non deve chiudersi qui")
     }
 
-    /// Server finto in ascolto su una porta effimera: parla il protocollo vero con i
-    /// codec di `common`, dal lato opposto del "Cliente" di test di `net.rs`.
+    /// Server finto in ascolto su una porta effimera: parla il protocollo vero con i codec
+    /// di `common`.
     struct ServerFinto {
         listener: TcpListener,
         indirizzo: SocketAddr,
@@ -1221,7 +1098,6 @@ mod tests {
             }
         }
 
-        /// Accetta la prossima connessione in arrivo.
         async fn accetta(&self) -> ConnessioneFinta {
             let (stream, _) = timeout(ATTESA, self.listener.accept())
                 .await
@@ -1232,17 +1108,16 @@ mod tests {
 
         /// Vero se entro `durata` nessuno prova a collegarsi.
         ///
-        /// E' l'opposto di [`accetta`](Self::accetta): serve a verificare che un
-        /// tentativo di riconnessione **non** parta. Va usata con un backoff di prova
-        /// molto piu' corto della durata attesa, altrimenti direbbe vero anche di un
-        /// client che si sta semplicemente ancora preparando a riprovare.
+        /// Serve a verificare che un tentativo di riconnessione **non** parta. Va usata
+        /// con un backoff di prova molto piu' corto della durata attesa, altrimenti
+        /// direbbe vero anche di un client che si sta ancora preparando a riprovare.
         async fn nessuna_connessione_entro(&self, durata: Duration) -> bool {
             timeout(durata, self.listener.accept()).await.is_err()
         }
     }
 
-    /// Connessione accettata dal server finto, sul verso opposto del `Cliente` di
-    /// `net.rs`: legge [`ClientMessage`] e scrive [`ServerMessage`].
+    /// Connessione accettata dal server finto: legge [`ClientMessage`] e scrive
+    /// [`ServerMessage`].
     struct ConnessioneFinta {
         lettura: FramedRead<OwnedReadHalf, ClientCodec>,
         scrittura: FramedWrite<OwnedWriteHalf, ServerCodec>,
@@ -1273,11 +1148,9 @@ mod tests {
                 .expect("il frame ricevuto deve essere valido")
         }
 
-        /// Risponde Welcome a Hello e restituisce il messaggio di autenticazione che
-        /// segue, lasciando al chiamante la risposta.
-        ///
-        /// Restituirlo invece di scartarlo serve ai test che devono distinguere
-        /// `Register` da `Login` tentativo per tentativo.
+        /// Risponde Welcome a Hello e restituisce il messaggio di autenticazione che segue,
+        /// lasciando al chiamante la risposta: restituirlo invece di scartarlo serve ai
+        /// test che devono distinguere `Register` da `Login` tentativo per tentativo.
         async fn handshake(&mut self) -> ClientMessage {
             match self.ricevi().await {
                 ClientMessage::Hello { protocol_version } => {
@@ -1298,17 +1171,17 @@ mod tests {
             }
         }
 
-        /// Handshake completo seguito da SessionToken: la sessione si apre.
+        /// Handshake seguito da un token di sessione: la sessione si apre.
         async fn accetta_login(&mut self) -> ClientMessage {
             let autenticazione = self.handshake().await;
             self.invia(ServerMessage::SessionToken {
-                token: "a".repeat(64),
+                token: "t".repeat(64),
             })
             .await;
             autenticazione
         }
 
-        /// Handshake completo seguito da un errore: l'autenticazione e' rifiutata.
+        /// Handshake seguito da un rifiuto delle credenziali.
         async fn rifiuta_login(&mut self, code: ErrorCode, message: &str) -> ClientMessage {
             let autenticazione = self.handshake().await;
             self.invia(ServerMessage::Error {
@@ -1320,260 +1193,140 @@ mod tests {
         }
     }
 
-    // --- analisi degli argomenti ---
-
-    /// Trasforma gli argomenti di un test nella forma che [`ClientConfig::from_args`]
-    /// si aspetta.
     fn argomenti(elenco: &[&str]) -> Vec<String> {
         elenco.iter().map(|voce| (*voce).to_owned()).collect()
     }
 
-    #[test]
-    fn help_restituisce_uso_senza_altri_controlli() {
-        let avvio = ClientConfig::from_args(argomenti(&["--help"])).expect("analisi riuscita");
-        assert_eq!(avvio, Avvio::Uso);
-    }
-
-    #[test]
-    fn configurazione_minima_con_sorgente_manuale_e_accettata() {
-        let avvio = ClientConfig::from_args(argomenti(&[
+    /// Argomenti comuni a tutte le configurazioni di prova, senza la sorgente.
+    fn base() -> Vec<&'static str> {
+        vec![
             "--server",
             "127.0.0.1:7878",
             "--user",
             "veicolo_01",
             "--password",
             "scorta12",
-            "--source",
-            "manual",
-            "--start",
-            "45.07,7.68",
-        ]))
-        .expect("analisi riuscita");
+        ]
+    }
 
-        match avvio {
-            Avvio::Configurato(config) => {
-                assert_eq!(
-                    config.server_addr,
-                    "127.0.0.1:7878"
-                        .parse::<SocketAddr>()
-                        .expect("indirizzo di test valido")
-                );
-                assert!(!config.register);
-                assert_eq!(
-                    config.source,
-                    SourceKind::Manual {
-                        iniziale: Coordinate::new(45.07, 7.68).expect("coordinata valida"),
-                    }
-                );
+    /// Analizza `base()` piu' le opzioni indicate, pretendendo che riesca.
+    fn configura(extra: &[&str]) -> ClientConfig {
+        let mut elenco = base();
+        elenco.extend_from_slice(extra);
+        match ClientConfig::from_args(argomenti(&elenco)).expect("analisi riuscita") {
+            Avvio::Configurato(config) => config,
+            Avvio::Uso => panic!("attesa una configurazione, ottenuto --help"),
+        }
+    }
+
+    #[test]
+    fn la_configurazione_minima_e_accettata_e_help_precede_ogni_controllo() {
+        let config = configura(&["--source", "manual", "--start", "45.0703,7.6869"]);
+
+        assert_eq!(config.username.as_str(), "veicolo_01");
+        assert_eq!(config.password, "scorta12");
+        assert!(!config.register, "senza --register si accede e basta");
+        assert_eq!(
+            config.source,
+            SourceKind::Manual {
+                iniziale: coordinata(45.0703, 7.6869)
             }
-            Avvio::Uso => panic!("atteso Configurato"),
+        );
+
+        assert!(configura(&["--source", "manual", "--start", "45.0,7.0", "--register"]).register);
+
+        // `--help` vince anche su una riga che sarebbe incompleta.
+        assert_eq!(
+            ClientConfig::from_args(argomenti(&["--help"])).expect("analisi riuscita"),
+            Avvio::Uso
+        );
+    }
+
+    #[test]
+    fn ogni_sorgente_raccoglie_i_propri_parametri() {
+        assert_eq!(
+            configura(&[
+                "--source",
+                "file",
+                "--file-path",
+                "percorso.csv",
+                "--file-loop"
+            ])
+            .source,
+            SourceKind::File {
+                percorso: PathBuf::from("percorso.csv"),
+                loop_forever: true,
+            }
+        );
+        assert_eq!(
+            configura(&[
+                "--source", "random", "--start", "45.0,7.0", "--radius", "500", "--step", "25",
+                "--seed", "42",
+            ])
+            .source,
+            SourceKind::RandomWalk {
+                partenza: coordinata(45.0, 7.0),
+                raggio_massimo_m: 500.0,
+                passo_massimo_m: 25.0,
+                seed: 42,
+            }
+        );
+        assert_eq!(
+            configura(&[
+                "--source", "route", "--start", "45.0,7.0", "--end", "45.5,9.0", "--speed", "50",
+                "--pause", "0.5@120",
+            ])
+            .source,
+            SourceKind::Route {
+                partenza: coordinata(45.0, 7.0),
+                arrivo: coordinata(45.5, 9.0),
+                velocita_kmh: 50.0,
+                pause: vec![crate::sources::Pausa {
+                    a_frazione: 0.5,
+                    durata: Duration::from_secs(120),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn gli_argomenti_incompleti_o_malformati_sono_errori_non_panici() {
+        /// Argomenti di un caso e predicato che riconosce l'errore atteso.
+        type Caso = (&'static [&'static str], fn(&ArgsError) -> bool);
+
+        let casi: [Caso; 8] = [
+            (&["--sconosciuta"], |e| {
+                matches!(e, ArgsError::OpzioneSconosciuta(_))
+            }),
+            (&["--server"], |e| matches!(e, ArgsError::ValoreMancante(_))),
+            (&["--server", "non-un-indirizzo"], |e| {
+                matches!(e, ArgsError::IndirizzoNonValido { .. })
+            }),
+            (&["--user", "ab"], |e| {
+                matches!(e, ArgsError::UsernameNonValido(_))
+            }),
+            (&["--source", "quantistica"], |e| {
+                matches!(e, ArgsError::SorgenteSconosciuta(_))
+            }),
+            (&["--start", "45.0"], |e| {
+                matches!(e, ArgsError::ParametroNonValido { .. })
+            }),
+            (&["--start", "91.0,7.0"], |e| {
+                matches!(e, ArgsError::ParametroNonValido { .. })
+            }),
+            (&["--pause", "meta@sempre"], |e| {
+                matches!(e, ArgsError::ParametroNonValido { .. })
+            }),
+        ];
+
+        for (argomenti_del_caso, atteso) in casi {
+            let errore = ClientConfig::from_args(argomenti(argomenti_del_caso))
+                .expect_err("gli argomenti del caso non sono validi");
+            assert!(atteso(&errore), "errore inatteso: {errore:?}");
         }
-    }
 
-    #[test]
-    fn register_alza_il_flag() {
-        let avvio = ClientConfig::from_args(argomenti(&[
-            "--server",
-            "127.0.0.1:7878",
-            "--user",
-            "veicolo_01",
-            "--password",
-            "scorta12",
-            "--register",
-            "--source",
-            "manual",
-            "--start",
-            "45.07,7.68",
-        ]))
-        .expect("analisi riuscita");
-
-        match avvio {
-            Avvio::Configurato(config) => assert!(config.register),
-            Avvio::Uso => panic!("atteso Configurato"),
-        }
-    }
-
-    #[test]
-    fn source_file_richiede_file_path() {
-        let esito = ClientConfig::from_args(argomenti(&[
-            "--server",
-            "127.0.0.1:7878",
-            "--user",
-            "veicolo_01",
-            "--password",
-            "scorta12",
-            "--source",
-            "file",
-        ]));
-
-        assert!(matches!(
-            esito,
-            Err(ArgsError::OpzioneObbligatoriaMancante("--file-path"))
-        ));
-    }
-
-    #[test]
-    fn source_file_con_percorso_e_loop() {
-        let avvio = ClientConfig::from_args(argomenti(&[
-            "--server",
-            "127.0.0.1:7878",
-            "--user",
-            "veicolo_01",
-            "--password",
-            "scorta12",
-            "--source",
-            "file",
-            "--file-path",
-            "percorso.csv",
-            "--file-loop",
-        ]))
-        .expect("analisi riuscita");
-
-        match avvio {
-            Avvio::Configurato(config) => assert_eq!(
-                config.source,
-                SourceKind::File {
-                    percorso: PathBuf::from("percorso.csv"),
-                    loop_forever: true,
-                }
-            ),
-            Avvio::Uso => panic!("atteso Configurato"),
-        }
-    }
-
-    #[test]
-    fn source_random_completa_con_tutti_i_parametri() {
-        let avvio = ClientConfig::from_args(argomenti(&[
-            "--server",
-            "127.0.0.1:7878",
-            "--user",
-            "veicolo_01",
-            "--password",
-            "scorta12",
-            "--source",
-            "random",
-            "--start",
-            "45.07,7.68",
-            "--radius",
-            "500",
-            "--step",
-            "20",
-            "--seed",
-            "42",
-        ]))
-        .expect("analisi riuscita");
-
-        match avvio {
-            Avvio::Configurato(config) => assert_eq!(
-                config.source,
-                SourceKind::RandomWalk {
-                    partenza: Coordinate::new(45.07, 7.68).expect("coordinata valida"),
-                    raggio_massimo_m: 500.0,
-                    passo_massimo_m: 20.0,
-                    seed: 42,
-                }
-            ),
-            Avvio::Uso => panic!("atteso Configurato"),
-        }
-    }
-
-    #[test]
-    fn source_route_con_una_pausa() {
-        let avvio = ClientConfig::from_args(argomenti(&[
-            "--server",
-            "127.0.0.1:7878",
-            "--user",
-            "veicolo_01",
-            "--password",
-            "scorta12",
-            "--source",
-            "route",
-            "--start",
-            "45.07,7.68",
-            "--end",
-            "45.46,9.19",
-            "--speed",
-            "90",
-            "--pause",
-            "0.5@600",
-        ]))
-        .expect("analisi riuscita");
-
-        match avvio {
-            Avvio::Configurato(config) => assert_eq!(
-                config.source,
-                SourceKind::Route {
-                    partenza: Coordinate::new(45.07, 7.68).expect("coordinata valida"),
-                    arrivo: Coordinate::new(45.46, 9.19).expect("coordinata valida"),
-                    velocita_kmh: 90.0,
-                    pause: vec![crate::sources::Pausa {
-                        a_frazione: 0.5,
-                        durata: Duration::from_secs(600),
-                    }],
-                }
-            ),
-            Avvio::Uso => panic!("atteso Configurato"),
-        }
-    }
-
-    #[test]
-    fn source_sconosciuta_e_rifiutata() {
-        let esito = ClientConfig::from_args(argomenti(&[
-            "--server",
-            "127.0.0.1:7878",
-            "--user",
-            "veicolo_01",
-            "--password",
-            "scorta12",
-            "--source",
-            "satellite",
-        ]));
-
-        assert!(matches!(
-            esito,
-            Err(ArgsError::SorgenteSconosciuta(sorgente)) if sorgente == "satellite"
-        ));
-    }
-
-    #[test]
-    fn opzione_sconosciuta_e_rifiutata() {
-        let esito = ClientConfig::from_args(argomenti(&["--boh"]));
-        assert!(matches!(esito, Err(ArgsError::OpzioneSconosciuta(opzione)) if opzione == "--boh"));
-    }
-
-    #[test]
-    fn valore_mancante_e_rifiutato() {
-        let esito = ClientConfig::from_args(argomenti(&["--server"]));
-        assert!(matches!(esito, Err(ArgsError::ValoreMancante("--server"))));
-    }
-
-    #[test]
-    fn indirizzo_non_valido_e_rifiutato() {
-        let esito = ClientConfig::from_args(argomenti(&["--server", "non-un-indirizzo"]));
-        assert!(matches!(esito, Err(ArgsError::IndirizzoNonValido { .. })));
-    }
-
-    #[test]
-    fn username_non_valido_e_rifiutato() {
-        let esito = ClientConfig::from_args(argomenti(&["--user", "ab"]));
-        assert!(matches!(esito, Err(ArgsError::UsernameNonValido(_))));
-    }
-
-    #[test]
-    fn coordinata_malformata_e_rifiutata() {
-        let esito = ClientConfig::from_args(argomenti(&["--start", "non-una-coordinata"]));
-        assert!(matches!(
-            esito,
-            Err(ArgsError::ParametroNonValido {
-                opzione: "--start",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn senza_server_manca_l_opzione_obbligatoria() {
-        let esito = ClientConfig::from_args(argomenti(&[
+        // Le opzioni obbligatorie mancanti, globali e della sorgente scelta.
+        let senza_server = vec![
             "--user",
             "veicolo_01",
             "--password",
@@ -1581,20 +1334,29 @@ mod tests {
             "--source",
             "manual",
             "--start",
-            "45.07,7.68",
-        ]));
-        assert!(matches!(
-            esito,
-            Err(ArgsError::OpzioneObbligatoriaMancante("--server"))
-        ));
-    }
+            "45.0,7.0",
+        ];
+        let mut senza_percorso = base();
+        senza_percorso.extend_from_slice(&["--source", "file"]);
 
-    // --- nucleo di rete ---
+        for (elenco, mancante) in [
+            (senza_server, "--server"),
+            (senza_percorso, "--file-path"),
+            (base(), "--source"),
+        ] {
+            match ClientConfig::from_args(argomenti(&elenco)) {
+                Err(ArgsError::OpzioneObbligatoriaMancante(opzione)) => {
+                    assert_eq!(opzione, mancante);
+                }
+                altro => panic!("atteso {mancante} mancante, ottenuto {altro:?}"),
+            }
+        }
+    }
 
     #[tokio::test]
-    async fn handshake_completo_produce_evento_connesso() {
+    async fn l_handshake_completo_produce_l_evento_connesso() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = avvia(config(finto.indirizzo));
+        let mut handle = avvia(config(finto.indirizzo), Tempi::default());
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
@@ -1604,26 +1366,16 @@ mod tests {
 
     /// Il ticker scatta a ogni intervallo, non solo una volta.
     ///
-    /// Il tempo qui e' vero, solo accorciato da [`tempi_di_prova`]: `start_paused` non
-    /// puo' convivere con il [`TcpListener`] vero di [`ServerFinto`]. Con l'orologio in
-    /// pausa tokio lo fa avanzare da solo appena tutti i task sono sospesi, e prima del
-    /// salto guarda l'I/O una volta sola, con una poll a timeout zero: su macOS una
-    /// connessione di loopback non e' mai pronta in quell'istante — la consegna passa
-    /// per il thread di input di `lo0` e costa qualche decina di microsecondi — quindi
-    /// l'orologio saltava di colpo a fine [`ATTESA`] e l'handshake risultava scaduto
-    /// prima di essere arrivato. Non riguardava solo l'`accept`: ogni attesa su I/O
-    /// reale sotto orologio in pausa correva lo stesso rischio. Su Linux la `connect`
-    /// di loopback completa dentro la syscall, quindi la corsa non si vedeva.
+    /// Il tempo qui e' vero, solo accorciato: `start_paused` non puo' convivere con un
+    /// `TcpListener` vero, perche' tokio farebbe avanzare l'orologio appena tutti i task
+    /// sono sospesi e su alcune piattaforme una connessione di loopback non e' ancora
+    /// pronta in quell'istante, facendo scadere l'handshake prima che arrivi.
     #[tokio::test]
     async fn il_ticker_invia_una_posizione_a_ogni_intervallo() {
         let intervallo = tempi_di_prova().intervallo_posizione;
         let finto = ServerFinto::avvia().await;
         let avvio = Instant::now();
-        let mut handle = avvia_con(
-            config_con_random(finto.indirizzo),
-            Arc::new(SystemClock),
-            tempi_di_prova(),
-        );
+        let mut handle = avvia(config_con_random(finto.indirizzo), tempi_di_prova());
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
@@ -1640,16 +1392,15 @@ mod tests {
                 ClientEvent::PositionSent(coordinate)
             );
 
-            // Solo un minimo. Il primo tick dell'`interval` e' consumato all'avvio del
-            // task, quindi lo scatto n-esimo non puo' maturare prima di n intervalli:
-            // e' questo a dire che le posizioni seguono il ritmo dell'intervallo invece
-            // di partire tutte insieme. Un massimo sarebbe invece instabile, perche' su
-            // una macchina carica uno scatto puo' arrivare in ritardo sul suo periodo.
+            // Solo un minimo. Il primo tick e' consumato all'avvio del task, quindi lo
+            // scatto n-esimo non puo' maturare prima di n intervalli: e' questo a dire che
+            // le posizioni seguono il ritmo invece di partire tutte insieme. Un massimo
+            // sarebbe instabile, perche' su una macchina carica uno scatto puo' ritardare.
             let trascorso = avvio.elapsed();
             assert!(
                 trascorso >= intervallo * numero,
-                "lo scatto {numero} e' arrivato dopo {trascorso:?}, \
-                 prima dei {numero} intervalli da {intervallo:?} che deve attendere"
+                "lo scatto {numero} e' arrivato dopo {trascorso:?}, prima dei {numero} \
+                 intervalli da {intervallo:?} che deve attendere"
             );
         }
     }
@@ -1657,7 +1408,7 @@ mod tests {
     #[tokio::test]
     async fn send_text_produce_text_to_server() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = avvia(config(finto.indirizzo));
+        let mut handle = avvia(config(finto.indirizzo), Tempi::default());
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
@@ -1678,16 +1429,15 @@ mod tests {
     #[tokio::test]
     async fn alla_disconnessione_il_client_si_riconnette_da_solo() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = avvia(config(finto.indirizzo));
+        let mut handle = avvia(config(finto.indirizzo), tempi_di_riconnessione());
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
 
-        // Chiusura brusca lato server: il banco resta comunque in ascolto sullo
-        // stesso indirizzo, pronto ad accettare il tentativo di riconnessione.
+        // Chiusura brusca lato server: il banco resta in ascolto sullo stesso indirizzo,
+        // pronto ad accettare il tentativo di riconnessione.
         drop(connessione);
-
         assert!(matches!(
             prossimo_evento(&mut handle).await,
             ClientEvent::Disconnected(_)
@@ -1698,14 +1448,17 @@ mod tests {
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
     }
 
+    /// Con `--register` il primo tentativo registra, ma solo quello: una volta creato,
+    /// l'utente esiste, e un secondo `Register` si prenderebbe `UsernameTaken`, che e'
+    /// terminale e farebbe uscire il task.
     #[tokio::test]
-    async fn il_primo_tentativo_con_register_manda_register() {
+    async fn dopo_una_registrazione_riuscita_la_riconnessione_accede() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = avvia_con(
-            config_con_register(finto.indirizzo),
-            Arc::new(SystemClock),
-            tempi_di_riconnessione(),
-        );
+        let config = ClientConfig {
+            register: true,
+            ..config(finto.indirizzo)
+        };
+        let mut handle = avvia(config, tempi_di_riconnessione());
 
         let mut connessione = finto.accetta().await;
         match connessione.accetta_login().await {
@@ -1715,35 +1468,8 @@ mod tests {
             }
             altro => panic!("atteso Register al primo tentativo, ottenuto {altro:?}"),
         }
-
-        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
-    }
-
-    /// Regressione: con `--register` il client rimandava `Register` a ogni
-    /// riconnessione, si prendeva `UsernameTaken` — errore terminale — e il task
-    /// usciva. Dopo una registrazione riuscita l'utente esiste: i tentativi seguenti
-    /// devono accedere.
-    #[tokio::test]
-    async fn dopo_una_registrazione_riuscita_la_riconnessione_manda_login() {
-        let finto = ServerFinto::avvia().await;
-        let mut handle = avvia_con(
-            config_con_register(finto.indirizzo),
-            Arc::new(SystemClock),
-            tempi_di_riconnessione(),
-        );
-
-        let mut connessione = finto.accetta().await;
-        assert!(
-            matches!(
-                connessione.accetta_login().await,
-                ClientMessage::Register { .. }
-            ),
-            "il primo tentativo con register deve ancora registrare"
-        );
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
 
-        // Caduta brusca lato server: il banco resta in ascolto sullo stesso
-        // indirizzo, pronto ad accettare la riconnessione automatica.
         drop(connessione);
         assert!(matches!(
             prossimo_evento(&mut handle).await,
@@ -1751,36 +1477,26 @@ mod tests {
         ));
 
         let mut connessione = finto.accetta().await;
-        match connessione.accetta_login().await {
-            ClientMessage::Login { username, password } => {
-                assert_eq!(username.as_str(), "veicolo_01");
-                assert_eq!(password, "scorta12");
-            }
-            altro => panic!(
-                "dopo una registrazione riuscita il secondo tentativo deve accedere con Login, \
-                 ottenuto {altro:?}"
+        assert!(
+            matches!(
+                connessione.accetta_login().await,
+                ClientMessage::Login { .. }
             ),
-        }
+            "dopo una registrazione riuscita il tentativo seguente deve accedere con Login"
+        );
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
     }
 
     #[tokio::test]
     async fn senza_register_ogni_tentativo_manda_login() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = avvia_con(
-            config(finto.indirizzo),
-            Arc::new(SystemClock),
-            tempi_di_riconnessione(),
-        );
+        let mut handle = avvia(config(finto.indirizzo), tempi_di_riconnessione());
 
         let mut connessione = finto.accetta().await;
-        assert!(
-            matches!(
-                connessione.accetta_login().await,
-                ClientMessage::Login { .. }
-            ),
-            "senza register il primo tentativo accede"
-        );
+        assert!(matches!(
+            connessione.accetta_login().await,
+            ClientMessage::Login { .. }
+        ));
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
 
         drop(connessione);
@@ -1797,47 +1513,40 @@ mod tests {
             ),
             "senza register anche la riconnessione accede"
         );
-        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
     }
 
-    /// Solo un `Register` **riuscito** abbassa il flag. Se il primo tentativo si
-    /// prende `UsernameTaken` — l'operatore ha passato `--register` su un utente che
-    /// esiste gia' — l'errore resta terminale: non sappiamo se la password data
-    /// corrisponde davvero a quell'utente, quindi ricadere su `Login` sarebbe un
-    /// tentativo alla cieca sulle credenziali di qualcun altro.
+    /// Solo un `Register` **riuscito** abbassa il flag. Se il primo tentativo si prende
+    /// `UsernameTaken` l'errore resta terminale: non sappiamo se la password data
+    /// corrisponde davvero a quell'utente, quindi ricadere su `Login` sarebbe un tentativo
+    /// alla cieca sulle credenziali di qualcun altro.
     #[tokio::test]
     async fn un_register_rifiutato_resta_terminale_e_non_ricade_su_login() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = avvia_con(
-            config_con_register(finto.indirizzo),
-            Arc::new(SystemClock),
-            tempi_di_riconnessione(),
-        );
+        let config = ClientConfig {
+            register: true,
+            ..config(finto.indirizzo)
+        };
+        let mut handle = avvia(config, tempi_di_riconnessione());
 
         let mut connessione = finto.accetta().await;
-        assert!(
-            matches!(
-                connessione
-                    .rifiuta_login(ErrorCode::UsernameTaken, "nome utente gia' in uso")
-                    .await,
-                ClientMessage::Register { .. }
-            ),
-            "il primo tentativo con register deve registrare"
-        );
+        assert!(matches!(
+            connessione
+                .rifiuta_login(ErrorCode::UsernameTaken, "nome utente gia' in uso")
+                .await,
+            ClientMessage::Register { .. }
+        ));
 
         assert_eq!(
             prossimo_evento(&mut handle).await,
             ClientEvent::Error("nome utente gia' in uso".to_owned()),
             "le credenziali rifiutate sono un errore, non una disconnessione"
         );
-
         assert!(
             finto
                 .nessuna_connessione_entro(Duration::from_millis(500))
                 .await,
             "dopo UsernameTaken il client non deve ritentare, ne' con Register ne' con Login"
         );
-
         assert_eq!(
             timeout(ATTESA, handle.event_rx.recv())
                 .await
@@ -1850,23 +1559,14 @@ mod tests {
     #[tokio::test]
     async fn la_sessione_sostituita_non_fa_ripartire_la_riconnessione() {
         let finto = ServerFinto::avvia().await;
-        // Backoff cortissimo e invio periodico lasciato a trenta secondi: se il client
-        // provasse a riconnettersi lo farebbe entro pochi decine di millisecondi, ben
-        // dentro l'attesa qui sotto, e nel frattempo il ticker delle posizioni non
-        // interferisce con la sequenza degli eventi.
-        let tempi = Tempi {
-            intervallo_posizione: Duration::from_secs(30),
-            backoff: [Duration::from_millis(20); 4],
-            backoff_massimo: Duration::from_millis(20),
-        };
-        let mut handle = avvia_con(config(finto.indirizzo), Arc::new(SystemClock), tempi);
+        let mut handle = avvia(config(finto.indirizzo), tempi_di_riconnessione());
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
 
-        // Il server non chiude di brutto: annuncia la sostituzione, come fa il server
-        // vero prima di lasciar cadere il canale della connessione precedente.
+        // Il server non chiude di brutto: annuncia la sostituzione, come fa il server vero
+        // prima di lasciar cadere il canale della connessione precedente.
         connessione
             .invia(ServerMessage::Error {
                 code: ErrorCode::NotAuthenticated,
@@ -1880,24 +1580,20 @@ mod tests {
             "la sostituzione e' una disconnessione con un motivo, non un errore qualunque"
         );
 
-        // Il punto del test: a differenza di
-        // `alla_disconnessione_il_client_si_riconnette_da_solo`, qui nessun nuovo
-        // handshake deve arrivare. Riconnettersi espellerebbe la connessione che ha
-        // preso il posto di questa, che a sua volta si riconnetterebbe, e cosi' via.
+        // Il punto del test: a differenza di una caduta qualunque, qui nessun nuovo
+        // handshake deve arrivare. Riconnettersi espellerebbe la connessione che ha preso
+        // il posto di questa, che a sua volta si riconnetterebbe, e cosi' via.
         assert!(
             finto
                 .nessuna_connessione_entro(Duration::from_millis(500))
                 .await,
             "dopo una sostituzione di sessione il client non deve ritentare da solo"
         );
-
-        // Il task e' terminato: tocca all'utente decidere se rilanciare il client.
         assert_eq!(
             timeout(ATTESA, handle.event_rx.recv())
                 .await
                 .expect("il task deve essere gia' terminato"),
-            None,
-            "il canale degli eventi si chiude con il task"
+            None
         );
     }
 
@@ -1905,19 +1601,14 @@ mod tests {
     async fn le_posizioni_accumulate_durante_la_disconnessione_arrivano_in_ordine() {
         let finto = ServerFinto::avvia().await;
         let indirizzo = finto.indirizzo;
-        let mut handle = avvia_con(
-            config_con_random(indirizzo),
-            Arc::new(SystemClock),
-            tempi_di_prova(),
-        );
+        let mut handle = avvia(config_con_random(indirizzo), tempi_di_prova());
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
 
-        // Chiude anche il banco: i tentativi di riconnessione devono fallire per
-        // restare nella fase di attesa, dove il ticker continua a interrogare la
-        // sorgente.
+        // Chiude anche il banco: i tentativi di riconnessione devono fallire per restare
+        // nella fase di attesa, dove il ticker continua a interrogare la sorgente.
         drop(connessione);
         drop(finto);
         assert!(matches!(
@@ -1925,8 +1616,8 @@ mod tests {
             ClientEvent::Disconnected(_)
         ));
 
-        // Con un intervallo di prova di 80ms, 250ms bastano ad accumulare piu' di
-        // una posizione mentre i tentativi di riconnessione falliscono.
+        // Con un intervallo di prova di 80 ms, 250 ms bastano ad accumulare piu' di una
+        // posizione mentre i tentativi di riconnessione falliscono.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let ripartito = TcpListener::bind(indirizzo)
@@ -1939,8 +1630,7 @@ mod tests {
         let mut connessione = ConnessioneFinta::da_stream(stream);
         connessione.accetta_login().await;
 
-        // Drena gli eventuali `Disconnected` dei tentativi falliti nel frattempo,
-        // fino al nuovo `Connected`.
+        // Drena gli eventuali `Disconnected` dei tentativi falliti nel frattempo.
         loop {
             match prossimo_evento(&mut handle).await {
                 ClientEvent::Connected => break,
@@ -1960,43 +1650,14 @@ mod tests {
 
         assert_ne!(
             prima, seconda,
-            "le due posizioni accumulate devono restare distinte e nell'ordine di generazione"
-        );
-    }
-
-    #[tokio::test]
-    async fn quit_chiude_il_task_e_il_canale_eventi_si_chiude() {
-        let finto = ServerFinto::avvia().await;
-        let mut handle = avvia(config(finto.indirizzo));
-
-        let mut connessione = finto.accetta().await;
-        connessione.accetta_login().await;
-        assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
-
-        handle
-            .command_tx
-            .send(ClientCommand::Quit)
-            .await
-            .expect("invio del comando riuscito");
-
-        match connessione.ricevi().await {
-            ClientMessage::Logout => {}
-            altro => panic!("atteso Logout, ottenuto {altro:?}"),
-        }
-
-        let chiuso = timeout(ATTESA, handle.event_rx.recv())
-            .await
-            .expect("il canale deve chiudersi entro l'attesa");
-        assert_eq!(
-            chiuso, None,
-            "il ricevitore degli eventi deve vedere None dopo Quit"
+            "le posizioni accumulate devono restare distinte e nell'ordine di generazione"
         );
     }
 
     #[tokio::test]
     async fn chiudi_manda_logout_e_attende_la_fine_del_task() {
         let finto = ServerFinto::avvia().await;
-        let mut handle = avvia(config(finto.indirizzo));
+        let mut handle = avvia(config(finto.indirizzo), Tempi::default());
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
@@ -2017,10 +1678,10 @@ mod tests {
 
     #[tokio::test]
     async fn chiudi_termina_anche_senza_connessione_aperta() {
-        // Nessuno in ascolto sull'indirizzo: il task resta nel ciclo di riconnessione,
-        // dove la chiusura deve funzionare esattamente come a connessione aperta.
+        // Nessuno in ascolto sull'indirizzo: il task resta nel ciclo di riconnessione, dove
+        // la chiusura deve funzionare esattamente come a connessione aperta.
         let indirizzo: SocketAddr = "127.0.0.1:1".parse().expect("indirizzo di test valido");
-        let handle = avvia_con(config(indirizzo), Arc::new(SystemClock), tempi_di_prova());
+        let handle = avvia(config(indirizzo), tempi_di_prova());
 
         assert!(
             handle.chiudi().await,
@@ -2030,8 +1691,8 @@ mod tests {
 
     #[tokio::test]
     async fn una_sorgente_esaurita_manda_ping_invece_di_restare_muta() {
-        // Un percorso di un solo punto, senza ripetizione: dopo il primo invio la
-        // sorgente e' esaurita e non produrra' mai piu' una posizione.
+        // Un percorso di un solo punto, senza ripetizione: dopo il primo invio la sorgente
+        // e' esaurita e non produrra' mai piu' una posizione.
         let file = FileDiProva::nuovo("esaurita", "lat,lon,offset_secs\n45.07,7.68,0\n");
         let finto = ServerFinto::avvia().await;
         let config = ClientConfig {
@@ -2041,7 +1702,7 @@ mod tests {
             },
             ..config(finto.indirizzo)
         };
-        let mut handle = avvia_con(config, Arc::new(SystemClock), tempi_di_prova());
+        let mut handle = avvia(config, tempi_di_prova());
 
         let mut connessione = finto.accetta().await;
         connessione.accetta_login().await;
@@ -2054,13 +1715,11 @@ mod tests {
 
         // Da qui la sorgente restituisce sempre `None`: senza il `Ping` la connessione
         // resterebbe muta fino alla scadenza di inattivita' del server.
-        match connessione.ricevi().await {
-            ClientMessage::Ping => {}
-            altro => panic!("atteso Ping a sorgente esaurita, ottenuto {altro:?}"),
-        }
-        match connessione.ricevi().await {
-            ClientMessage::Ping => {}
-            altro => panic!("atteso un secondo Ping, ottenuto {altro:?}"),
+        for numero in 1..=2 {
+            match connessione.ricevi().await {
+                ClientMessage::Ping => {}
+                altro => panic!("atteso il Ping numero {numero}, ottenuto {altro:?}"),
+            }
         }
     }
 }

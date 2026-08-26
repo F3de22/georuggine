@@ -1,28 +1,16 @@
-//! Analisi dei comandi digitati nella riga di input della TUI (requisito P20).
+//! Analisi dei comandi digitati nella riga di input della TUI.
 //!
-//! Come `console.rs` nel server, il parsing e' separato dall'esecuzione:
-//! [`analizza_input`] e' una funzione pura che traduce una riga in un [`ComandoUtente`], e
-//! chi la chiama (il ciclo della TUI, in [`super::esegui`]) decide cosa farne. Il
-//! vantaggio e' lo stesso: i test qui sotto non aprono ne' un terminale ne' una
-//! connessione di rete.
+//! Come `console.rs` nel server, il parsing e' separato dall'esecuzione: [`analizza_input`]
+//! e' una funzione pura che traduce una riga in un [`ComandoUtente`], e chi la chiama
+//! decide cosa farne. I test qui sotto non aprono ne' un terminale ne' una connessione.
 //!
-//! # Testo libero senza comando
+//! Questa TUI non ha un canale "chat" implicito: il testo libero si manda solo con `/msg`.
+//! Una riga vuota, o senza `/` iniziale, non e' quindi un errore ma un caso senza nulla da
+//! eseguire, e vale [`ErroreInput::NienteDaFare`], che chi chiama ignora in silenzio.
 //!
-//! A differenza della console del server, dove ogni riga e' per forza un comando
-//! amministrativo (una riga senza `/` iniziale e' li' un comando sconosciuto), questa TUI
-//! non ha modo di mandare testo libero al server se non tramite `/msg` esplicito: non
-//! esiste un canale "chat" implicito. Una riga senza `/` iniziale, e allo stesso modo una
-//! riga vuota, non sono quindi un errore ma un caso senza nulla da eseguire:
-//! [`analizza_input`] le restituisce entrambe come [`ErroreInput::NienteDaFare`], che chi
-//! chiama riconosce e ignora silenziosamente (non la mostra in `ultimo_errore`).
-//!
-//! # Dove possono stare gli spazi
-//!
-//! Solo `/msg` accetta testo libero con spazi, esattamente come `/broadcast` nella console
-//! del server; gli altri comandi si dividono per parole con [`str::split_whitespace`], mai
-//! indicizzando i byte della riga: una riga con caratteri multibyte (accenti, emoji) non
-//! puo' quindi far cadere l'interfaccia su un indice che non sta su un confine di
-//! carattere.
+//! Solo `/msg` accetta testo con spazi; gli altri comandi si dividono per parole con
+//! [`str::split_whitespace`], mai indicizzando i byte: una riga con caratteri multibyte non
+//! puo' far cadere l'interfaccia su un indice fuori da un confine di carattere.
 
 use georuggine_common::protocol::AnalysisRange;
 use georuggine_common::types::{Coordinate, CoordinateError};
@@ -91,17 +79,9 @@ pub enum ErroreInput {
 ///
 /// # Errori
 ///
-/// - [`ErroreInput::NienteDaFare`] se la riga e' vuota o non comincia per `/`: non e' un
-///   errore vero, vedi la documentazione del modulo;
-/// - [`ErroreInput::ArgomentoMancante`] se manca un argomento obbligatorio, per esempio
-///   `/pos` senza longitudine;
-/// - [`ErroreInput::ArgomentiInEccesso`] se il comando ne riceve piu' di quanti ne accetti;
-/// - [`ErroreInput::NumeroNonValido`] se lat/lon di `/pos` non si interpretano come `f64`;
-/// - [`ErroreInput::CoordinataNonValida`] se lat/lon sono numeriche ma fuori intervallo;
-/// - [`ErroreInput::IntervalloSconosciuto`] se l'intervallo di `/analisi` non e' uno fra
-///   `today`, `week` e `month`;
-/// - [`ErroreInput::ComandoSconosciuto`] se il primo termine comincia per `/` ma non e'
-///   uno dei quattro comandi riconosciuti.
+/// La variante di [`ErroreInput`] che descrive cosa non va: [`ErroreInput::NienteDaFare`]
+/// per una riga vuota o senza `/`, un argomento mancante o di troppo, un numero o una
+/// coordinata non validi, un intervallo o un comando sconosciuti.
 pub fn analizza_input(riga: &str) -> Result<ComandoUtente, ErroreInput> {
     let riga = riga.trim();
     if !riga.starts_with('/') {
@@ -151,11 +131,8 @@ pub fn analizza_input(riga: &str) -> Result<ComandoUtente, ErroreInput> {
     }
 }
 
-/// Divide una riga gia' ripulita nel primo termine e in cio' che lo segue.
-///
-/// Stessa forma di `spezza` in `console.rs`: la divisione passa da
-/// [`str::split_once`], che taglia su un confine di carattere, quindi una riga multibyte
-/// non puo' produrre un indice illegale.
+/// Divide una riga gia' ripulita nel primo termine e in cio' che lo segue, tagliando su
+/// un confine di carattere: una riga multibyte non puo' produrre un indice illegale.
 fn spezza(riga: &str) -> (&str, &str) {
     match riga.split_once(char::is_whitespace) {
         Some((primo, resto)) => (primo, resto.trim_start()),
@@ -198,9 +175,8 @@ fn analizza_f64(
 
 /// Traduce l'alias di un intervallo nella variante di [`AnalysisRange`] che indica.
 ///
-/// A differenza della console del server, che ammette anche gli alias italiani, qui
-/// valgono solo i tre nomi del formato richiesto (`today`, `week`, `month`): la TUI e'
-/// un'interfaccia sola, non ha bisogno di due lingue per lo stesso comando.
+/// Valgono i soli tre nomi inglesi: la TUI non ha bisogno di due lingue per lo stesso
+/// comando.
 ///
 /// # Errori
 ///
