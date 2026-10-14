@@ -166,13 +166,6 @@ struct SorgenteGrezza {
 
 impl ClientConfig {
     /// Analizza gli argomenti da riga di comando, senza il nome del programma.
-    ///
-    /// # Errori
-    ///
-    /// [`ArgsError`] se un'opzione e' sconosciuta o le manca il valore, se `--server` non
-    /// e' un indirizzo valido, se `--user` non rispetta il formato di [`Username`], se un
-    /// parametro numerico o una coordinata sono malformati, se `--source` non e' una delle
-    /// quattro strategie o se manca un'opzione obbligatoria.
     pub fn from_args<I>(argomenti: I) -> Result<Avvio, ArgsError>
     where
         I: IntoIterator<Item = String>,
@@ -382,11 +375,7 @@ fn costruisci_source_kind(
     }
 }
 
-/// Comando che l'interfaccia manda al task di rete.
-///
-/// Il task lo traduce in un messaggio di protocollo, salvo
-/// [`ClientCommand::SetManualPosition`]: quello alimenta la sorgente manuale e non
-/// produce di per se' nessun messaggio, che parte invece al prossimo giro del ticker.
+/// Comando che l'interfaccia manda al task di rete. Per invio di messaggi 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientCommand {
     /// Manda un messaggio testuale al server.
@@ -405,8 +394,7 @@ pub enum ClientEvent {
     /// La sessione e' aperta: handshake, autenticazione e messaggi in attesa consegnati.
     Connected,
     /// La connessione e' caduta; il campo descrive il motivo. Un tentativo di
-    /// riconnessione e' gia' in corso, salvo che il task stia per terminare: e' il caso
-    /// della sessione sostituita.
+    /// riconnessione e' gia' in corso, salvo che il task stia per terminare
     Disconnected(String),
     /// Testo ricevuto dal server.
     ServerText {
@@ -428,10 +416,6 @@ pub enum ClientEvent {
 
 /// Parametri temporali del task di rete: intervallo di invio periodico e progressione del
 /// backoff di riconnessione.
-///
-/// Sono un parametro e non costanti fisse per lo stesso motivo di `ConnectionTimeouts` nel
-/// server: chi verifica backoff e invii periodici deve poterlo fare senza aspettare i
-/// valori di produzione, dove i binari passano [`Tempi::default`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tempi {
     /// Intervallo fra due interrogazioni della sorgente di posizione.
@@ -460,9 +444,7 @@ impl Default for Tempi {
 }
 
 impl Tempi {
-    /// Ritardo del tentativo numero `tentativo` (il primo e' 1), con un jitter casuale
-    /// fino al 20% in piu': senza, client diversi riavviati insieme proverebbero a
-    /// riconnettersi tutti nello stesso istante.
+    /// Ritardo del tentativo numero `tentativo` (il primo e' 1), con un jitter casuale fino al 20% in piu'
     fn ritardo_di(&self, tentativo: u32) -> Duration {
         let indice = usize::try_from(tentativo.saturating_sub(1)).unwrap_or(usize::MAX);
         let base = self
@@ -476,9 +458,6 @@ impl Tempi {
 }
 
 /// Stato che il task di rete porta attraverso le fasi connessa e disconnessa.
-///
-/// E' una struttura di sole referenze e non un insieme di parametri separati perche'
-/// altrimenti le funzioni che la usano supererebbero il limite di argomenti di clippy.
 struct StatoRete<'a> {
     sorgente: &'a mut dyn PositionSource,
     manuale: Option<&'a SorgenteManuale<Coordinate>>,
@@ -533,15 +512,9 @@ pub struct ClientHandle {
 impl ClientHandle {
     /// Avvia il task di rete.
     ///
-    /// `sorgente` arriva gia' costruita da [`SourceKind::build`]: una sorgente che non si
-    /// inizializza (il file di un percorso mancante o illeggibile) e' un errore di
-    /// configurazione, e va scoperto dal chiamante **prima** di aprire qualunque
-    /// connessione, non dentro un task gia' avviato dove diventerebbe un evento su un
-    /// canale che nessuno legge ancora.
-    ///
+    /// `sorgente` arriva gia' costruita da [SourceKind::build]
     /// `clock` e `tempi` sono parametri e non valori fissi perche' i test possano
-    /// accorciare intervallo e backoff e iniettare un orologio deterministico: l'istante
-    /// di ogni [`ClientMessage::Position`] viene da li'. In produzione si passano
+    /// accorciare intervallo e backoff e iniettare un orologio deterministico. In produzione si passano
     /// `SystemClock` e [`Tempi::default`].
     pub fn spawn(
         config: ClientConfig,
@@ -691,11 +664,6 @@ async fn esegui(
 ///
 /// `registra` decide fra [`ClientMessage::Register`] e [`ClientMessage::Login`], e non e'
 /// `config.register` perche' quel campo vale per la prima sessione e non per le successive.
-///
-/// # Errori
-///
-/// [`MotivoFallimento::Rete`] per ogni guasto di rete o violazione del protocollo;
-/// [`MotivoFallimento::Terminale`] per credenziali rifiutate o versione incompatibile.
 async fn connetti_e_autentica(
     config: &ClientConfig,
     registra: bool,
@@ -801,9 +769,7 @@ async fn fase_connessa(
                     Some(coordinate) => accoda(stato.coda, coordinate, ora),
                     // Sorgente esaurita: un percorso da file arrivato in fondo senza
                     // ripetizione non produrra' piu' nulla, e una connessione muta viene
-                    // chiusa dal server alla scadenza di inattivita'. Un `Ping` al ritmo
-                    // del ticker tiene viva la sessione e lascia il veicolo raggiungibile
-                    // dai messaggi del server.
+                    // chiusa dal server alla scadenza di inattivita'
                     None => {
                         if uscita.send(ClientMessage::Ping).await.is_err() {
                             return EsitoFase::Riconnetti("scrittura fallita".to_owned());
@@ -892,9 +858,6 @@ async fn fase_connessa(
 
 /// Attende il ritardo di backoff, continuando a interrogare la sorgente e a servire i
 /// comandi che non richiedono una connessione.
-///
-/// `SendText` e `RequestAnalysis` non vengono accodati: senza connessione non c'e' un
-/// server a cui recapitarli, e la coda locale e' riservata alle sole posizioni.
 async fn attesa_riconnessione(
     ritardo: Duration,
     stato: &mut StatoRete<'_>,
@@ -948,11 +911,6 @@ fn accoda(
 
 /// Invia in ordine tutte le posizioni in coda, emettendo [`ClientEvent::PositionSent`] per
 /// ognuna.
-///
-/// # Errori
-///
-/// La descrizione dell'errore di scrittura, se la connessione cade a meta': la posizione
-/// che non e' partita resta in testa alla coda per il prossimo tentativo.
 async fn svuota_coda(
     coda: &mut VecDeque<(Coordinate, DateTime<Utc>)>,
     uscita: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
