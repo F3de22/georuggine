@@ -841,12 +841,6 @@ pub enum SourceKind {
 
 impl SourceKind {
     /// Costruisce la sorgente descritta da questa variante.
-    ///
-    /// # Errori
-    ///
-    /// Gli errori di [`FileSource::from_path`], che qui non vengono assorbiti: un percorso
-    /// illeggibile o senza punti deve fermare l'avvio del client. Le altre varianti
-    /// normalizzano i parametri assurdi con un warn e restituiscono sempre `Ok`.
     pub fn build(&self) -> io::Result<SorgenteCostruita> {
         let costruita = match self {
             Self::File {
