@@ -1,18 +1,8 @@
 //! Log periodico del tempo di CPU consumato dal processo.
 //!
-//! Una lettura sola del contatore non dice nulla, perche' il valore cresce sempre: quello
-//! che interessa e' quanto e' cresciuto nell'ultimo intervallo. [`CpuLogger`] tiene percio'
-//! la lettura precedente e scrive una riga a ogni intervallo con il valore assoluto, la
-//! differenza rispetto al giro prima e la percentuale che quella differenza rappresenta
-//! sul tempo di orologio trascorso.
-//!
-//! Il timestamp della riga arriva dal [`Clock`] condiviso, come ogni altro fatto da
-//! datare. L'intervallo su cui si calcola la percentuale viene invece da [`Instant`], che
-//! e' monotono: un orologio di calendario puo' saltare (correzione NTP, cambio d'ora) o
-//! essere fermo nei test, e la divisione avrebbe al denominatore un tempo falso o nullo.
-//!
-//! Nessun guasto del log ferma il server: se il disco e' pieno o la cartella non e'
-//! scrivibile, il task registra l'errore e riprova al giro successivo.
+//! Ogni riga riporta il valore assoluto, la differenza dalla lettura precedente e la
+//! percentuale sul tempo trascorso, misurato con [`Instant`] perche' monotono. Un errore
+//! di scrittura non ferma il server: si riprova all'intervallo successivo.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
@@ -33,17 +23,11 @@ use crate::net::ConnectionRegistry;
 /// Nome del file di log dentro la cartella configurata.
 const NOME_FILE: &str = "cpu.log";
 
-/// Intestazione delle colonne, scritta solo alla creazione del file.
-///
-/// Separatore tabulazione e non virgola: i valori non contengono mai tabulazioni, quindi
-/// non serve nessun quoting e il file resta leggibile sia a occhio sia con `cut -f`.
+/// Intestazione delle colonne, separate da tabulazione.
 const INTESTAZIONE: &str = "timestamp\tcpu_utente_ms\tcpu_sistema_ms\tcpu_totale_ms\t\
                             delta_ms\tpercentuale_cpu\tutenti_connessi\n";
 
 /// Lettura del tempo di CPU con l'istante monotono in cui e' stata presa.
-///
-/// I due valori stanno insieme perche' si usano insieme: la percentuale e' il rapporto fra
-/// la crescita del primo e quella del secondo.
 #[derive(Debug, Clone, Copy)]
 struct Rilevazione {
     /// Tempo di CPU complessivo letto in quel momento.
@@ -53,9 +37,6 @@ struct Rilevazione {
 }
 
 /// Scrive periodicamente su file il tempo di CPU consumato dal server.
-///
-/// Si costruisce con [`CpuLogger::new`] e si avvia con [`CpuLogger::avvia`], tipicamente
-/// dentro un `tokio::spawn`.
 pub struct CpuLogger {
     /// Cartella che contiene `cpu.log`; viene creata se non esiste.
     log_dir: PathBuf,
@@ -67,9 +48,6 @@ pub struct CpuLogger {
 
 impl CpuLogger {
     /// Costruisce un logger che scrive in `log_dir` ogni `intervallo`.
-    ///
-    /// La cartella nasce alla prima scrittura, dentro `spawn_blocking`, perche' crearla e'
-    /// I/O bloccante e questo costruttore puo' essere chiamato da un contesto asincrono.
     pub fn new(log_dir: PathBuf, intervallo: Duration, clock: Arc<dyn Clock>) -> Self {
         Self {
             log_dir,
@@ -78,35 +56,22 @@ impl CpuLogger {
         }
     }
 
-    /// Scrive una riga di log a ogni intervallo, finche' non arriva lo spegnimento.
-    ///
-    /// Prende `self` per valore perche' il chiamante lo passa a `tokio::spawn`, che
-    /// pretende un futuro `'static`.
-    ///
-    /// La prima scadenza di `interval` matura subito e non viene scartata: con un
-    /// intervallo di due minuti un file vuoto per due minuti sembrerebbe un logger rotto.
-    /// La prima riga esce quindi all'avvio, con delta e percentuale a zero. Allo
-    /// spegnimento ne scrive un'ultima, cosi' l'ultimo tratto di attivita' non resta fuori
-    /// dal conteggio.
+    /// Scrive una riga all'avvio, una a ogni intervallo e una finale allo spegnimento.
     pub async fn avvia(
         self,
         registry: Arc<ConnectionRegistry>,
         mut shutdown: broadcast::Receiver<()>,
     ) {
         let mut battito = tokio::time::interval(self.intervallo);
-        // Se il task resta indietro (macchina sospesa, esecutore congestionato) le
-        // scadenze perse non si recuperano: maturerebbero tutte insieme, e il file si
-        // riempirebbe di righe distanti microsecondi con percentuali calcolate su
-        // intervalli quasi nulli. Serve una fotografia ogni due minuti, non il recupero
-        // di quelle mancate.
+        // Le scadenze perse non si recuperano: righe ravvicinate darebbero percentuali
+        // calcolate su intervalli quasi nulli.
         battito.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let mut precedente: Option<Rilevazione> = None;
 
         loop {
             tokio::select! {
-                // Anche l'errore del ricevitore (mittente caduto, segnali saltati) e' un
-                // motivo per smettere: nessuno mandera' piu' nulla su quel canale.
+                // Anche un errore del ricevitore significa che non arriveranno altri segnali.
                 _ = shutdown.recv() => {
                     self.registra(&registry, &mut precedente).await;
                     tracing::info!("spegnimento: il log del tempo di CPU si chiude");
@@ -119,15 +84,10 @@ impl CpuLogger {
         }
     }
 
-    /// Prende una lettura, la trasforma in una riga e la accoda al file.
+    /// Legge il tempo di CPU e accoda una riga al file.
     ///
-    /// `precedente` si aggiorna anche quando la scrittura fallisce: il `delta_ms` e'
-    /// definito rispetto all'ultima *lettura*, non all'ultima riga andata a buon fine, e
-    /// ancorarlo a quest'ultima farebbe comparire, dopo una serie di guasti, un delta su
-    /// un intervallo diverso da quello della percentuale.
-    ///
-    /// Una lettura che fallisce salta invece la riga: senza il tempo di CPU non c'e'
-    /// niente da scrivere, e inventare uno zero direbbe il falso.
+    /// Se la lettura fallisce la riga viene saltata; `precedente` si aggiorna anche se
+    /// fallisce la scrittura, cosi' delta e percentuale restano sullo stesso intervallo.
     async fn registra(&self, registry: &ConnectionRegistry, precedente: &mut Option<Rilevazione>) {
         let uso = match process_cpu_usage() {
             Ok(uso) => uso,
@@ -141,8 +101,7 @@ impl CpuLogger {
             istante: Instant::now(),
         };
 
-        // Alla prima riga non c'e' un intervallo precedente: delta e percentuale valgono
-        // zero, l'unica cosa vera che si possa dire di un confronto che manca.
+        // Alla prima riga delta e percentuale valgono zero.
         let (delta, trascorso) = match precedente {
             Some(prima) => (
                 adesso.totale.saturating_sub(prima.totale),
@@ -178,10 +137,7 @@ impl CpuLogger {
     }
 }
 
-/// Compone la riga di log, terminata da un a capo.
-///
-/// I tempi sono in millisecondi interi: il contatore del sistema ha risoluzione al
-/// microsecondo, ma su intervalli di due minuti la terza cifra decimale non aggiunge nulla.
+/// Compone la riga di log, con i tempi in millisecondi.
 fn formatta_riga(
     quando: DateTime<Utc>,
     uso: CpuUsage,
@@ -201,16 +157,9 @@ fn formatta_riga(
     )
 }
 
-/// Percentuale di CPU usata nell'intervallo: `delta / trascorso * 100`.
+/// Percentuale di CPU nell'intervallo, limitata a `100 * numero di core`.
 ///
-/// Il valore puo' superare 100 legittimamente, perche' il server e' multi thread e in un
-/// secondo di orologio puo' consumare piu' di un secondo di CPU: il tetto e'
-/// `100 * numero di core`. Sopra quel tetto il rapporto non descrive piu' niente di reale
-/// — ci si arriva solo con un intervallo misurato male, per esempio se la macchina e'
-/// stata sospesa fra due letture — e viene limitato.
-///
-/// Non restituisce mai NaN, infinito o un valore negativo: l'intervallo nullo della prima
-/// riga e' trattato a parte, e cio' che resta passa da un controllo di finitezza.
+/// Restituisce 0 per un intervallo nullo e non produce mai NaN o valori negativi.
 fn percentuale_cpu(delta: Duration, trascorso: Duration) -> f64 {
     if trascorso.is_zero() {
         return 0.0;
@@ -224,10 +173,7 @@ fn percentuale_cpu(delta: Duration, trascorso: Duration) -> f64 {
     }
 }
 
-/// Valore massimo che [`percentuale_cpu`] puo' restituire: `100 * numero di core`.
-///
-/// Se il numero di core non e' interrogabile si assume un core solo, cioe' il tetto piu'
-/// basso: il valore riportato resta prudente.
+/// Tetto di [`percentuale_cpu`]: `100 * numero di core`, con un core se non rilevabile.
 fn tetto_percentuale() -> f64 {
     let core = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     100.0 * core as f64
@@ -235,19 +181,12 @@ fn tetto_percentuale() -> f64 {
 
 /// Accoda una riga a `cpu.log`, creando cartella, file e intestazione se mancano.
 ///
-/// E' l'unica funzione bloccante del modulo, e per questo il chiamante la esegue dentro
-/// `spawn_blocking`.
-///
-/// L'intestazione si scrive solo quando il file nasce qui, e la distinzione arriva dal
-/// sistema operativo: si prova ad aprire con `create_new`, che fallisce con
-/// [`io::ErrorKind::AlreadyExists`] se il file c'e' gia'. Un `Path::exists` seguito
-/// dall'apertura lascerebbe una finestra fra i due, e due esecuzioni contemporanee
-/// potrebbero scrivere entrambe l'intestazione.
+/// L'apertura con `create_new` stabilisce in modo atomico se il file e' nuovo e va
+/// scritta l'intestazione.
 ///
 /// # Errori
 ///
-/// L'errore del sistema operativo se la cartella non si puo' creare, se il file non si
-/// puo' aprire in aggiunta o se la scrittura non riesce.
+/// L'errore del sistema operativo se cartella o file non si possono creare o scrivere.
 fn accoda_riga(log_dir: &Path, riga: &str) -> io::Result<()> {
     fs::create_dir_all(log_dir)?;
     let percorso = log_dir.join(NOME_FILE);
@@ -257,8 +196,7 @@ fn accoda_riga(log_dir: &Path, riga: &str) -> io::Result<()> {
         .create_new(true)
         .open(&percorso)
     {
-        // Intestazione e prima riga in una scrittura sola: cosi' non esiste un istante in
-        // cui il file contiene la sola intestazione senza dati.
+        // Intestazione e prima riga in un'unica scrittura.
         Ok(mut file) => file.write_all(format!("{INTESTAZIONE}{riga}").as_bytes()),
         Err(errore) if errore.kind() == io::ErrorKind::AlreadyExists => {
             let mut file = OpenOptions::new()
@@ -283,15 +221,13 @@ mod tests {
     /// Intervallo dei test: abbastanza corto da non rallentare la suite.
     const INTERVALLO_BREVE: Duration = Duration::from_millis(20);
 
-    /// Tetto, non pausa: le attese tornano appena la condizione e' vera, e superarlo fa
-    /// fallire il test con un messaggio chiaro invece di lasciarlo appeso.
+    /// Attesa massima delle condizioni verificate dai test.
     const ATTESA_MASSIMA: Duration = Duration::from_secs(10);
 
     /// Passo con cui si ricontrolla il file mentre si aspetta.
     const PASSO_ATTESA: Duration = Duration::from_millis(5);
 
-    /// Cartella di prova che ancora non esiste: e' il logger a doverla creare, ed e'
-    /// proprio cio' che i test verificano.
+    /// Cartella di prova ancora inesistente, che il logger deve creare.
     fn cartella_temporanea(nome: &str) -> PathBuf {
         let unico = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -319,10 +255,7 @@ mod tests {
         }
     }
 
-    /// Aspetta che il file contenga almeno `quante` righe, e le restituisce.
-    ///
-    /// La sincronizzazione e' a condizione e non a tempo: il test non indovina quanti
-    /// millisecondi servono, ricontrolla il file finche' non ce ne sono abbastanza.
+    /// Attende che il file contenga almeno `quante` righe e le restituisce.
     async fn attendi_righe(log_dir: &Path, quante: usize) -> Vec<String> {
         let attesa = async {
             loop {
@@ -343,9 +276,7 @@ mod tests {
         riga.split('\t').collect()
     }
 
-    /// Tiene occupata la CPU per almeno `durata` senza sospendere il thread: uno `sleep`
-    /// farebbe passare il tempo di orologio ma non quello di calcolo, e il delta
-    /// resterebbe a zero.
+    /// Tiene occupata la CPU per almeno `durata`.
     fn brucia_cpu(durata: Duration) {
         let inizio = Instant::now();
         let mut accumulatore: u64 = 0;
@@ -365,8 +296,7 @@ mod tests {
         let meta = percentuale_cpu(Duration::from_millis(500), Duration::from_secs(1));
         assert!((meta - 50.0).abs() < 1e-9, "attesa 50%, ottenuto {meta}");
 
-        // Un anno di CPU in un microsecondo non e' misurabile: e' il caso
-        // dell'intervallo sballato, e il valore va limitato al tetto.
+        // Intervallo misurato male: il valore va limitato al tetto.
         assert_eq!(
             percentuale_cpu(Duration::from_secs(31_536_000), Duration::from_micros(1)),
             tetto_percentuale()
@@ -423,9 +353,7 @@ mod tests {
             logger(&cartella).avvia(Arc::new(ConnectionRegistry::new()), spegnimento.subscribe()),
         );
 
-        // Il ciclo di calcolo gira su un thread da lavoro: bloccando qui il thread del
-        // test, con due worker il logger continua a battere. Serve a far crescere davvero
-        // il contatore fra due letture.
+        // Il calcolo gira su un altro thread, cosi' il logger continua a scrivere.
         let _ = task::spawn_blocking(|| brucia_cpu(Duration::from_millis(150))).await;
 
         let righe = attendi_righe(&cartella, 4).await;
@@ -448,9 +376,8 @@ mod tests {
             // Il registro dei test e' vuoto: nessun veicolo collegato.
             assert_eq!(colonne[6], "0", "utenti connessi inattesi in {riga:?}");
 
-            // Il totale non deve tornare indietro e il delta deve raccontare la stessa
-            // differenza. La tolleranza di un millisecondo serve perche' i tre valori
-            // sono troncati a millisecondo ognuno per conto proprio.
+            // Totale non decrescente e delta coerente, con un millisecondo di tolleranza
+            // per gli arrotondamenti.
             match precedente {
                 None => assert_eq!(delta, 0, "la prima riga non ha una lettura precedente"),
                 Some(prima) => {
@@ -508,9 +435,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lo_spegnimento_ferma_il_task_e_lascia_una_riga_finale() {
-        // L'intervallo e' lungo rispetto alla durata del test: dopo la riga iniziale il
-        // logger non ne scrive altre da se', quindi la riga in piu' che si conta alla
-        // fine puo' essere solo quella dello spegnimento.
+        // Con un intervallo lungo, la riga in piu' puo' essere solo quella finale.
         let cartella = cartella_temporanea("spegnimento");
         let logger = CpuLogger::new(
             cartella.clone(),
@@ -525,8 +450,7 @@ mod tests {
         let prima = attendi_righe(&cartella, 2).await.len();
 
         assert!(spegnimento.send(()).is_ok(), "nessun ricevitore in ascolto");
-        // Il task scrive la riga finale prima di terminare, quindi quando la sua
-        // `JoinHandle` si risolve la scrittura e' gia' avvenuta.
+        // Quando il task termina la riga finale e' gia' scritta.
         timeout(ATTESA_MASSIMA, task)
             .await
             .expect("il task termina dopo lo spegnimento")

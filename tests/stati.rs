@@ -1,9 +1,5 @@
-//! Scenario end-to-end: la macchina a stati fermo/movimento vista dal veicolo.
-//!
-//! Copre il passaggio in movimento quando la posizione si sposta oltre la soglia (R4) e
-//! il ritorno a fermo dopo tre minuti senza spostamenti (R5), piu' lo stato che il server
-//! attribuisce a chi si scollega. I tre minuti non si aspettano davvero: sono tempo di
-//! dominio, e l'orologio finto condiviso fra client e server li attraversa in un istante.
+//! Scenario end-to-end: passaggio in movimento, ritorno a fermo dopo tre minuti e stato
+//! di chi si scollega. L'orologio finto condiviso fa passare i tre minuti all'istante.
 
 mod support;
 
@@ -16,7 +12,7 @@ use support::{
     ClientGrezzo, TestClient, TestServer, a_cinquanta_metri, a_un_metro, attendi_stato, partenza,
 };
 
-/// Un secondo oltre la soglia di ritorno a fermo, nel tipo di chrono.
+/// Un secondo oltre la soglia di ritorno a fermo.
 fn oltre_la_soglia_di_fermo() -> TimeDelta {
     TimeDelta::seconds(i64::try_from(STILL_AFTER_SECS).expect("la soglia entra in i64") + 1)
 }
@@ -27,8 +23,7 @@ async fn uno_spostamento_oltre_la_soglia_porta_in_movimento() {
     let id = server.registra("veicolo_01").await;
     let mut cliente = TestClient::accedi_e_invia(&server, "veicolo_01").await;
 
-    // La prima posizione della sessione non porta mai in movimento: non c'e' un punto
-    // precedente con cui misurare uno spostamento.
+    // La prima posizione della sessione non porta in movimento.
     cliente.invia_posizione(partenza()).await;
     cliente.invia_posizione(a_cinquanta_metri()).await;
 
@@ -44,10 +39,8 @@ async fn uno_spostamento_sotto_la_soglia_non_cambia_stato() {
     let server = TestServer::avvia().await;
     let id = server.registra("veicolo_01").await;
 
-    // Qui serve un client grezzo: l'assenza di un messaggio non si dimostra aspettando,
-    // ma mandando subito dopo qualcosa la cui risposta e' certa. Il canale conserva
-    // l'ordine, quindi se il `Pong` arriva prima di un `StateChanged` quel cambio di
-    // stato non e' stato prodotto.
+    // Client grezzo: se il Pong arriva prima di un StateChanged, il cambio di stato non
+    // c'e' stato.
     let mut veicolo = ClientGrezzo::connetti(&server).await;
     veicolo.saluta_e_accedi("veicolo_01").await;
 
@@ -83,9 +76,7 @@ async fn tre_minuti_senza_spostamenti_riportano_a_fermo() {
     cliente.invia_posizione(a_cinquanta_metri()).await;
     assert_eq!(cliente.attendi_cambio_di_stato().await, UserState::Moving);
 
-    // Il veicolo continua a mandare la stessa coordinata, quindi nessuna posizione
-    // rimette in movimento l'orologio dell'ultimo spostamento: passata la soglia, e' il
-    // task periodico del server ad accorgersene e ad avvisare il diretto interessato.
+    // Senza nuovi spostamenti e' il task periodico a riportare il veicolo a fermo.
     server.avanza(oltre_la_soglia_di_fermo());
 
     assert_eq!(cliente.attendi_cambio_di_stato().await, UserState::Still);

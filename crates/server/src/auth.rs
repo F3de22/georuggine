@@ -1,17 +1,7 @@
-//! Registrazione e accesso degli utenti: hashing delle password e policy.
+//! Registrazione e accesso degli utenti.
 //!
-//! Le password non vengono mai salvate in chiaro: si conserva l'hash Argon2id nel
-//! formato PHC, una stringa autocontenuta che porta con se' algoritmo, versione,
-//! parametri e salt. La verifica rilegge i parametri da li', quindi cambiare
-//! [`AuthConfig`] non invalida gli hash gia' scritti.
-//!
-//! La password in chiaro non compare mai in un log ne' in un messaggio d'errore:
-//! [`AuthError::WeakPassword`] descrive cosa manca senza citare cio' che l'utente ha
-//! scritto.
-//!
-//! Argon2 e' lento per costruzione, ed e' li' che sta la sua sicurezza: [`register`] e
-//! [`login`] lo eseguono dentro `tokio::task::spawn_blocking`, insieme alle chiamate al
-//! [`Repository`], che sono sincrone.
+//! Le password sono salvate come hash Argon2id in formato PHC, che contiene anche salt e
+//! parametri. L'hashing e gli accessi al [`Repository`] girano in `spawn_blocking`.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -35,15 +25,10 @@ const SALT_BYTES: usize = 16;
 /// Byte casuali di un token di sessione.
 const TOKEN_BYTES: usize = 32;
 
-/// Hash Argon2id usato da [`login`] quando lo username non esiste.
+/// Hash Argon2id usato da [`login`] quando lo username non esiste, cosi' i due casi di
+/// fallimento costano lo stesso tempo e non rivelano quali utenti sono registrati.
 ///
-/// Rende indistinguibili i due modi di fallire un accesso: senza, il caso "utente
-/// inesistente" tornerebbe subito mentre "password sbagliata" pagherebbe la verifica
-/// Argon2, e la differenza di tempo direbbe a chi prova quali username esistono.
-///
-/// Corrisponde a una password che nessuno conosce, con i parametri di
-/// [`AuthConfig::default`]: chi cambia quella configurazione in produzione deve
-/// rigenerare anche questa costante, altrimenti la differenza di tempo torna misurabile.
+/// Va rigenerato se cambiano i parametri di [`AuthConfig::default`].
 const HASH_FITTIZIO: &str = "$argon2id$v=19$m=19456,t=2,p=1$+VRtQ67z7l20ciN8AoheKQ$b6yROYVyGAc2PwIkF0UFTBTtyFdx2c2Rm94YEkCj3vU";
 
 /// Errore restituito dalle operazioni di autenticazione.
@@ -52,17 +37,13 @@ pub enum AuthError {
     /// La password non rispetta la policy; il messaggio elenca cosa manca.
     #[error("password troppo debole: {0}")]
     WeakPassword(String),
-    /// Username o password non validi.
-    ///
-    /// Il messaggio e' volutamente unico per i due casi: distinguerli direbbe a chi
-    /// tenta l'accesso quali username sono registrati.
+    /// Username o password non validi, con un messaggio unico per i due casi.
     #[error("credenziali non valide")]
     InvalidCredentials,
     /// Lo username e' gia' assegnato a un altro utente.
     #[error("username gia' registrato")]
     UsernameTaken,
-    /// Guasto di una primitiva crittografica o dell'attivita' che la esegue: parametri
-    /// non validi, hash illeggibile, generatore casuale assente, task interrotto.
+    /// Errore di una primitiva crittografica o del task che la esegue.
     #[error("errore interno di autenticazione: {0}")]
     Hashing(String),
     /// Errore proveniente dalla persistenza.
@@ -70,12 +51,7 @@ pub enum AuthError {
     Storage(#[from] StorageError),
 }
 
-/// Parametri di costo di Argon2id.
-///
-/// Sono configurabili perche' i test possano abbassarli restando veloci e perche' in
-/// produzione si possano alzare senza toccare il codice. Alzarli rende piu' caro
-/// l'attacco a dizionario su un archivio rubato, ma ogni accesso costa piu' tempo di
-/// CPU, che e' proprio la grandezza riportata nel log periodico.
+/// Parametri di costo di Argon2id; i test li abbassano per restare veloci.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthConfig {
     /// Memoria occupata dal calcolo, in KiB (`m`).
@@ -102,8 +78,7 @@ impl AuthConfig {
     ///
     /// # Errori
     ///
-    /// [`AuthError::Hashing`] se la combinazione non e' ammessa, per esempio con una
-    /// memoria minore di `8 * parallelism`.
+    /// [`AuthError::Hashing`] se la combinazione non e' ammessa.
     fn parametri(&self) -> Result<Params, AuthError> {
         Params::new(self.memory_kib, self.iterations, self.parallelism, None).map_err(|errore| {
             AuthError::Hashing(format!("parametri di Argon2 non validi: {errore}"))
@@ -121,14 +96,12 @@ fn errore_di_task(errore: task::JoinError) -> AuthError {
     AuthError::Hashing(format!("attivita' in background non completata: {errore}"))
 }
 
-/// Riempie `destinazione` con byte del generatore casuale del sistema operativo.
-///
-/// Si usa la variante fallibile `try_fill_bytes` e non `fill_bytes`, che andrebbe in
-/// panico se il sistema non avesse entropia disponibile.
+/// Riempie `destinazione` con byte casuali del sistema operativo, senza andare in panico
+/// se l'entropia non e' disponibile.
 ///
 /// # Errori
 ///
-/// [`AuthError::Hashing`] se il generatore del sistema non e' disponibile.
+/// [`AuthError::Hashing`] se il generatore non e' disponibile.
 fn byte_casuali(destinazione: &mut [u8]) -> Result<(), AuthError> {
     SysRng.try_fill_bytes(destinazione).map_err(|errore| {
         AuthError::Hashing(format!(
@@ -137,16 +110,11 @@ fn byte_casuali(destinazione: &mut [u8]) -> Result<(), AuthError> {
     })
 }
 
-/// Calcola l'hash Argon2id di una password, con salt casuale.
-///
-/// Il risultato e' una stringa PHC come
-/// `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`: contiene tutto cio' che serve a
-/// verificarla, quindi salt e parametri non vanno conservati a parte.
+/// Calcola l'hash Argon2id di una password con salt casuale, in formato PHC.
 ///
 /// # Errori
 ///
-/// [`AuthError::Hashing`] se i parametri non sono validi o se il generatore casuale del
-/// sistema non e' disponibile.
+/// [`AuthError::Hashing`] se i parametri non sono validi o manca il generatore casuale.
 pub fn hash_password(password: &str, config: &AuthConfig) -> Result<String, AuthError> {
     let mut salt_grezzo = [0_u8; SALT_BYTES];
     byte_casuali(&mut salt_grezzo)?;
@@ -160,17 +128,13 @@ pub fn hash_password(password: &str, config: &AuthConfig) -> Result<String, Auth
         .to_string())
 }
 
-/// Verifica una password contro un hash in formato PHC.
-///
-/// Il confronto lo fa la crate `argon2` a tempo costante: con `==` uscirebbe al primo
-/// byte diverso, e il tempo di risposta rivelerebbe quanti byte sono stati indovinati.
-/// I parametri di costo vengono da `hash` e non da [`AuthConfig`], quindi restano validi
-/// anche gli hash calcolati con una configurazione precedente.
+/// Verifica una password contro un hash PHC, a tempo costante e con i parametri
+/// contenuti nell'hash.
 ///
 /// # Errori
 ///
-/// [`AuthError::Hashing`] se `hash` non e' una stringa PHC leggibile. Una password
-/// sbagliata non e' un errore: vale `Ok(false)`.
+/// [`AuthError::Hashing`] se l'hash non e' leggibile; una password sbagliata da'
+/// `Ok(false)`.
 pub fn verify_password(hash: &str, password: &str) -> Result<bool, AuthError> {
     let analizzato = PasswordHash::new(hash).map_err(errore_di_hashing)?;
 
@@ -185,9 +149,7 @@ pub fn verify_password(hash: &str, password: &str) -> Result<bool, AuthError> {
 ///
 /// # Errori
 ///
-/// [`AuthError::WeakPassword`] con l'elenco di **tutti** i requisiti non rispettati, non
-/// solo del primo, cosi' chi sceglie la password corregge tutto in una volta. Il
-/// messaggio non riporta mai la password.
+/// [`AuthError::WeakPassword`] con tutti i requisiti mancanti, senza riportare la password.
 pub fn valida_password(password: &str) -> Result<(), AuthError> {
     let lunghezza = password.chars().count();
     let mut mancanze = Vec::new();
@@ -214,23 +176,16 @@ pub fn valida_password(password: &str) -> Result<(), AuthError> {
     }
 }
 
-/// Token che identifica una sessione aperta, consegnato al client dopo l'accesso.
-///
-/// E' un newtype e non un alias di `String` perche' il compilatore lo distingua da uno
-/// username, da un hash o da un qualunque altro testo che gira nel server.
+/// Token che identifica una sessione aperta.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionToken(String);
 
 impl SessionToken {
-    /// Genera un token nuovo da [`TOKEN_BYTES`] byte casuali.
-    ///
-    /// I byte sono resi in esadecimale minuscolo, quindi il token e' lungo 64 caratteri
-    /// tutti stampabili e puo' viaggiare in un messaggio di testo senza codifiche
-    /// aggiuntive.
+    /// Genera un token di `TOKEN_BYTES` byte casuali, in esadecimale.
     ///
     /// # Errori
     ///
-    /// [`AuthError::Hashing`] se il generatore casuale del sistema non e' disponibile.
+    /// [`AuthError::Hashing`] se il generatore casuale non e' disponibile.
     pub fn generate() -> Result<Self, AuthError> {
         let mut byte = [0_u8; TOKEN_BYTES];
         byte_casuali(&mut byte)?;
@@ -238,8 +193,7 @@ impl SessionToken {
         let esadecimale = byte.iter().fold(
             String::with_capacity(TOKEN_BYTES * 2),
             |mut accumulatore, valore| {
-                // `write!` su una `String` non puo' fallire: si ignora l'esito invece di
-                // usare l'`expect` che il progetto vieta.
+                // `write!` su una `String` non fallisce.
                 let _ = write!(accumulatore, "{valore:02x}");
                 accumulatore
             },
@@ -254,18 +208,12 @@ impl SessionToken {
     }
 }
 
-/// Registra un nuovo utente e ne restituisce l'id assegnato.
-///
-/// La password viene validata per prima, cosi' una password debole non fa pagare ne'
-/// l'hashing ne' un accesso al database.
+/// Registra un nuovo utente e ne restituisce l'id.
 ///
 /// # Errori
 ///
-/// - [`AuthError::WeakPassword`] se la password non rispetta la policy;
-/// - [`AuthError::UsernameTaken`] se lo username e' gia' registrato: l'errore del
-///   database non viene propagato, perche' parla di vincoli e tabelle;
-/// - [`AuthError::Hashing`] se il calcolo dell'hash fallisce;
-/// - [`AuthError::Storage`] per ogni altro guasto della persistenza.
+/// [`AuthError::WeakPassword`], [`AuthError::UsernameTaken`], oppure un errore di hashing
+/// o di persistenza.
 pub async fn register(
     repo: &Arc<dyn Repository>,
     config: &AuthConfig,
@@ -274,8 +222,6 @@ pub async fn register(
 ) -> Result<UserId, AuthError> {
     valida_password(password)?;
 
-    // I dati vengono duplicati perche' `spawn_blocking` sposta la chiusura su un altro
-    // thread e richiede quindi che non contenga prestiti.
     let password_posseduta = password.to_owned();
     let config_posseduta = *config;
     let hash = task::spawn_blocking(move || hash_password(&password_posseduta, &config_posseduta))
@@ -296,17 +242,14 @@ pub async fn register(
     }
 }
 
-/// Verifica le credenziali di un utente e ne restituisce l'id.
+/// Verifica le credenziali e restituisce l'id dell'utente.
 ///
-/// Se lo username non esiste, la password viene comunque verificata contro
-/// [`HASH_FITTIZIO`], cosi' i due percorsi fanno lo stesso lavoro.
+/// Se lo username non esiste la password si verifica comunque contro `HASH_FITTIZIO`.
 ///
 /// # Errori
 ///
-/// - [`AuthError::InvalidCredentials`] se lo username non esiste **o** la password e'
-///   sbagliata: i due casi sono indistinguibili, per messaggio e per tempo di risposta;
-/// - [`AuthError::Hashing`] se la verifica non e' eseguibile;
-/// - [`AuthError::Storage`] se la lettura dalla persistenza fallisce.
+/// [`AuthError::InvalidCredentials`] per utente inesistente o password errata, oppure un
+/// errore di hashing o di persistenza.
 pub async fn login(
     repo: &Arc<dyn Repository>,
     username: &Username,
@@ -346,8 +289,7 @@ mod tests {
 
     use crate::storage::SqliteRepository;
 
-    /// Parametri di Argon2 ridotti al minimo utile: la correttezza non dipende dal
-    /// costo, e quelli di produzione peserebbero decine di millisecondi per test.
+    /// Parametri di Argon2 minimi, per test veloci.
     fn config_di_test() -> AuthConfig {
         AuthConfig {
             memory_kib: 32,
@@ -356,8 +298,7 @@ mod tests {
         }
     }
 
-    /// Repository vuoto in RAM, dietro il puntatore condiviso che `register` e `login`
-    /// si aspettano.
+    /// Repository vuoto in memoria.
     fn repository() -> Arc<dyn Repository> {
         let istante = DateTime::from_timestamp(1_704_067_200, 0).expect("istante valido");
         Arc::new(
@@ -420,9 +361,8 @@ mod tests {
 
     #[test]
     fn l_hash_fittizio_e_valido_e_non_verifica_nessuna_password() {
-        // Se la costante non fosse una stringa PHC valida, `login` su un utente
-        // inesistente darebbe un errore di hashing invece di InvalidCredentials, e il
-        // caso tornerebbe distinguibile.
+        // Se la costante non fosse un PHC valido, `login` su un utente inesistente
+        // darebbe un errore diverso da InvalidCredentials.
         assert!(
             !verify_password(HASH_FITTIZIO, "qualunque1").expect("la costante deve essere valida")
         );

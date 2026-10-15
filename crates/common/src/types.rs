@@ -9,10 +9,7 @@ use thiserror::Error;
 
 /// Distanza minima in metri perche' due posizioni successive contino come spostamento.
 ///
-/// Non si confrontano le coordinate con `==`: la sorgente simulata sovrappone rumore
-/// alla posizione, quindi un veicolo fermo emette letture che differiscono comunque
-/// nelle ultime cifre decimali. La soglia assorbe quel rumore restando molto sotto allo
-/// spostamento di un veicolo reale fra due invii.
+/// Assorbe il rumore delle coordinate simulate, che varia anche a veicolo fermo.
 pub const MOVEMENT_THRESHOLD_METERS: f64 = 5.0;
 
 /// Secondi senza movimento dopo i quali un veicolo passa a [`UserState::Still`].
@@ -40,9 +37,8 @@ pub enum CoordinateError {
 
 /// Punto sulla superficie terrestre, in gradi decimali.
 ///
-/// I campi sono privati e la deserializzazione passa dal costruttore validante, quindi
-/// una `Coordinate` non puo' esistere fuori intervallo nemmeno se i byte arrivano dalla
-/// rete.
+/// La deserializzazione passa da [`Coordinate::new`], quindi anche una coordinata
+/// arrivata dalla rete e' sempre in intervallo.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "CoordinateRepr")]
 pub struct Coordinate {
@@ -50,8 +46,7 @@ pub struct Coordinate {
     lon: f64,
 }
 
-/// Forma di trasporto di [`Coordinate`]: stessi campi nello stesso ordine, quindi la
-/// codifica sul filo e' identica, ma la deserializzazione passa da [`Coordinate::new`].
+/// Forma di trasporto di [`Coordinate`], usata per validare in deserializzazione.
 #[derive(Deserialize)]
 struct CoordinateRepr {
     lat: f64,
@@ -59,15 +54,11 @@ struct CoordinateRepr {
 }
 
 impl Coordinate {
-    /// Costruisce una coordinata verificando che i valori siano in intervallo.
-    ///
-    /// Gli estremi sono inclusi; `NaN` e infiniti falliscono i confronti e sono quindi
-    /// rifiutati.
+    /// Costruisce una coordinata, estremi inclusi; `NaN` e infiniti sono rifiutati.
     ///
     /// # Errori
     ///
-    /// [`CoordinateError`] se la latitudine e' fuori da `[-90, 90]` o la longitudine
-    /// fuori da `[-180, 180]`.
+    /// [`CoordinateError`] se latitudine o longitudine sono fuori intervallo.
     pub fn new(lat: f64, lon: f64) -> Result<Self, CoordinateError> {
         if !(-90.0..=90.0).contains(&lat) {
             return Err(CoordinateError::LatitudineFuoriIntervallo(lat));
@@ -112,21 +103,19 @@ pub enum UsernameError {
     CarattereNonAmmesso(char),
 }
 
-/// Nome scelto da un utente: da 3 a 32 caratteri, alfanumerici ASCII o underscore.
+/// Nome utente: da 3 a 32 caratteri, alfanumerici ASCII o underscore.
 ///
-/// Come [`Coordinate`], il campo e' privato e la deserializzazione passa dalla
-/// validazione.
+/// Come [`Coordinate`], viene validato anche in deserializzazione.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub struct Username(String);
 
 impl Username {
-    /// Costruisce uno username validando lunghezza e caratteri ammessi.
+    /// Costruisce uno username valido.
     ///
     /// # Errori
     ///
-    /// [`UsernameError`] se il nome non ha da 3 a 32 caratteri o se contiene un
-    /// carattere diverso da alfanumerico ASCII o underscore.
+    /// [`UsernameError`] se lunghezza o caratteri non sono ammessi.
     pub fn new(raw: &str) -> Result<Self, UsernameError> {
         Self::valida(raw)?;
         Ok(Self(raw.to_owned()))
@@ -195,10 +184,7 @@ pub struct PositionRecord {
     pub recorded_at: DateTime<Utc>,
 }
 
-/// Distanza in metri fra due coordinate lungo la superficie terrestre.
-///
-/// Formula dell'emisenoverso su una sfera. L'errore rispetto all'ellissoide resta sotto
-/// lo 0,5%, molto meno di [`MOVEMENT_THRESHOLD_METERS`].
+/// Distanza in metri fra due coordinate, con la formula dell'emisenoverso su sfera.
 pub fn haversine_meters(a: Coordinate, b: Coordinate) -> f64 {
     let lat_a = a.lat.to_radians();
     let lat_b = b.lat.to_radians();

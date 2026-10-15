@@ -1,11 +1,7 @@
 //! Console amministrativa: i comandi che l'operatore scrive sullo standard input.
 //!
-//! La lettura di stdin non sta qui: il modulo si divide in [`analizza_comando`], una
-//! funzione pura che traduce una riga in un [`Comando`], e [`esegui`], che quel comando
-//! lo applica alle dipendenze del server. Le due cose le mette insieme il binario. La
-//! separazione e' cio' che rende la console verificabile senza un terminale.
-//!
-//! # Come si scrivono i comandi
+//! [`analizza_comando`] traduce una riga in un [`Comando`] senza effetti collaterali;
+//! [`esegui`] lo applica alle dipendenze del server.
 //!
 //! ```text
 //! /utenti                                  elenco dei veicoli e del loro stato
@@ -16,17 +12,8 @@
 //! /esci                                    spegnimento ordinato del server
 //! ```
 //!
-//! Solo l'ultimo campo puo' contenere spazi, ed e' sempre un testo libero: il
-//! destinatario e' percio' la prima parola dopo il nome del comando. Non e' una perdita,
-//! perche' uno [`Username`](georuggine_common::types::Username) ammette solo
-//! alfanumerici ASCII e underscore. La divisione passa da [`str::split_once`] e
-//! [`str::split_whitespace`], mai indicizzando i byte: una riga multibyte non puo' far
-//! cadere il server su un indice fuori da un confine di carattere.
-//!
-//! `/utenti` elenca tutti gli utenti registrati con lo stato (sconnesso, fermo o in
-//! movimento): la connessione la dice il registro, il movimento lo
-//! [`StateTracker`]. L'ultima posizione nota si ottiene leggendo tutto lo storico e
-//! tenendone la coda, perche' il [`Repository`] non ha un metodo dedicato.
+//! Solo l'ultimo campo puo' contenere spazi. Le righe si dividono su confini di carattere,
+//! quindi un testo multibyte non puo' causare un panico.
 
 use std::sync::Arc;
 
@@ -54,17 +41,14 @@ Comandi disponibili:
   /aiuto                                   questo elenco
   /esci                                    avvia lo spegnimento ordinato del server";
 
-/// Secondi di anticipo su [`Clock::now`] entro cui puo' trovarsi una posizione salvata.
-///
-/// L'istante di una rilevazione lo misura il client, e il livello di rete ne accetta fino
-/// a cinque minuti di anticipo: cercare fino a `now` soltanto lascerebbe fuori proprio le
-/// rilevazioni piu' recenti di un veicolo il cui orologio va avanti.
+/// Anticipo tollerato sui `recorded_at` dei client, come nel livello di rete: senza, la
+/// ricerca dell'ultima posizione escluderebbe quelle di un client con l'orologio avanti.
 const ANTICIPO_TOLLERATO_SECS: i64 = 300;
 
 /// Comando riconosciuto dalla console.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Comando {
-    /// Elenca i veicoli connessi con la loro ultima posizione nota.
+    /// Elenca i veicoli con stato e ultima posizione.
     Utenti,
     /// Manda un avviso a tutta la flotta.
     Broadcast(String),
@@ -91,11 +75,7 @@ pub enum Comando {
 /// Errore di [`analizza_comando`], cioe' una riga che non e' un comando eseguibile.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ErroreComando {
-    /// La riga e' vuota o fatta di soli spazi.
-    ///
-    /// Non e' un errore dell'operatore: chi chiama la riconosce e passa alla riga
-    /// successiva senza stampare. Sta fra gli errori perche' per una riga vuota non c'e'
-    /// nessuna variante di [`Comando`] da restituire.
+    /// La riga e' vuota: il chiamante la ignora senza stampare nulla.
     #[error("riga vuota: nessun comando da eseguire")]
     RigaVuota,
     /// Il primo termine della riga non e' un comando conosciuto.
@@ -120,11 +100,7 @@ pub enum ErroreComando {
     IntervalloSconosciuto(String),
 }
 
-/// Cosa la console deve stampare, e se il suo ciclo e' finito.
-///
-/// Un solo testo gia' pronto, riuscita o meno che sia l'operazione: il destinatario e'
-/// una persona davanti a un terminale, non un chiamante che possa rimediare a un errore.
-/// Per la stessa ragione [`esegui`] non restituisce un `Result`.
+/// Testo da stampare e indicazione se la console deve terminare.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Esito {
     /// Testo da mostrare all'operatore, senza l'a capo finale.
@@ -151,10 +127,7 @@ impl Esito {
     }
 }
 
-/// Dipendenze su cui la console lavora.
-///
-/// Sono gli stessi esemplari condivisi che riceve il livello di rete: un registro o una
-/// messaggistica diversi non vedrebbero nessuno dei veicoli collegati.
+/// Dipendenze della console, condivise con il livello di rete.
 pub struct ConsoleContext {
     /// Persistenza di utenti, posizioni e messaggi.
     pub repo: Arc<dyn Repository>,
@@ -162,19 +135,15 @@ pub struct ConsoleContext {
     pub registry: Arc<ConnectionRegistry>,
     /// Messaggistica, costruita sullo stesso [`registry`](Self::registry).
     pub messaging: Arc<MessageHub>,
-    /// Sorgente dell'ora: la console non chiama mai `Utc::now()` da se'.
+    /// Sorgente dell'ora.
     pub clock: Arc<dyn Clock>,
-    /// Macchina a stati fermo/movimento, la stessa che il livello di rete aggiorna.
+    /// Macchina a stati fermo/movimento.
     pub stati: Arc<StateTracker>,
     /// Canale su cui `/esci` annuncia lo spegnimento.
     pub shutdown: broadcast::Sender<()>,
 }
 
-/// Errore incontrato mentre si esegue un comando gia' riconosciuto.
-///
-/// Non esce dal modulo: [`esegui`] lo riduce al testo che l'operatore legge. E' un enum
-/// perche' i casi hanno origini diverse (l'operatore, il database, il runtime) e il
-/// messaggio lo deve dire.
+/// Errore nell'esecuzione di un comando, ridotto da [`esegui`] a un testo.
 #[derive(Debug, Error)]
 enum ErroreEsecuzione {
     /// Nessun utente registrato ha lo username indicato.
@@ -186,24 +155,17 @@ enum ErroreEsecuzione {
     /// Errore proveniente dalla messaggistica.
     #[error("messaggio non inviato: {0}")]
     Messaggistica(#[from] MessagingError),
-    /// L'attivita' di `spawn_blocking` che legge dal repository non e' arrivata in fondo.
+    /// Il task di `spawn_blocking` che legge dal repository non e' terminato.
     #[error("attivita' in background non completata: {0}")]
     Task(String),
 }
 
-/// Traduce una riga di testo nel comando che descrive.
-///
-/// La riga viene ripulita degli spazi ai due estremi; il primo termine e' il nome del
-/// comando e tutto cio' che segue sono i suoi argomenti.
+/// Traduce una riga nel comando corrispondente.
 ///
 /// # Errori
 ///
-/// - [`ErroreComando::RigaVuota`] se la riga e' vuota o fatta di soli spazi;
-/// - [`ErroreComando::Sconosciuto`] se il primo termine non e' un comando;
-/// - [`ErroreComando::ArgomentoMancante`] se manca un argomento obbligatorio;
-/// - [`ErroreComando::ArgomentiInEccesso`] se il comando ne riceve piu' del previsto;
-/// - [`ErroreComando::IntervalloSconosciuto`] se l'intervallo di `/analisi` non e' uno
-///   degli alias ammessi.
+/// La variante di [`ErroreComando`] che descrive il problema, compresa
+/// [`ErroreComando::RigaVuota`] per una riga vuota.
 pub fn analizza_comando(riga: &str) -> Result<Comando, ErroreComando> {
     let riga = riga.trim();
     if riga.is_empty() {
@@ -244,9 +206,7 @@ pub fn analizza_comando(riga: &str) -> Result<Comando, ErroreComando> {
                 testo: testo.trim_end().to_owned(),
             })
         }
-        // `/analisi` non ha campi di testo libero, quindi si divide per parole: cosi' un
-        // argomento in piu' e' distinguibile da uno username con uno spazio dentro, che
-        // non esiste.
+        // Nessun campo di testo libero: si divide per parole.
         "/analisi" => match resto.split_whitespace().collect::<Vec<&str>>().as_slice() {
             [] => Err(ErroreComando::ArgomentoMancante {
                 comando: "/analisi",
@@ -268,8 +228,7 @@ pub fn analizza_comando(riga: &str) -> Result<Comando, ErroreComando> {
     }
 }
 
-/// Divide una riga gia' ripulita nel primo termine e in cio' che lo segue, senza gli
-/// spazi iniziali. Se non ci sono spazi, il resto e' vuoto.
+/// Divide una riga nel primo termine e nel resto, senza spazi iniziali.
 fn spezza(riga: &str) -> (&str, &str) {
     match riga.split_once(char::is_whitespace) {
         Some((primo, resto)) => (primo, resto.trim_start()),
@@ -277,11 +236,11 @@ fn spezza(riga: &str) -> (&str, &str) {
     }
 }
 
-/// Verifica che a un comando senza argomenti non ne sia stato passato nessuno.
+/// Verifica che il comando non abbia argomenti.
 ///
 /// # Errori
 ///
-/// [`ErroreComando::ArgomentiInEccesso`] se dopo il nome del comando c'e' altro.
+/// [`ErroreComando::ArgomentiInEccesso`] se ce ne sono.
 fn senza_argomenti(comando: &'static str, resto: &str) -> Result<(), ErroreComando> {
     if resto.is_empty() {
         Ok(())
@@ -290,14 +249,11 @@ fn senza_argomenti(comando: &'static str, resto: &str) -> Result<(), ErroreComan
     }
 }
 
-/// Traduce l'alias di un intervallo nella variante di [`AnalysisRange`] che indica.
-///
-/// [`AnalysisRange::Custom`] non ha un alias perche' la console non ha una sintassi per
-/// scriverne gli estremi, ma [`esegui`] accetta comunque qualunque intervallo.
+/// Traduce l'alias di un intervallo in [`AnalysisRange`].
 ///
 /// # Errori
 ///
-/// [`ErroreComando::IntervalloSconosciuto`] su qualunque altra parola.
+/// [`ErroreComando::IntervalloSconosciuto`] per qualunque altra parola.
 fn analizza_intervallo(parola: &str) -> Result<AnalysisRange, ErroreComando> {
     match parola {
         "today" | "oggi" => Ok(AnalysisRange::Today),
@@ -307,11 +263,8 @@ fn analizza_intervallo(parola: &str) -> Result<AnalysisRange, ErroreComando> {
     }
 }
 
-/// Esegue un comando sulle dipendenze del server.
-///
-/// Ogni esito, riuscito o fallito, diventa il testo di un [`Esito`]. L'unico comando che
-/// chiude il ciclo e' `/esci`, che manda anche il segnale di spegnimento al resto del
-/// server.
+/// Esegue un comando e restituisce il testo da stampare; `/esci` invia anche il segnale
+/// di spegnimento.
 pub async fn esegui(comando: Comando, contesto: &ConsoleContext) -> Esito {
     match comando {
         Comando::Utenti => riferisci(elenca_utenti(contesto).await),
@@ -326,8 +279,7 @@ pub async fn esegui(comando: Comando, contesto: &ConsoleContext) -> Esito {
         } => riferisci(riepiloga(&destinatario, range, contesto).await),
         Comando::Aiuto => Esito::parla(AIUTO),
         Comando::Esci => {
-            // L'errore significa solo che nessuno e' in ascolto, cioe' che il server sta
-            // gia' terminando per un'altra via.
+            // Un errore indica solo che il server sta gia' terminando.
             let _ = contesto.shutdown.send(());
             Esito::congeda("Spegnimento richiesto: il server chiude le connessioni aperte.")
         }
@@ -342,15 +294,11 @@ fn riferisci(esito: Result<String, ErroreEsecuzione>) -> Esito {
     }
 }
 
-/// Elenca tutti i veicoli registrati con il loro stato e l'ultima posizione nota.
-///
-/// Lo stato combina due fonti: chi non ha una voce nel registro delle connessioni e'
-/// sconnesso; per chi ce l'ha, fermo o in movimento lo dice lo [`StateTracker`].
+/// Elenca tutti i veicoli registrati con stato e ultima posizione.
 ///
 /// # Errori
 ///
-/// [`ErroreEsecuzione::Persistenza`] o [`ErroreEsecuzione::Task`] se lo storico non e'
-/// leggibile.
+/// Errore di lettura dello storico.
 async fn elenca_utenti(contesto: &ConsoleContext) -> Result<String, ErroreEsecuzione> {
     let connessi = contesto.registry.connected_users().await;
     let repo = Arc::clone(&contesto.repo);
@@ -379,10 +327,8 @@ async fn elenca_utenti(contesto: &ConsoleContext) -> Result<String, ErroreEsecuz
     Ok(testo)
 }
 
-/// Stato da mostrare per un utente.
-///
-/// Un utente connesso di cui la macchina a stati non sa ancora nulla e' fermo: e' lo stato
-/// con cui ogni sessione si apre.
+/// Stato da mostrare: sconnesso se non c'e' una connessione nel registro, altrimenti
+/// fermo o in movimento secondo lo [`StateTracker`].
 fn stato_di(id: UserId, connessi: &[UserId], stati: &StateTracker) -> UserState {
     if !connessi.contains(&id) {
         return UserState::Disconnected;
@@ -393,7 +339,7 @@ fn stato_di(id: UserId, connessi: &[UserId], stati: &StateTracker) -> UserState 
     }
 }
 
-/// Riga dell'elenco di `/utenti`: chi e' il veicolo e dove si trovava l'ultima volta.
+/// Riga dell'elenco di `/utenti`.
 struct Voce {
     /// Identificatore dell'utente.
     id: UserId,
@@ -404,7 +350,7 @@ struct Voce {
 }
 
 impl Voce {
-    /// Riga da mostrare all'operatore, con lo stato dell'utente.
+    /// Testo della riga, con lo stato indicato.
     fn riga(&self, stato: UserState) -> String {
         match &self.ultima {
             Some(posizione) => format!(
@@ -419,24 +365,20 @@ impl Voce {
     }
 }
 
-/// Raccoglie nome e ultima posizione di ogni utente registrato, in ordine di id.
-///
-/// E' sincrona perche' il [`Repository`] lo e': il chiamante la porta su un thread da
-/// lavoro. Le letture stanno in una chiamata sola invece di una per utente, cosi' il
-/// passaggio all'esecutore si paga una volta.
+/// Raccoglie nome e ultima posizione di ogni utente, in ordine di id, con una sola
+/// chiamata bloccante.
 ///
 /// # Errori
 ///
-/// [`StorageError`] se l'elenco degli utenti o lo storico non sono leggibili.
+/// [`StorageError`] se utenti o storico non sono leggibili.
 fn raccogli_voci(repo: &dyn Repository, adesso: DateTime<Utc>) -> Result<Vec<Voce>, StorageError> {
     let fine = fine_dello_storico(adesso);
 
     repo.list_users()?
         .into_iter()
         .map(|utente| {
-            // Manca un modo diretto di chiedere l'ultima posizione: si legge lo storico e
-            // se ne tiene la coda, che e' la piu' recente perche' `positions_in_range`
-            // ordina per `recorded_at` crescente.
+            // Il repository non ha una query per l'ultima posizione: si prende l'ultima
+            // dello storico, ordinato per `recorded_at`.
             let mut posizioni =
                 repo.positions_in_range(utente.id, DateTime::<Utc>::MIN_UTC, fine)?;
 
@@ -449,25 +391,21 @@ fn raccogli_voci(repo: &dyn Repository, adesso: DateTime<Utc>) -> Result<Vec<Voc
         .collect()
 }
 
-/// Estremo superiore dell'intervallo che contiene tutto lo storico.
+/// Estremo superiore per leggere tutto lo storico.
 ///
-/// Non e' `MAX_UTC` perche' il repository confronta gli istanti come testo: `MAX_UTC` si
-/// scrive con l'anno preceduto da `+`, che in ASCII viene prima delle cifre, quindi
-/// risulterebbe minore di qualunque data reale e l'intervallo sarebbe sempre vuoto.
-/// `MIN_UTC` come estremo inferiore non ha il problema: il suo `-` viene prima delle
-/// cifre, che e' proprio l'ordine voluto.
+/// Non si usa `MAX_UTC`: scritto come testo comincia con `+` e risulterebbe minore di
+/// qualunque data reale.
 fn fine_dello_storico(adesso: DateTime<Utc>) -> DateTime<Utc> {
     adesso
         .checked_add_signed(TimeDelta::seconds(ANTICIPO_TOLLERATO_SECS))
         .unwrap_or(adesso)
 }
 
-/// Manda un avviso a tutta la flotta e riferisce quanti veicoli ha raggiunto.
+/// Manda un avviso a tutta la flotta e riporta quanti veicoli ha raggiunto.
 ///
 /// # Errori
 ///
-/// [`ErroreEsecuzione::Messaggistica`] se il testo supera il limite di lunghezza o se la
-/// scrittura a storico fallisce.
+/// [`ErroreEsecuzione::Messaggistica`] se il testo e' troppo lungo o la scrittura fallisce.
 async fn manda_avviso(testo: &str, contesto: &ConsoleContext) -> Result<String, ErroreEsecuzione> {
     let raggiunti = contesto.messaging.broadcast(testo).await?;
 
@@ -477,13 +415,11 @@ async fn manda_avviso(testo: &str, contesto: &ConsoleContext) -> Result<String, 
     ))
 }
 
-/// Manda un messaggio a un solo veicolo e riferisce se lo ha raggiunto subito.
+/// Manda un messaggio a un solo veicolo e riporta se e' stato consegnato subito.
 ///
 /// # Errori
 ///
-/// [`ErroreEsecuzione::UtenteSconosciuto`] se nessun utente registrato ha quel nome, e in
-/// quel caso non viene scritto nulla; [`ErroreEsecuzione::Messaggistica`] se l'invio non
-/// riesce.
+/// [`ErroreEsecuzione::UtenteSconosciuto`] o [`ErroreEsecuzione::Messaggistica`].
 async fn manda_messaggio(
     destinatario: &str,
     testo: &str,
@@ -505,9 +441,7 @@ async fn manda_messaggio(
 ///
 /// # Errori
 ///
-/// [`ErroreEsecuzione::UtenteSconosciuto`] se nessun utente registrato ha quel nome;
-/// [`ErroreEsecuzione::Persistenza`] o [`ErroreEsecuzione::Task`] se lo storico non e'
-/// leggibile.
+/// [`ErroreEsecuzione::UtenteSconosciuto`] o un errore di lettura dello storico.
 async fn riepiloga(
     destinatario: &str,
     range: AnalysisRange,
@@ -542,12 +476,8 @@ async fn riepiloga(
     ))
 }
 
-/// Il tragitto in una riga: quanti punti, da dove e fino a dove.
-///
-/// Elencare tutti i punti non servirebbe all'operatore, perche' un giorno di invii ogni 30
-/// secondi ne conta migliaia: partenza e arrivo con i loro istanti dicono dove il veicolo
-/// e' andato, e il numero di punti quanto e' fitto il percorso. Il numero e' `totale`,
-/// quello del tragitto completo, non la lunghezza di `route`, che puo' essere un campione.
+/// Il tragitto in una riga: numero di punti (`totale`, del tragitto completo), partenza
+/// e arrivo.
 fn descrivi_tragitto(route: &[PositionRecord], totale: u64) -> String {
     let punto = |posizione: &PositionRecord| {
         format!(
@@ -565,17 +495,11 @@ fn descrivi_tragitto(route: &[PositionRecord], totale: u64) -> String {
     }
 }
 
-/// Cerca l'id dell'utente che ha lo username indicato.
-///
-/// Il confronto avviene sul testo e non su uno `Username` costruito dall'argomento: cosi'
-/// un nome che non supererebbe nemmeno la validazione da' lo stesso "utente sconosciuto"
-/// di un nome ben formato ma inesistente, che e' cio' che all'operatore interessa.
+/// Cerca l'id dell'utente con lo username indicato.
 ///
 /// # Errori
 ///
-/// [`ErroreEsecuzione::UtenteSconosciuto`] se nessuno ha quel nome;
-/// [`ErroreEsecuzione::Persistenza`] o [`ErroreEsecuzione::Task`] se l'elenco non e'
-/// leggibile.
+/// [`ErroreEsecuzione::UtenteSconosciuto`] o un errore di lettura.
 async fn risolvi_username(
     destinatario: &str,
     contesto: &ConsoleContext,
@@ -590,13 +514,11 @@ async fn risolvi_username(
         .ok_or_else(|| ErroreEsecuzione::UtenteSconosciuto(destinatario.to_owned()))
 }
 
-/// Esegue una lettura del repository su un thread da lavoro: i suoi metodi sono
-/// sincroni, e chiamarli qui fermerebbe un thread dell'esecutore.
+/// Esegue una lettura del repository in `spawn_blocking`.
 ///
 /// # Errori
 ///
-/// [`ErroreEsecuzione::Persistenza`] se la lettura fallisce, [`ErroreEsecuzione::Task`]
-/// se l'attivita' non arriva in fondo.
+/// [`ErroreEsecuzione::Persistenza`] o [`ErroreEsecuzione::Task`].
 async fn in_background<T, F>(lettura: F) -> Result<T, ErroreEsecuzione>
 where
     F: FnOnce() -> Result<T, StorageError> + Send + 'static,
@@ -634,10 +556,7 @@ fn concorda(quanti: usize, singolare: &str, plurale: &str) -> String {
     }
 }
 
-/// Durata in secondi come la legge una persona: `2h 05m 30s`, `5m 30s`, `30s`.
-///
-/// Le unita' vuote in testa non compaiono, quelle in mezzo si': `1h 00m 05s` dice piu' di
-/// `1h 5s`, dove i cinque secondi si potrebbero scambiare per cinque minuti.
+/// Durata in formato leggibile: `2h 05m 30s`, `5m 30s`, `30s`.
 fn formatta_durata(secondi: u64) -> String {
     let ore = secondi / 3_600;
     let minuti = (secondi % 3_600) / 60;
@@ -807,9 +726,7 @@ mod tests {
 
     #[test]
     fn un_testo_multibyte_non_manda_in_panico_il_parsing() {
-        // Se la divisione indicizzasse i byte invece di tagliare sui confini di
-        // carattere, queste righe farebbero cadere il server. Il destinatario non e' uno
-        // username valido, ma il parsing non lo sa e non deve nemmeno provarci.
+        // Il parsing deve dividere su confini di carattere, non di byte.
         assert_eq!(
             analizza_comando("/broadcast attenzione: neve 🚚 sull'A4 città"),
             Ok(Comando::Broadcast(
@@ -855,11 +772,8 @@ mod tests {
         orologio: Arc<FakeClock>,
     }
 
-    /// Istante UTC del mezzogiorno locale del 2026-08-13.
-    ///
-    /// Le varianti di calendario di [`AnalysisRange`] partono dalla mezzanotte
-    /// **locale**: partire da mezzogiorno tiene le posizioni dentro la giornata locale
-    /// qualunque sia il fuso della macchina che esegue i test.
+    /// Mezzogiorno locale del 2026-08-13 in UTC: tiene le posizioni dentro la giornata
+    /// locale qualunque sia il fuso della macchina.
     fn mezzogiorno_locale() -> DateTime<Utc> {
         let data = NaiveDate::from_ymd_opt(2026, 8, 13).expect("data di test valida");
         let orario = NaiveTime::from_hms_opt(12, 0, 0).expect("orario di test valido");
@@ -945,8 +859,8 @@ mod tests {
             connetti(&banco, primo).await,
             connetti(&banco, secondo).await,
         );
-        // Il primo si sposta di circa 100 m fra due posizioni: e' in movimento. Il secondo
-        // si e' appena collegato e non ha ancora inviato nulla: e' fermo.
+        // Il primo si e' spostato di circa 100 m (in movimento), il secondo si e' appena
+        // collegato (fermo).
         banco.contesto.stati.on_connect(primo);
         banco.contesto.stati.on_connect(secondo);
         let partenza = Coordinate::new(LAT_PARTENZA, LON_PARTENZA).expect("coordinata valida");
@@ -1105,8 +1019,7 @@ mod tests {
     async fn analisi_riporta_i_numeri_del_riepilogo() {
         let banco = banco();
         let user_id = registra(&banco, "veicolo_01");
-        // Dieci punti in linea retta, uno scatto di circa 100 m ogni 10 s: gli stessi
-        // numeri verificati in `analysis.rs`, cioe' 900 m in 90 s a 36 km/h.
+        // Dieci punti a 100 m ogni 10 s: 900 m in 90 s, 36 km/h.
         for i in 0..10 {
             registra_posizione(&banco, user_id, f64::from(i), i64::from(i) * 10 - 90);
         }
@@ -1200,8 +1113,7 @@ mod tests {
         assert!(esito.termina, "/esci deve chiudere il ciclo della console");
         assert_eq!(spegnimento.recv().await, Ok(()));
 
-        // Senza nessuno in ascolto `send` fallisce, ma la console deve congedarsi
-        // comunque.
+        // Senza nessuno in ascolto `send` fallisce, ma la console termina comunque.
         drop(spegnimento);
         assert!(esegui(Comando::Esci, &banco.contesto).await.termina);
     }

@@ -8,17 +8,11 @@
 //!       -> Logout
 //! ```
 //!
-//! Fuori sequenza il server risponde con [`ErrorCode::NotAuthenticated`]. Oltre al flusso
-//! guidato dal client, il server puo' inviare in qualsiasi momento
-//! [`ServerMessage::Broadcast`], [`ServerMessage::Direct`] e
-//! [`ServerMessage::StateChanged`], che non sono risposte a una richiesta.
+//! Fuori sequenza il server risponde con [`ErrorCode::NotAuthenticated`]. Broadcast,
+//! Direct e StateChanged possono arrivare in qualsiasi momento.
 //!
-//! # Compatibilita' del formato
-//!
-//! postcard codifica le varianti con il loro indice posizionale: aggiungerne in coda e'
-//! compatibile, riordinarle o rimuoverle rompe i peer gia' in giro. Per questo la
-//! versione si negozia a livello applicativo con [`PROTOCOL_VERSION`], che un peer
-//! sconosciuto deserializza senza errori.
+//! postcard codifica le varianti per indice: le nuove vanno aggiunte in coda, e ogni
+//! modifica incompatibile richiede di alzare [`PROTOCOL_VERSION`].
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -26,19 +20,13 @@ use thiserror::Error;
 
 use crate::types::{Coordinate, PositionRecord, UserState, Username};
 
-/// Versione del protocollo implementata da questo crate, scambiata nell'handshake.
+/// Versione del protocollo, scambiata nell'handshake.
 ///
-/// La 2 ha aggiunto [`MovementSummary::route_points`]: un campo in piu' cambia la
-/// codifica del riepilogo, e un peer della versione 1 lo leggerebbe male senza accorgersene.
+/// Portata a 2 con l'aggiunta di [`MovementSummary::route_points`].
 pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Testo con cui il server annuncia che la sessione e' stata sostituita da una nuova
-/// connessione dello stesso utente.
-///
-/// Non c'e' un [`ErrorCode`] dedicato: si usa il piu' vicino nel significato,
-/// [`ErrorCode::NotAuthenticated`], e il testo fa da discriminante. La costante sta qui
-/// perche' e' parte del contratto: il client lo riconosce per non riconnettersi, e un
-/// letterale duplicato nei due crate divergerebbe in silenzio.
+/// connessione dello stesso utente; il client lo usa per non riconnettersi.
 pub const SESSION_REPLACED_MESSAGE: &str =
     "sessione sostituita da un'altra connessione dello stesso utente";
 
@@ -206,10 +194,8 @@ pub struct MovementSummary {
     pub average_speed_kmh: f64,
     /// Numero di soste rilevate.
     pub stop_count: u32,
-    /// Tragitto percorso, in ordine cronologico: tutte le posizioni analizzate se sono
-    /// poche, altrimenti un loro campione a intervalli regolari che comprende sempre la
-    /// prima e l'ultima. Il campione tiene il messaggio ben sotto il limite di un frame
-    /// anche su un mese di dati.
+    /// Tragitto in ordine cronologico: intero se breve, altrimenti un campione a
+    /// intervalli regolari che comprende sempre il primo e l'ultimo punto.
     pub route: Vec<PositionRecord>,
     /// Numero di posizioni del tragitto completo, prima del campionamento.
     pub route_points: u64,
@@ -371,9 +357,7 @@ mod tests {
 
     #[test]
     fn username_invalido_nel_messaggio_e_rifiutato_in_deserializzazione() {
-        // postcard codifica una variante come indice varint seguito dai campi: `Register`
-        // e' la variante 1. La prima meta' del test fissa questa assunzione sul formato,
-        // la seconda verifica il rifiuto.
+        // `Register` e' la variante 1: il test fissa questa assunzione sul formato.
         let ammesso = postcard::to_stdvec(&(1_u32, "veicolo_01", "segreto"))
             .expect("serializzazione riuscita");
         assert_eq!(
@@ -391,8 +375,7 @@ mod tests {
 
     #[test]
     fn il_messaggio_di_sessione_sostituita_e_un_testo_stabile() {
-        // Server e client si accordano su questo letterale: il test lo fissa perche' una
-        // modifica su un solo lato non passi inosservata.
+        // Il client riconosce la sostituzione da questo testo esatto.
         assert_eq!(
             SESSION_REPLACED_MESSAGE,
             "sessione sostituita da un'altra connessione dello stesso utente"

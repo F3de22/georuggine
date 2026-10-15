@@ -1,24 +1,8 @@
-//! Motore di analisi dei percorsi: da una sequenza di [`PositionRecord`] a un
-//! [`MovementSummary`].
+//! Analisi dei percorsi: da una sequenza di [`PositionRecord`] a un [`MovementSummary`].
 //!
-//! [`analyze`] e' una funzione pura su una fetta di record, quindi si prova senza
-//! database ne' rete.
-//!
-//! # Cos'e' movimento
-//!
-//! Il criterio e' quello di [`crate::state`], e per la stessa ragione: la sorgente
-//! simulata sovrappone rumore alla posizione. Un segmento conta come spostamento solo se
-//! supera [`MOVEMENT_THRESHOLD_METERS`]; sotto soglia e' rumore, e non contribuisce ne'
-//! alla distanza percorsa ne' al tempo in movimento. Da qui discende tutto il resto: il
-//! tempo che accompagna un segmento sopra soglia e' tempo in movimento, quello di un
-//! segmento sotto soglia e' tempo di pausa.
-//!
-//! # Pausa e sosta non sono la stessa cosa
-//!
-//! `pause_duration_secs` e' il tempo totale passato fermi; `stop_count` conta solo le
-//! pause che durano almeno [`STILL_AFTER_SECS`], cioe' quelle abbastanza lunghe da essere
-//! una sosta. Una fermata di due minuti al semaforo entra nel primo valore e non nel
-//! secondo.
+//! Un segmento fra due posizioni consecutive e' movimento se supera
+//! [`MOVEMENT_THRESHOLD_METERS`], altrimenti e' pausa. Una pausa lunga almeno
+//! [`STILL_AFTER_SECS`] conta anche come sosta.
 
 use chrono::{
     DateTime, Datelike, Days, Local, MappedLocalTime, NaiveDate, NaiveTime, TimeZone, Utc,
@@ -31,55 +15,31 @@ use georuggine_common::types::{
 /// Metri al secondo espressi in chilometri all'ora.
 const SECONDI_PER_ORA_SU_METRI_PER_KM: f64 = 3.6;
 
-/// Minuti in un giorno, limite della ricerca del primo istante valido di una giornata.
+/// Minuti in un giorno, limite della ricerca del primo istante valido di una data.
 const MINUTI_IN_UN_GIORNO: u32 = 24 * 60;
 
 /// Passo in minuti della stessa ricerca.
 const PASSO_RICERCA_MINUTI: usize = 15;
 
-/// Punti al massimo nel tragitto di un riepilogo.
-///
-/// Una posizione occupa circa 45 byte sul filo: mille punti stanno sotto i 50 KB, molto
-/// lontano dal MiB di un frame, mentre un mese di invii ogni 30 secondi ne conterebbe
-/// decine di migliaia e non si potrebbe nemmeno spedire. Mille bastano a disegnare il
-/// percorso di un giorno con un punto ogni minuto e mezzo circa.
+/// Punti massimi del tragitto in un riepilogo: circa 45 KB sul filo, ben sotto il limite
+/// di un frame anche su un mese di dati.
 pub const MAX_PUNTI_TRAGITTO: usize = 1_000;
 
-/// Riepiloga i movimenti descritti da una sequenza di posizioni.
+/// Riepiloga i movimenti di una sequenza di posizioni ordinate per `recorded_at`.
 ///
-/// # Precondizione
-///
-/// `positions` deve essere gia' ordinato per `recorded_at` crescente, come lo restituisce
-/// la query che lo produce. Se la precondizione viene violata gli intervalli
-/// all'indietro contano zero secondi (vedi [`durata_secs`]) e il riepilogo resta
-/// coerente, con le distanze sommate e i tempi sottostimati.
-///
-/// # Come vengono calcolati i campi
-///
-/// Si scorrono le coppie di posizioni consecutive. Un segmento sopra
-/// [`MOVEMENT_THRESHOLD_METERS`] somma la sua lunghezza in `total_distance_meters` e la
-/// sua durata in `moving_duration_secs`; uno sotto soglia somma la durata in
-/// `pause_duration_secs`. Le pause consecutive si accumulano e valgono una sosta solo se
-/// raggiungono [`STILL_AFTER_SECS`].
-///
-/// `average_speed_kmh` divide la distanza per il **solo** tempo in movimento; con zero
-/// secondi in movimento vale `0.0` e mai `NaN` o infinito. Con meno di due posizioni non
-/// esiste nessun segmento e tutti i campi numerici valgono zero.
-///
-/// Distanze e durate si calcolano su **tutte** le posizioni; solo `route`, il tragitto
-/// restituito, e' un campione di al massimo [`MAX_PUNTI_TRAGITTO`] punti (vedi
-/// [`campiona_tragitto`]), mentre `route_points` dice quante erano in origine.
+/// La velocita' media considera il solo tempo in movimento e vale 0 se non ce n'e'.
+/// Distanze e durate usano tutte le posizioni; il tragitto restituito e' un campione di
+/// al massimo [`MAX_PUNTI_TRAGITTO`] punti.
 pub fn analyze(positions: &[PositionRecord]) -> MovementSummary {
     let mut total_distance_meters = 0.0;
     let mut moving_duration_secs: u64 = 0;
     let mut pause_duration_secs: u64 = 0;
     let mut stop_count: u32 = 0;
-    // Durata della pausa ancora aperta, azzerata da ogni segmento in movimento.
+    // Durata della pausa in corso, azzerata da ogni segmento in movimento.
     let mut pausa_aperta_secs: u64 = 0;
 
     for coppia in positions.windows(2) {
         let [precedente, corrente] = coppia else {
-            // `windows(2)` non produce mai fette di lunghezza diversa da due.
             continue;
         };
 
@@ -97,8 +57,7 @@ pub fn analyze(positions: &[PositionRecord]) -> MovementSummary {
         }
     }
 
-    // Una pausa che arriva fino all'ultima posizione non ha un segmento in movimento che
-    // la chiuda: senza questa riga l'ultima sosta non verrebbe contata.
+    // Chiude un'eventuale pausa che arriva fino all'ultima posizione.
     stop_count = chiudi_pausa(stop_count, pausa_aperta_secs);
 
     MovementSummary {
@@ -112,37 +71,27 @@ pub fn analyze(positions: &[PositionRecord]) -> MovementSummary {
     }
 }
 
-/// Riduce il tragitto ad al massimo `massimo` punti presi a intervalli regolari.
-///
-/// Sotto il limite il tragitto torna intero. Sopra, il punto `i` del campione e' la
-/// posizione di indice `i * (n - 1) / (massimo - 1)`: il primo e l'ultimo restano sempre
-/// quelli veri, cosi' partenza e arrivo non cambiano, e gli indici crescono strettamente
-/// perche' `n > massimo`, quindi nessun punto si ripete e l'ordine cronologico resta.
+/// Riduce il tragitto ad al massimo `massimo` punti presi a intervalli regolari,
+/// mantenendo sempre il primo e l'ultimo.
 fn campiona_tragitto(positions: &[PositionRecord], massimo: usize) -> Vec<PositionRecord> {
     let n = positions.len();
     if n <= massimo {
         return positions.to_vec();
     }
-    // Con meno di due punti non c'e' un intervallo da dividere: la formula sotto
-    // dividerebbe per zero.
+    // Evita la divisione per zero nella formula sotto.
     if massimo < 2 {
         return positions.iter().take(massimo).cloned().collect();
     }
 
     (0..massimo)
         .filter_map(|i| {
-            // Il prodotto non trabocca: `i < massimo` e `n` e' la lunghezza di una fetta,
-            // e su 64 bit servirebbero miliardi di miliardi di posizioni.
             let indice = i.saturating_mul(n - 1) / (massimo - 1);
             positions.get(indice).cloned()
         })
         .collect()
 }
 
-/// Aggiunge una sosta al conteggio se la pausa appena chiusa era abbastanza lunga.
-///
-/// La soglia e' inclusa: una pausa di esattamente [`STILL_AFTER_SECS`] secondi e' gia' un
-/// veicolo fermo.
+/// Aggiunge una sosta se la pausa appena chiusa raggiunge la soglia (inclusa).
 fn chiudi_pausa(stop_count: u32, pausa_secs: u64) -> u32 {
     if pausa_secs >= STILL_AFTER_SECS {
         stop_count.saturating_add(1)
@@ -151,20 +100,12 @@ fn chiudi_pausa(stop_count: u32, pausa_secs: u64) -> u32 {
     }
 }
 
-/// Secondi fra due istanti, zero se il secondo non viene dopo il primo.
-///
-/// Le durate negative possono nascere solo se la precondizione di ordinamento di
-/// [`analyze`] e' violata: contarle come zero evita che un ingresso disordinato produca
-/// durate assurde.
+/// Secondi fra due istanti, zero se il secondo precede il primo.
 fn durata_secs(inizio: DateTime<Utc>, fine: DateTime<Utc>) -> u64 {
     u64::try_from((fine - inizio).num_seconds()).unwrap_or(0)
 }
 
-/// Velocita' media in km/h su una distanza in metri e una durata in secondi.
-///
-/// Con durata nulla restituisce `0.0`: in virgola mobile la divisione per zero non fa
-/// terminare il processo ma produce infinito, o `NaN`, e quel valore finirebbe nel
-/// riepilogo mandato al client.
+/// Velocita' media in km/h; 0 con durata nulla, per non produrre infinito o `NaN`.
 fn velocita_media_kmh(distanza_metri: f64, durata_secs: u64) -> f64 {
     if durata_secs == 0 {
         return 0.0;
@@ -172,21 +113,11 @@ fn velocita_media_kmh(distanza_metri: f64, durata_secs: u64) -> f64 {
     distanza_metri / durata_secs as f64 * SECONDI_PER_ORA_SU_METRI_PER_KM
 }
 
-/// Traduce un [`AnalysisRange`] negli estremi temporali con cui interrogare lo storico.
-///
-/// E' un trait di estensione e non un `impl` inerente perche' [`AnalysisRange`] appartiene
-/// a `georuggine-common`: la regola dell'orfano vieta di aggiungergli metodi da qui.
+/// Estremi temporali di un [`AnalysisRange`] (trait di estensione, perche' il tipo sta
+/// in `georuggine-common`).
 pub trait AnalysisRangeExt {
-    /// Estremi `(from, to)` dell'intervallo, in UTC e con entrambi gli estremi inclusi.
-    ///
-    /// Le varianti di calendario partono dalla mezzanotte **locale** — "oggi" e' il giorno
-    /// di chi guarda la flotta, non quello UTC — e arrivano a `now`, non alla fine del
-    /// periodo: oltre `now` non esistono posizioni da leggere, e cosi' `from <= to` vale
-    /// sempre. Il risultato torna in UTC per essere confrontabile con i `recorded_at`
-    /// salvati.
-    ///
-    /// [`AnalysisRange::Custom`] restituisce i propri estremi immutati: verificare che
-    /// `from` non venga dopo `to` e' compito del chiamante.
+    /// Estremi `(from, to)` in UTC, inclusi: dalla mezzanotte locale del primo giorno
+    /// del periodo fino a `now`. [`AnalysisRange::Custom`] restituisce i propri estremi.
     fn to_bounds(&self, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>);
 }
 
@@ -196,11 +127,8 @@ impl AnalysisRangeExt for AnalysisRange {
     }
 }
 
-/// Corpo di [`AnalysisRangeExt::to_bounds`], parametrico sul fuso orario.
-///
-/// Il fuso e' un parametro invece di `Local` fisso perche' il comportamento sui cambi
-/// d'ora dipende dal database dei fusi del sistema: senza il parametro non si potrebbe
-/// esercitare in modo deterministico una mezzanotte inesistente o ripetuta.
+/// Corpo di [`AnalysisRangeExt::to_bounds`], parametrico sul fuso per poterlo testare
+/// sui cambi d'ora.
 fn estremi_nel_fuso<Tz: TimeZone>(
     range: &AnalysisRange,
     now: DateTime<Utc>,
@@ -218,27 +146,18 @@ fn estremi_nel_fuso<Tz: TimeZone>(
     (primo_istante_del_giorno(giorno_iniziale, fuso), now)
 }
 
-/// Lunedi' della settimana a cui il giorno appartiene, il giorno stesso se e' un lunedi'.
-///
-/// Una domenica appartiene alla settimana che finisce quel giorno, quindi si torna
-/// indietro di sei giorni e non avanti di uno.
+/// Lunedi' della settimana del giorno indicato.
 fn lunedi_della_settimana(giorno: NaiveDate) -> NaiveDate {
     let arretramento = u64::from(giorno.weekday().num_days_from_monday());
-    // `checked_sub_days` fallisce solo a ridosso della data minima rappresentabile, dove
-    // restare sul giorno stesso e' comunque un estremo inferiore valido.
     giorno
         .checked_sub_days(Days::new(arretramento))
         .unwrap_or(giorno)
 }
 
-/// Primo istante di un giorno di calendario in un dato fuso, espresso in UTC.
+/// Primo istante di un giorno nel fuso indicato, in UTC.
 ///
-/// La mezzanotte locale non sempre esiste: nei fusi che spostano avanti l'orologio a
-/// mezzanotte le 00:00 vengono saltate, e in quelli che lo spostano indietro capitano due
-/// volte. Nel primo caso si cerca in avanti a passi di [`PASSO_RICERCA_MINUTI`] il primo
-/// orario che esiste, nel secondo si prende la prima delle due occorrenze, cosi'
-/// l'intervallo copre tutta la giornata locale. Se nessun orario del giorno fosse valido,
-/// cosa che nessun fuso reale produce, si ripiega sulla mezzanotte UTC.
+/// Se la mezzanotte non esiste per un cambio d'ora si prende il primo orario valido;
+/// se e' ripetuta, la prima occorrenza.
 fn primo_istante_del_giorno<Tz: TimeZone>(giorno: NaiveDate, fuso: &Tz) -> DateTime<Utc> {
     for minuti in (0..MINUTI_IN_UN_GIORNO).step_by(PASSO_RICERCA_MINUTI) {
         let Some(orario) = NaiveTime::from_hms_opt(minuti / 60, minuti % 60, 0) else {
@@ -268,8 +187,7 @@ mod tests {
     const LAT_PARTENZA: f64 = 45.0703;
     const LON_PARTENZA: f64 = 7.6869;
 
-    /// Gradi di latitudine che valgono circa 100 m: venti volte la soglia di movimento,
-    /// abbastanza perche' il segmento sia inequivocabilmente uno spostamento.
+    /// Gradi di latitudine che valgono circa 100 m, ben oltre la soglia di movimento.
     const GRADI_PER_CENTO_METRI: f64 = 0.000_9;
 
     /// Gradi di latitudine che valgono circa 1 m, quindi sotto la soglia di movimento.
@@ -280,8 +198,8 @@ mod tests {
         i64::try_from(STILL_AFTER_SECS).expect("soglia rappresentabile")
     }
 
-    /// Posizione a `passi` scatti di circa 100 m a nord della partenza, piu' `rumore`
-    /// scatti di circa 1 m, rilevata a `secondi` dall'inizio.
+    /// Posizione `passi` volte 100 m e `rumore` volte 1 m a nord della partenza, a
+    /// `secondi` dall'inizio.
     fn punto(passi: f64, rumore: f64, secondi: i64) -> PositionRecord {
         PositionRecord {
             user_id: UTENTE,
@@ -309,8 +227,7 @@ mod tests {
 
     #[test]
     fn un_percorso_rettilineo_ha_distanza_e_velocita_attese() {
-        // Dieci punti in linea retta, uno scatto di circa 100 m ogni 10 s: nove segmenti,
-        // 90 s di movimento, circa 10 m/s ovvero 36 km/h.
+        // Dieci punti a 100 m l'uno dall'altro ogni 10 s: 900 m in 90 s, 36 km/h.
         let posizioni: Vec<_> = (0..10)
             .map(|i| punto(f64::from(i), 0.0, i64::from(i) * 10))
             .collect();
@@ -337,8 +254,7 @@ mod tests {
 
     #[test]
     fn la_pausa_non_entra_nel_divisore_della_velocita_media() {
-        // Un'ora fermi, poi due scatti da 100 m in 10 s l'uno: 200 m in 20 s sono 36
-        // km/h, mentre sull'intera durata sarebbero stati meno di 0,2 km/h.
+        // Un'ora fermi, poi 200 m in 20 s: la media resta 36 km/h.
         let riepilogo = analyze(&[
             punto(0.0, 0.0, 0),
             punto(0.0, 1.0, 3_600),
@@ -421,8 +337,7 @@ mod tests {
 
     #[test]
     fn durate_nulle_o_negative_non_producono_valori_assurdi() {
-        // Spostamento oltre soglia in un intervallo di durata nulla: nessun divisore per
-        // la velocita' media.
+        // Spostamento in un intervallo nullo: la velocita' non deve dividere per zero.
         let istantaneo = analyze(&[punto(0.0, 0.0, 0), punto(1.0, 0.0, 0)]);
         assert_eq!(istantaneo.moving_duration_secs, 0);
         assert_eq!(istantaneo.average_speed_kmh, 0.0);
@@ -455,12 +370,8 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 10, 25).expect("data di test valida")
     }
 
-    /// Fuso orario di prova che sposta il cambio d'ora a mezzanotte.
-    ///
-    /// I fusi europei cambiano l'ora alle 02:00 o alle 03:00 locali, quindi la loro
-    /// mezzanotte esiste sempre e non esercita ne' [`MappedLocalTime::None`] ne'
-    /// [`MappedLocalTime::Ambiguous`]. Fusi reali con quel comportamento esistono, ma
-    /// dipenderebbero dal database dei fusi del sistema.
+    /// Fuso di prova con il cambio d'ora a mezzanotte, per esercitare mezzanotti
+    /// inesistenti e ripetute senza dipendere dal database dei fusi.
     #[derive(Debug, Clone, Copy)]
     struct FusoConCambioAMezzanotte;
 
@@ -507,10 +418,7 @@ mod tests {
         }
     }
 
-    /// Istante UTC corrispondente all'ora locale indicata nel fuso di sistema.
-    ///
-    /// I test di [`AnalysisRangeExt::to_bounds`] partono da un'ora locale e verificano il
-    /// risultato in ora locale, cosi' le attese non dipendono dal fuso della macchina.
+    /// Istante UTC dell'ora locale indicata nel fuso di sistema.
     fn locale(anno: i32, mese: u32, giorno: u32, ora: u32, minuto: u32) -> DateTime<Utc> {
         let data = NaiveDate::from_ymd_opt(anno, mese, giorno).expect("data di test valida");
         let orario = NaiveTime::from_hms_opt(ora, minuto, 0).expect("orario di test valido");
@@ -575,8 +483,7 @@ mod tests {
 
     #[test]
     fn custom_restituisce_gli_estremi_ricevuti_senza_correggerli() {
-        // La validazione da > a e' compito del chiamante: gli estremi passano cosi' come
-        // sono, anche invertiti.
+        // Gli estremi passano invariati, anche se invertiti.
         for (from, to) in [(istante(0), istante(86_400)), (istante(86_400), istante(0))] {
             assert_eq!(
                 AnalysisRange::Custom { from, to }.to_bounds(istante(1_000)),
@@ -592,8 +499,7 @@ mod tests {
             locale(2026, 2, 28, 23, 59),
             locale(2026, 12, 31, 23, 59),
             locale(2024, 2, 29, 6, 0),
-            // Ultima domenica di marzo e di ottobre: i giorni in cui i fusi europei
-            // cambiano l'ora.
+            // Ultima domenica di marzo e di ottobre: cambio dell'ora in Europa.
             locale(2026, 3, 29, 12, 0),
             locale(2026, 10, 25, 12, 0),
         ];
@@ -615,8 +521,7 @@ mod tests {
 
     #[test]
     fn una_mezzanotte_inesistente_o_ripetuta_non_rompe_l_intervallo() {
-        // Prima le assunzioni sul fuso finto: se smettesse di avere il salto e la
-        // ripetizione, il resto del test passerebbe senza provare nulla.
+        // Verifica preliminare che il fuso di prova abbia salto e ripetizione.
         assert!(matches!(
             FusoConCambioAMezzanotte
                 .offset_from_local_datetime(&giorno_del_salto().and_time(NaiveTime::MIN)),
@@ -629,8 +534,7 @@ mod tests {
                 if prima.fix() == ora_legale() && seconda.fix() == ora_solare()
         ));
 
-        // Le 00:00 del 29 marzo non esistono: si parte dal primo istante che esiste, le
-        // 01:00 con offset +02:00, cioe' le 23:00 UTC del giorno prima.
+        // Le 00:00 del 29 marzo non esistono: si parte dalle 01:00 (+02:00).
         let adesso = giorno_del_salto()
             .and_hms_opt(12, 0, 0)
             .expect("orario valido")
@@ -645,8 +549,7 @@ mod tests {
         );
         assert!(from <= to);
 
-        // Le 00:00 del 25 ottobre capitano due volte: si prende la prima, cosi'
-        // l'intervallo copre tutta la giornata locale.
+        // Le 00:00 del 25 ottobre sono ripetute: si prende la prima.
         let adesso = giorno_della_ripetizione()
             .and_hms_opt(12, 0, 0)
             .expect("orario valido")

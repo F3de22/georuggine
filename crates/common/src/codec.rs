@@ -1,8 +1,4 @@
-//! Framing dei messaggi di protocollo su TCP.
-//!
-//! TCP e' un flusso di byte senza confini di messaggio: una `read` puo' restituire mezzo
-//! messaggio, o due messaggi attaccati. [`MessageCodec`] ricostruisce i confini con un
-//! frame a prefisso di lunghezza:
+//! Framing dei messaggi su TCP con prefisso di lunghezza:
 //!
 //! ```text
 //! +--------------------+---------------------------+
@@ -10,12 +6,8 @@
 //! +--------------------+---------------------------+
 //! ```
 //!
-//! La lunghezza e' big-endian, l'ordine di rete, cosi' il formato sul filo non dipende
-//! dall'architettura dei due peer.
-//!
-//! [`CodecError::FrameTooLarge`] e [`CodecError::Serialization`] non sono recuperabili
-//! sulla stessa connessione: il flusso resta disallineato rispetto ai confini dei frame,
-//! quindi il chiamante deve chiudere la connessione anziche' continuare a leggere.
+//! Dopo [`CodecError::FrameTooLarge`] o [`CodecError::Serialization`] il flusso non e'
+//! piu' allineato ai confini dei frame: il chiamante deve chiudere la connessione.
 
 use std::io;
 use std::marker::PhantomData;
@@ -28,10 +20,8 @@ use tokio_util::codec::{Decoder, Encoder};
 
 use crate::protocol::{ClientMessage, ServerMessage};
 
-/// Dimensione massima ammessa per il payload di un frame, in byte.
-///
-/// Sta diversi ordini di grandezza sopra al messaggio piu' grande che il protocollo
-/// prevede e limita la memoria che una singola connessione puo' far riservare.
+/// Dimensione massima del payload di un frame, in byte: limita la memoria che una
+/// connessione puo' far riservare.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
 
 /// Byte occupati dal prefisso di lunghezza che apre ogni frame.
@@ -54,15 +44,11 @@ pub enum CodecError {
     Serialization(#[from] postcard::Error),
 }
 
-/// Codec a prefisso di lunghezza per i messaggi `T` serializzati con postcard.
+/// Codec a prefisso di lunghezza per messaggi `T` serializzati con postcard.
 ///
-/// Si usa con `Framed::new(stream, MessageCodec::new())`. Il codec e' privo di stato: la
-/// riassemblazione dei frame parziali vive nel buffer che `Framed` gli passa. Ogni
-/// estremo usa il codec del proprio verso: il client legge [`ServerMessage`] e scrive
-/// [`ClientMessage`], il server fa l'opposto.
+/// Il client legge [`ServerMessage`] e scrive [`ClientMessage`], il server il contrario.
 pub struct MessageCodec<T> {
-    /// Fissa il tipo dei messaggi senza occupare spazio. La forma `fn(T) -> T` rende il
-    /// codec `Send` e `Sync` qualunque sia `T`, cosa che un `PhantomData<T>` non farebbe.
+    /// `fn(T) -> T` rende il codec `Send` e `Sync` qualunque sia `T`.
     _message: PhantomData<fn(T) -> T>,
 }
 
@@ -87,13 +73,12 @@ where
 {
     type Error = CodecError;
 
-    /// Serializza il messaggio e lo accoda a `dst` preceduto dalla sua lunghezza.
+    /// Serializza il messaggio preceduto dalla sua lunghezza.
     ///
     /// # Errori
     ///
-    /// [`CodecError::Serialization`] se il messaggio non e' serializzabile e
-    /// [`CodecError::FrameTooLarge`] se il payload supera [`MAX_FRAME_BYTES`]. In
-    /// entrambi i casi `dst` resta invariato: non viene scritto un frame a meta'.
+    /// [`CodecError::Serialization`] o [`CodecError::FrameTooLarge`]; in entrambi i casi
+    /// `dst` resta invariato.
     fn encode(&mut self, item: T, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let payload = postcard::to_stdvec(&item)?;
         if payload.len() > MAX_FRAME_BYTES {
@@ -102,8 +87,7 @@ where
             });
         }
 
-        // Il controllo qui sopra garantisce `payload.len() <= 1 MiB`: la conversione a
-        // u32 non tronca.
+        // Il controllo sopra garantisce che la lunghezza stia in un u32.
         let len = payload.len() as u32;
         dst.reserve(LENGTH_PREFIX_BYTES + payload.len());
         dst.put_u32(len);
@@ -119,15 +103,12 @@ where
     type Item = T;
     type Error = CodecError;
 
-    /// Estrae da `src` il primo frame completo, se e' gia' arrivato per intero.
-    ///
-    /// Finche' il buffer non contiene l'header o l'intero payload restituisce `Ok(None)`
-    /// senza consumare i byte gia' ricevuti, cosi' che la lettura successiva li ritrovi.
+    /// Estrae il primo frame completo; `Ok(None)` se non e' ancora arrivato per intero.
     ///
     /// # Errori
     ///
-    /// [`CodecError::FrameTooLarge`] se l'header dichiara piu' di [`MAX_FRAME_BYTES`]
-    /// byte e [`CodecError::Serialization`] se il payload non rappresenta un `T`.
+    /// [`CodecError::FrameTooLarge`] se l'header dichiara troppi byte,
+    /// [`CodecError::Serialization`] se il payload non e' un `T`.
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.len() < LENGTH_PREFIX_BYTES {
             return Ok(None);
@@ -137,8 +118,7 @@ where
         header.copy_from_slice(&src[..LENGTH_PREFIX_BYTES]);
         let dichiarata = u64::from(u32::from_be_bytes(header));
 
-        // Il confronto precede ogni `reserve`: un header ostile che dichiara 4 GiB costa
-        // un errore e non la memoria che dichiara.
+        // Il controllo precede ogni `reserve`: un header ostile non fa allocare memoria.
         if dichiarata > MAX_FRAME_BYTES as u64 {
             return Err(CodecError::FrameTooLarge { len: dichiarata });
         }
@@ -146,8 +126,7 @@ where
         let payload_len = dichiarata as usize;
         let frame_len = LENGTH_PREFIX_BYTES + payload_len;
         if src.len() < frame_len {
-            // Payload legittimo ma incompleto: si prepara lo spazio per il resto e si
-            // lascia intatto quanto arrivato finora.
+            // Payload incompleto: si riserva lo spazio e si attende il resto.
             src.reserve(frame_len - src.len());
             return Ok(None);
         }
@@ -187,8 +166,7 @@ mod tests {
         }
     }
 
-    /// Compone a mano un frame: la lunghezza e' un parametro a se' per poter dichiarare
-    /// un valore che non corrisponde al payload effettivo.
+    /// Compone a mano un frame, con una lunghezza dichiarata anche diversa dal payload.
     fn frame_con(lunghezza: u32, payload: &[u8]) -> BytesMut {
         let mut buffer = BytesMut::new();
         buffer.put_u32(lunghezza);
@@ -233,8 +211,7 @@ mod tests {
 
     #[test]
     fn un_frame_parziale_non_consuma_il_buffer() {
-        // Prima meta' header, poi payload incompleto: in nessuno dei due casi i byte
-        // gia' arrivati vanno consumati.
+        // Header o payload incompleti: i byte gia' arrivati non vanno consumati.
         for tagliato_a in [2, frame_di(posizione()).len() - 1] {
             let intero = frame_di(posizione());
             let mut buffer = BytesMut::from(&intero[..tagliato_a]);

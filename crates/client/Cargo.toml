@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Client Georuggine: invia la posizione del veicolo e mostra la flotta in TUI"
+description = "Client Georuggine: simula un veicolo, ne invia la posizione e lo mostra in una TUI"
 
 [lib]
 name = "georuggine_client"

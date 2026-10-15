@@ -1,8 +1,5 @@
-// Punto di ingresso del client Georuggine.
-// Non contiene logica propria: analizza gli argomenti, costruisce e valida la sorgente di
-// posizione, avvia la connessione di rete e cede il controllo alla TUI.
-// Non va mai in panico: ogni guasto diventa un messaggio sullo standard error e un codice
-// di uscita diverso da zero.
+//! Punto di ingresso del client: legge gli argomenti, prepara la sorgente di posizione,
+//! avvia il task di rete e la TUI.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -20,15 +17,14 @@ async fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(errore) => {
-            // Un errore d'uso va sullo standard error e non nel log, quindi viene visto sul terminale
+            // Errore d'uso: va sullo standard error, non nel log.
             eprintln!("{errore}\n\n{USO}");
             return ExitCode::FAILURE;
         }
     };
 
-    // La sorgente si costruisce prima di aprire qualunque connessione: un percorso su file
-    // mancante o illeggibile deve fermare l'avvio finche' c'e' ancora qualcuno che legge
-    // l'errore, non trasformarsi in un veicolo che non si muove, quindi prima della creazione della TUI
+    // La sorgente si costruisce prima della TUI: un file mancante deve fermare l'avvio
+    // con un errore leggibile sul terminale.
     let sorgente = match config.source.build() {
         Ok(sorgente) => sorgente,
         Err(errore) => {
@@ -42,18 +38,15 @@ async fn main() -> ExitCode {
 
     let esito = tui::esegui(&mut handle, stato).await;
 
-    // La TUI e' finita, per `/quit` dell'operatore o per un errore irrecuperabile del
-    // terminale: si chiude e si aspetta il task di rete, non si abbaondona alla distruzione del runtime.
+    // Si attende la chiusura del task di rete, cosi' il Logout parte davvero.
     if !handle.chiudi().await {
         eprintln!("il task di rete non si e' chiuso entro l'attesa");
     }
 
     match esito {
         Ok(Chiusura::Utente) => ExitCode::SUCCESS,
-        // Il task di rete si e' fermato da se', di solito perche' il server ha rifiutato
-        // l'accesso: il motivo si stampa qui, a terminale gia' ripristinato, altrimenti
-        // sparirebbe con lo schermo della TUI e il client sembrerebbe essersi chiuso senza
-        // ragione.
+        // Il task di rete si e' fermato da solo (accesso rifiutato, sessione sostituita):
+        // il motivo si stampa qui, a terminale ripristinato.
         Ok(Chiusura::Rete(motivo)) => {
             eprintln!(
                 "client terminato: {}",

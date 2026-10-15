@@ -1,14 +1,8 @@
-//! Tempo di CPU consumato dal processo, letto dal sistema operativo.
+//! Tempo di CPU consumato dal processo: `getrusage(RUSAGE_SELF)` su Unix,
+//! `GetProcessTimes` su Windows.
 //!
-//! Il tempo di CPU e' cosa diversa dal tempo di orologio: un processo fermo su una
-//! `accept` consuma secondi di orologio ma non di CPU. Serve percio' un contatore per
-//! processo che la libreria standard non espone: `getrusage(RUSAGE_SELF)` su Unix,
-//! `GetProcessTimes` su Windows. Sono chiamate FFI, e questo modulo e' l'unico punto del
-//! progetto in cui il `unsafe` che richiedono e' ammesso.
-//!
-//! I contatori del sistema sono interi con segno o coppie di parole da 32 bit, mentre
-//! [`Duration`] e' senza segno: la conversione e' isolata in una funzione per
-//! piattaforma, che satura invece di traboccare e mappa a zero i valori negativi.
+//! E' l'unico modulo del progetto con codice `unsafe`, necessario per le chiamate FFI.
+//! Le conversioni verso [`Duration`] saturano e portano a zero i valori negativi.
 
 use std::io;
 use std::time::Duration;
@@ -18,49 +12,38 @@ use std::time::Duration;
 pub struct CpuUsage {
     /// Tempo di CPU passato nel codice del processo.
     pub user: Duration,
-    /// Tempo di CPU passato nel kernel per conto del processo (I/O di rete e su file).
+    /// Tempo di CPU passato nel kernel per conto del processo.
     pub system: Duration,
 }
 
 impl CpuUsage {
-    /// Tempo di CPU complessivo.
-    ///
-    /// La somma satura invece di traboccare: l'operatore `+` fra `Duration` va in panico
-    /// in caso di overflow, e il progetto non ammette panici in produzione.
+    /// Tempo di CPU complessivo; la somma satura invece di andare in panico.
     pub fn total(&self) -> Duration {
         self.user.saturating_add(self.system)
     }
 }
 
-/// Legge il tempo di CPU consumato finora dal processo corrente.
+/// Legge il tempo di CPU consumato finora dal processo.
 ///
 /// # Errori
 ///
-/// L'errore del sistema operativo se la chiamata sottostante fallisce, e un errore
-/// [`io::ErrorKind::Unsupported`] sulle piattaforme che non sono ne' Unix ne' Windows.
+/// L'errore del sistema operativo se la chiamata fallisce.
 #[cfg(unix)]
 pub fn process_cpu_usage() -> io::Result<CpuUsage> {
     use std::mem::MaybeUninit;
 
-    // Non serve azzerare la struct: `getrusage` la riempie per intero, e il tipo impedisce
-    // di leggerla prima che sia stata scritta.
     let mut consumo = MaybeUninit::<libc::rusage>::uninit();
 
-    // SAFETY: `consumo.as_mut_ptr()` punta a una `MaybeUninit<rusage>` sullo stack di
-    // questa funzione: non nullo, allineato e grande quanto una `rusage`, quindi la libc
-    // puo' scrivervi l'intera struttura. Il prestito mutabile esclusivo dura per tutta la
-    // chiamata, che e' sincrona, quindi non c'e' aliasing; `getrusage` non conserva il
-    // puntatore oltre il ritorno e scrive senza leggere il contenuto precedente, percio'
-    // passare memoria non inizializzata e' corretto.
+    // SAFETY: il puntatore indica una `MaybeUninit<rusage>` locale, valida, allineata e
+    // non aliasata per tutta la chiamata; `getrusage` la scrive per intero e non conserva
+    // il puntatore.
     let esito = unsafe { libc::getrusage(libc::RUSAGE_SELF, consumo.as_mut_ptr()) };
 
     if esito != 0 {
         return Err(io::Error::last_os_error());
     }
 
-    // SAFETY: `getrusage` ha restituito 0, quindi per contratto ha inizializzato tutti i
-    // campi della `rusage` puntata: la memoria e' un valore valido del tipo. Il ramo di
-    // errore e' gia' uscito sopra.
+    // SAFETY: `getrusage` ha restituito 0, quindi ha inizializzato tutta la struttura.
     let consumo = unsafe { consumo.assume_init() };
 
     Ok(CpuUsage {
@@ -69,10 +52,7 @@ pub fn process_cpu_usage() -> io::Result<CpuUsage> {
     })
 }
 
-/// Converte un `timeval` (secondi piu' microsecondi, con segno) in [`Duration`].
-///
-/// I valori negativi diventano zero: `Duration` non li rappresenta, e un cast `as u64` li
-/// trasformerebbe in durate enormi per wrapping silenzioso.
+/// Converte un `timeval` in [`Duration`]; i valori negativi diventano zero.
 #[cfg(unix)]
 fn da_timeval(valore: libc::timeval) -> Duration {
     let secondi = u64::try_from(valore.tv_sec).unwrap_or(0);
@@ -81,36 +61,28 @@ fn da_timeval(valore: libc::timeval) -> Duration {
     Duration::from_secs(secondi).saturating_add(Duration::from_micros(microsecondi))
 }
 
-/// Legge il tempo di CPU consumato finora dal processo corrente.
+/// Legge il tempo di CPU consumato finora dal processo.
 ///
 /// # Errori
 ///
-/// L'errore del sistema operativo se la chiamata sottostante fallisce, e un errore
-/// [`io::ErrorKind::Unsupported`] sulle piattaforme che non sono ne' Unix ne' Windows.
+/// L'errore del sistema operativo se la chiamata fallisce.
 #[cfg(windows)]
 pub fn process_cpu_usage() -> io::Result<CpuUsage> {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
-    // Creazione e uscita non servono, ma non si possono omettere: l'API non accetta
-    // puntatori nulli.
+    // Creazione e uscita non servono, ma l'API non accetta puntatori nulli.
     let mut creazione = FILETIME::default();
     let mut uscita = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut utente = FILETIME::default();
 
-    // SAFETY: `GetCurrentProcess` non prende parametri e non tocca memoria del chiamante,
-    // quindi non ha precondizioni; il blocco serve solo perche' e' una chiamata FFI.
-    // Restituisce lo pseudo-handle del processo corrente, valido per tutta la vita del
-    // processo e da non chiudere.
+    // SAFETY: `GetCurrentProcess` non ha precondizioni e restituisce uno pseudo-handle
+    // sempre valido, da non chiudere.
     let processo = unsafe { GetCurrentProcess() };
 
-    // SAFETY: `processo` e' lo pseudo-handle appena ottenuto, sempre valido e con i
-    // diritti necessari, perche' un processo puo' sempre interrogare i propri tempi. I
-    // quattro puntatori nascono da variabili locali `FILETIME` distinte e gia'
-    // inizializzate: non nulli, allineati, scrivibili, non aliasati fra loro, e vivi per
-    // tutta la chiamata, che e' sincrona. L'API scrive esattamente un `FILETIME` per
-    // puntatore e non li conserva oltre il ritorno.
+    // SAFETY: l'handle e' valido e i quattro puntatori indicano `FILETIME` locali
+    // distinti, inizializzati e vivi per tutta la chiamata sincrona.
     let esito = unsafe {
         GetProcessTimes(
             processo,
@@ -131,11 +103,8 @@ pub fn process_cpu_usage() -> io::Result<CpuUsage> {
     })
 }
 
-/// Converte un `FILETIME` in [`Duration`].
-///
-/// Come contatore di durata un `FILETIME` e' un intero a 64 bit spezzato in due parole da
-/// 32, in unita' da 100 ns. Si divide in secondi piu' resto invece di passare da
-/// `Duration::from_nanos(unita * 100)`, che per valori grandi traboccherebbe.
+/// Converte un `FILETIME` (unita' da 100 ns su due parole da 32 bit) in [`Duration`],
+/// passando per secondi e resto per non traboccare.
 #[cfg(windows)]
 fn da_filetime(valore: windows_sys::Win32::Foundation::FILETIME) -> Duration {
     /// Unita' da 100 ns contenute in un secondo.
@@ -149,12 +118,11 @@ fn da_filetime(valore: windows_sys::Win32::Foundation::FILETIME) -> Duration {
     Duration::from_secs(unita / UNITA_PER_SECONDO).saturating_add(Duration::from_nanos(resto))
 }
 
-/// Legge il tempo di CPU consumato finora dal processo corrente.
+/// Piattaforme diverse da Unix e Windows: non supportate.
 ///
 /// # Errori
 ///
-/// Sempre [`io::ErrorKind::Unsupported`]: su questa piattaforma non esiste una fonte
-/// equivalente a `getrusage` o `GetProcessTimes`.
+/// Sempre [`io::ErrorKind::Unsupported`].
 #[cfg(not(any(unix, windows)))]
 pub fn process_cpu_usage() -> io::Result<CpuUsage> {
     Err(io::Error::new(
@@ -170,11 +138,8 @@ mod tests {
 
     use std::time::Instant;
 
-    /// Tiene occupata la CPU per almeno `durata` senza sospendere il thread.
-    ///
-    /// Uno `sleep` non andrebbe bene: fa passare il tempo di orologio ma non quello di
-    /// calcolo. Il risultato passa da `black_box` perche' altrimenti l'ottimizzatore
-    /// potrebbe eliminare il ciclo, che non ha altri effetti osservabili.
+    /// Tiene occupata la CPU per almeno `durata`; `black_box` impedisce
+    /// all'ottimizzatore di eliminare il ciclo.
     fn brucia_cpu(durata: Duration) {
         let inizio = Instant::now();
         let mut accumulatore: u64 = 0;
@@ -223,9 +188,8 @@ mod tests {
         );
     }
 
-    // I contatori del sistema sono interi con segno (Unix) o coppie di parole a 32 bit
-    // (Windows), mentre `Duration` e' senza segno: qui si verifica che i valori limite
-    // non traboccino e che quelli negativi non diventino durate enormi.
+    // I valori limite non devono traboccare e quelli negativi non devono diventare
+    // durate enormi.
 
     #[cfg(unix)]
     #[test]

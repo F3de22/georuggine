@@ -1,9 +1,5 @@
-//! Codice condiviso fra il server e il client Georuggine: tipi di dominio, protocollo
-//! di rete con il relativo codec e il trait `Clock`, che la logica di dominio usa al
-//! posto di `Utc::now()`.
-//!
-//! Essendo una libreria, gli errori si modellano con `thiserror` e non con `anyhow`, e
-//! non ci sono `unwrap`/`expect`/`panic!` sui percorsi di produzione.
+//! Codice condiviso fra server e client: tipi di dominio, protocollo, codec di rete e
+//! il trait `Clock`, che permette ai test di controllare il tempo.
 
 pub mod clock;
 pub mod codec;

@@ -1,14 +1,7 @@
-//! Messaggistica del server: avvisi alla flotta, messaggi diretti e testo in arrivo.
+//! Messaggistica del server: avvisi alla flotta, messaggi diretti e testi in arrivo.
 //!
-//! I tre versi passano tutti da [`MessageHub`], che fa sempre le stesse due cose nello
-//! stesso ordine: **prima persiste, poi eventualmente invia**. L'ordine non e'
-//! indifferente, perche' [`Repository::pending_messages`] legge dallo storico ed e' da li'
-//! che un veicolo ritrova, alla connessione successiva, i messaggi arrivati mentre era
-//! spento: un invio non scritto prima sparirebbe se il destinatario non fosse
-//! raggiungibile.
-//!
-//! I metodi del [`Repository`] sono sincroni, quindi ogni scrittura passa da
-//! `tokio::task::spawn_blocking`.
+//! [`MessageHub`] salva sempre il messaggio prima di inviarlo, cosi' un diretto per un
+//! utente scollegato resta in attesa e gli viene consegnato al login successivo.
 
 use std::sync::Arc;
 
@@ -22,11 +15,7 @@ use tokio::task;
 use crate::net::ConnectionRegistry;
 use crate::storage::{MessageDirection, MessageId, Repository, StorageError};
 
-/// Caratteri che un messaggio puo' avere al massimo.
-///
-/// Si conta in caratteri e non in byte, cosi' un testo accentato non vale il doppio di
-/// uno in ASCII puro. Il tetto evita che un corpo smisurato finisca nel database e nella
-/// coda di scrittura di ogni connessione aperta.
+/// Lunghezza massima di un messaggio, in caratteri e non in byte.
 pub const MAX_CARATTERI: usize = 1_024;
 
 /// Errore restituito dalle operazioni di messaggistica.
@@ -43,33 +32,23 @@ pub enum MessagingError {
     /// Errore proveniente dalla persistenza.
     #[error("errore di persistenza: {0}")]
     Storage(#[from] StorageError),
-    /// L'attivita' di `spawn_blocking` che esegue la scrittura non e' arrivata in fondo.
-    ///
-    /// E' una variante a se' e non un riuso di [`MessagingError::Storage`] perche' il
-    /// messaggio dica la causa vera invece di attribuire al database un guasto che non e'
-    /// suo.
+    /// Il task di `spawn_blocking` che esegue la scrittura non e' terminato.
     #[error("attivita' in background non completata: {0}")]
     Task(String),
 }
 
 /// Punto unico da cui passano i messaggi del server.
-///
-/// Ha un solo esemplare, condiviso da tutte le connessioni come le altre dipendenze.
 pub struct MessageHub {
     /// Persistenza dei messaggi, anche di quelli consegnati subito.
     repo: Arc<dyn Repository>,
     /// Connessioni aperte verso cui recapitare.
     registry: Arc<ConnectionRegistry>,
-    /// Sorgente dell'ora: l'hub non chiama mai `Utc::now()` da se'.
+    /// Sorgente dell'ora.
     clock: Arc<dyn Clock>,
 }
 
 impl MessageHub {
     /// Costruisce un hub sulle dipendenze condivise del server.
-    ///
-    /// L'orologio va scelto uguale a quello della persistenza e del livello di rete: gli
-    /// istanti scritti a storico e quelli annunciati ai client devono venire dalla stessa
-    /// sorgente.
     pub fn new(
         repo: Arc<dyn Repository>,
         registry: Arc<ConnectionRegistry>,
@@ -82,18 +61,13 @@ impl MessageHub {
         }
     }
 
-    /// Manda un avviso a tutta la flotta, restituendo quanti destinatari ha raggiunto.
+    /// Manda un avviso a tutti i veicoli connessi e restituisce quanti lo hanno ricevuto.
     ///
-    /// Il messaggio va a storico una volta sola, senza destinatario: non e' in attesa per
-    /// nessuno, e chi era spento non lo ritrova al ritorno. Un destinatario che legge
-    /// troppo piano viene saltato invece di far attendere gli altri, quindi il conteggio
-    /// puo' essere minore del numero di connessioni aperte.
+    /// Un destinatario con la coda piena viene saltato, per non rallentare gli altri.
     ///
     /// # Errori
     ///
-    /// [`MessagingError::TooLong`] se il corpo supera [`MAX_CARATTERI`], e in quel caso
-    /// non viene ne' scritto ne' inviato; [`MessagingError::Storage`] o
-    /// [`MessagingError::Task`] se la scrittura fallisce.
+    /// [`MessagingError::TooLong`] se il testo e' troppo lungo, oppure un errore di scrittura.
     pub async fn broadcast(&self, body: &str) -> Result<usize, MessagingError> {
         let (_, sent_at) = self
             .persisti(None, MessageDirection::Broadcast, body)
@@ -108,17 +82,12 @@ impl MessageHub {
             .await)
     }
 
-    /// Manda un messaggio a un solo veicolo; vero se lo ha raggiunto subito.
-    ///
-    /// Il falso non e' un fallimento: significa che il destinatario non ha una
-    /// connessione aperta e che il messaggio, gia' scritto, lo aspetta in
-    /// [`Repository::pending_messages`].
+    /// Manda un messaggio a un solo utente; `false` se non e' connesso, nel qual caso il
+    /// messaggio resta in attesa del prossimo accesso.
     ///
     /// # Errori
     ///
-    /// [`MessagingError::TooLong`] se il corpo supera [`MAX_CARATTERI`], e in quel caso
-    /// non viene ne' scritto ne' inviato; [`MessagingError::Storage`] o
-    /// [`MessagingError::Task`] se la scrittura fallisce.
+    /// [`MessagingError::TooLong`] se il testo e' troppo lungo, oppure un errore di scrittura.
     pub async fn direct(&self, user_id: UserId, body: &str) -> Result<bool, MessagingError> {
         let (id, sent_at) = self
             .persisti(Some(user_id), MessageDirection::Direct, body)
@@ -136,23 +105,19 @@ impl MessageHub {
             .await;
 
         if consegnato {
-            // Si marca il solo messaggio appena scritto, non tutta l'attesa dell'utente:
-            // quelli che lo precedono possono non essere mai stati recapitati.
+            // Si marca solo questo messaggio: quelli precedenti potrebbero non essere mai
+            // stati recapitati.
             self.marca_consegnato(id).await?;
         }
 
         Ok(consegnato)
     }
 
-    /// Prende in carico il testo che un veicolo ha mandato al server.
-    ///
-    /// Non produce nessun invio: la risposta al client la decide il livello di rete con
-    /// un `Ack`.
+    /// Salva il testo inviato da un veicolo.
     ///
     /// # Errori
     ///
-    /// [`MessagingError::TooLong`] se il corpo supera [`MAX_CARATTERI`];
-    /// [`MessagingError::Storage`] o [`MessagingError::Task`] se la scrittura fallisce.
+    /// [`MessagingError::TooLong`] se il testo e' troppo lungo, oppure un errore di scrittura.
     pub async fn from_user(&self, user_id: UserId, body: &str) -> Result<(), MessagingError> {
         self.persisti(Some(user_id), MessageDirection::Inbound, body)
             .await?;
@@ -160,12 +125,8 @@ impl MessageHub {
         Ok(())
     }
 
-    /// Valida il corpo e lo scrive a storico, restituendo id e istante assegnati.
-    ///
-    /// L'istante torna al chiamante invece di essere riletto dall'orologio al momento
-    /// dell'invio, cosi' la riga nel database e il messaggio che arriva al client portano
-    /// lo stesso `sent_at`. La validazione precede lettura dell'ora e scrittura, quindi
-    /// un messaggio rifiutato non lascia nessuna traccia.
+    /// Valida e salva il messaggio, restituendo id e istante; lo stesso istante viene
+    /// usato nel messaggio inviato al client.
     async fn persisti(
         &self,
         user_id: Option<UserId>,
@@ -175,8 +136,6 @@ impl MessageHub {
         valida_lunghezza(body)?;
 
         let adesso = self.clock.now();
-        // I dati vengono duplicati perche' `spawn_blocking` sposta la chiusura su un
-        // altro thread e richiede quindi che non contenga prestiti.
         let repo = Arc::clone(&self.repo);
         let corpo = body.to_owned();
         let id =
@@ -189,13 +148,11 @@ impl MessageHub {
         Ok((id, adesso))
     }
 
-    /// Segna consegnato il messaggio indicato.
+    /// Segna come consegnato il messaggio indicato.
     ///
     /// # Errori
     ///
-    /// [`MessagingError::Storage`] o [`MessagingError::Task`] se la marcatura fallisce.
-    /// L'errore risale anche se il messaggio era gia' partito: senza la marcatura
-    /// verrebbe riproposto al prossimo accesso, e chi lo ha mandato ha diritto di saperlo.
+    /// Errore di scrittura o del task di `spawn_blocking`.
     async fn marca_consegnato(&self, id: MessageId) -> Result<(), MessagingError> {
         let repo = Arc::clone(&self.repo);
         task::spawn_blocking(move || repo.mark_delivered(id))
@@ -208,12 +165,11 @@ impl MessageHub {
     }
 }
 
-/// Verifica che il corpo stia dentro [`MAX_CARATTERI`].
+/// Verifica che il testo non superi [`MAX_CARATTERI`].
 ///
 /// # Errori
 ///
-/// [`MessagingError::TooLong`] con la lunghezza vera e il massimo ammesso, cosi' il
-/// livello di rete puo' riferirli al client senza ricontarli.
+/// [`MessagingError::TooLong`] con la lunghezza effettiva e quella massima.
 fn valida_lunghezza(body: &str) -> Result<(), MessagingError> {
     let lunghezza = body.chars().count();
 
@@ -255,11 +211,8 @@ mod tests {
         sent_at: DateTime<Utc>,
     }
 
-    /// Repository che delega a quello vero annotando i messaggi scritti.
-    ///
-    /// Serve perche' nessun metodo di [`Repository`] rilegge la direzione di un messaggio
-    /// ne' i messaggi senza destinatario: senza la spia, "persiste con direzione Inbound"
-    /// e "il broadcast finisce comunque a storico" non sarebbero verificabili.
+    /// Repository che delega a quello vero e registra i messaggi scritti, per verificare
+    /// direzione e destinatario anche dove il trait non li espone.
     struct RepositorySpia {
         interno: SqliteRepository,
         scritture: Mutex<Vec<Scrittura>>,
@@ -471,8 +424,7 @@ mod tests {
     #[tokio::test]
     async fn direct_a_un_assente_resta_in_attesa_e_non_va_ad_altri() {
         let banco = banco();
-        // Un altro utente e' connesso: senza di lui il test non distinguerebbe un hub che
-        // sceglie il destinatario sbagliato da uno che non consegna a nessuno.
+        // Un secondo utente connesso verifica che il destinatario sia quello giusto.
         let mut altrui = connetti(&banco, UserId(1)).await;
 
         let consegnato = banco
@@ -511,8 +463,7 @@ mod tests {
                 .expect("l'invio diretto riesce")
         );
 
-        // L'utente si collega e riceve un secondo messaggio: la marcatura di questo non
-        // deve dare per consegnato il primo, che nessuno gli ha ancora recapitato.
+        // Marcare il secondo messaggio non deve segnare come consegnato il primo.
         let mut coda = connetti(&banco, UserId(1)).await;
         assert!(
             banco
@@ -590,9 +541,7 @@ mod tests {
         );
         assert!(e_vuota(&mut coda), "un messaggio rifiutato non parte");
 
-        // 'a' accentata e' un carattere solo ma due byte in UTF-8: un limite contato sui
-        // byte rifiuterebbe questo messaggio, che di caratteri ne ha esattamente il
-        // massimo.
+        // 'a' accentata occupa due byte ma conta come un carattere.
         let accentato = "\u{e0}".repeat(MAX_CARATTERI);
         assert_eq!(accentato.len(), MAX_CARATTERI * 2, "il testo e' multibyte");
         banco
