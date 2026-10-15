@@ -54,6 +54,12 @@ const CAPACITA_EVENTI: usize = 32;
 /// Attesa massima concessa al task di rete per chiudersi in modo ordinato.
 const ATTESA_CHIUSURA: Duration = Duration::from_secs(5);
 
+/// Attesa massima, dopo il `Logout`, perche' il server chiuda la connessione.
+///
+/// Sta sotto [`ATTESA_CHIUSURA`], che la comprende: il server risponde al `Logout` e chiude
+/// in pochi millisecondi, e un secondo basta anche a uno sotto carico.
+const ATTESA_LOGOUT: Duration = Duration::from_secs(1);
+
 /// Testo mostrato da `--help`.
 pub const USO: &str = "\
 Uso: georuggine-client [OPZIONI]
@@ -808,8 +814,7 @@ async fn fase_connessa(
                         }
                     }
                     Some(ClientCommand::Quit) => {
-                        let _ = uscita.send(ClientMessage::Logout).await;
-                        let _ = uscita.close().await;
+                        chiudi_con_logout(ingresso, uscita).await;
                         return EsitoFase::Termina;
                     }
                     None => return EsitoFase::Termina,
@@ -854,6 +859,27 @@ async fn fase_connessa(
             }
         }
     }
+}
+
+/// Manda `Logout` e chiude la connessione in modo ordinato.
+///
+/// Chiudere subito il socket non basta: se il server sta ancora rispondendo alle richieste
+/// precedenti, le sue risposte arrivano a un socket chiuso, il sistema operativo del client
+/// risponde con un reset e il server scarta cio' che aveva ricevuto ma non ancora letto,
+/// cioe' le ultime posizioni e il `Logout` stesso. Si chiude percio' solo il verso di
+/// scrittura e si continua a leggere, scartando, finche' il server non chiude a sua volta,
+/// cosa che fa subito dopo aver confermato il `Logout`; [`ATTESA_LOGOUT`] limita l'attesa
+/// se il server non risponde.
+async fn chiudi_con_logout(
+    ingresso: &mut FramedRead<OwnedReadHalf, ServerCodec>,
+    uscita: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
+) {
+    let _ = uscita.send(ClientMessage::Logout).await;
+    let _ = uscita.close().await;
+    let _ = timeout(ATTESA_LOGOUT, async {
+        while let Some(Ok(_)) = ingresso.next().await {}
+    })
+    .await;
 }
 
 /// Attende il ritardo di backoff, continuando a interrogare la sorgente e a servire i
