@@ -538,7 +538,7 @@ async fn riepiloga(
         formatta_durata(riepilogo.moving_duration_secs),
         formatta_durata(riepilogo.pause_duration_secs),
         riepilogo.stop_count,
-        descrivi_tragitto(&riepilogo.route),
+        descrivi_tragitto(&riepilogo.route, riepilogo.route_points),
     ))
 }
 
@@ -546,8 +546,9 @@ async fn riepiloga(
 ///
 /// Elencare tutti i punti non servirebbe all'operatore, perche' un giorno di invii ogni 30
 /// secondi ne conta migliaia: partenza e arrivo con i loro istanti dicono dove il veicolo
-/// e' andato, e il numero di punti quanto e' fitto il percorso.
-fn descrivi_tragitto(route: &[PositionRecord]) -> String {
+/// e' andato, e il numero di punti quanto e' fitto il percorso. Il numero e' `totale`,
+/// quello del tragitto completo, non la lunghezza di `route`, che puo' essere un campione.
+fn descrivi_tragitto(route: &[PositionRecord], totale: u64) -> String {
     let punto = |posizione: &PositionRecord| {
         format!(
             "{:.6}, {:.6} ({})",
@@ -560,12 +561,7 @@ fn descrivi_tragitto(route: &[PositionRecord]) -> String {
     match route {
         [] => "nessun punto".to_owned(),
         [solo] => format!("1 punto, a {}", punto(solo)),
-        [primo, .., ultimo] => format!(
-            "{} punti, da {} a {}",
-            route.len(),
-            punto(primo),
-            punto(ultimo)
-        ),
+        [primo, .., ultimo] => format!("{totale} punti, da {} a {}", punto(primo), punto(ultimo)),
     }
 }
 

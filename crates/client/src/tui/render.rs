@@ -201,15 +201,16 @@ fn righe_analisi(riepilogo: &MovementSummary) -> Vec<Line<'static>> {
         )),
         Line::from(format!("Soste:       {}", riepilogo.stop_count)),
     ];
-    righe.extend(righe_tragitto(&riepilogo.route));
+    righe.extend(righe_tragitto(&riepilogo.route, riepilogo.route_points));
     righe
 }
 
 /// Il tragitto in poche righe: quanti punti, da dove e fino a dove.
 ///
 /// Il riquadro non ha spazio per migliaia di punti: partenza e arrivo con i loro orari
-/// dicono dove il veicolo e' andato, e il numero di punti quanto e' fitto il percorso.
-fn righe_tragitto(route: &[PositionRecord]) -> Vec<Line<'static>> {
+/// dicono dove il veicolo e' andato, e il numero di punti quanto e' fitto il percorso. Il
+/// numero e' `totale`, quello del tragitto completo: `route` puo' esserne un campione.
+fn righe_tragitto(route: &[PositionRecord], totale: u64) -> Vec<Line<'static>> {
     let punto = |posizione: &PositionRecord| {
         format!(
             "{:.5}, {:.5}  ({})",
@@ -226,7 +227,7 @@ fn righe_tragitto(route: &[PositionRecord]) -> Vec<Line<'static>> {
             Line::from(format!("  in:        {}", punto(solo))),
         ],
         [primo, .., ultimo] => vec![
-            Line::from(format!("Tragitto:    {} punti", route.len())),
+            Line::from(format!("Tragitto:    {totale} punti")),
             Line::from(format!("  da:        {}", punto(primo))),
             Line::from(format!("  a:         {}", punto(ultimo))),
         ],
@@ -282,12 +283,16 @@ mod tests {
 
     #[test]
     fn il_tragitto_mostra_numero_di_punti_partenza_e_arrivo() {
-        let righe = righe_tragitto(&[punto(45.0703, 0), punto(45.0712, 30), punto(45.0721, 60)]);
+        // Tre punti di un campione che ne riassume 2880: conta il totale, non il campione.
+        let righe = righe_tragitto(
+            &[punto(45.0703, 0), punto(45.0712, 30), punto(45.0721, 60)],
+            2_880,
+        );
 
         assert_eq!(
             testo(&righe),
             vec![
-                "Tragitto:    3 punti".to_owned(),
+                "Tragitto:    2880 punti".to_owned(),
                 "  da:        45.07030, 7.68690  (00:00:00)".to_owned(),
                 "  a:         45.07210, 7.68690  (00:01:00)".to_owned(),
             ]
@@ -297,11 +302,11 @@ mod tests {
     #[test]
     fn un_tragitto_vuoto_o_di_un_punto_resta_leggibile() {
         assert_eq!(
-            testo(&righe_tragitto(&[])),
+            testo(&righe_tragitto(&[], 0)),
             vec!["Tragitto:    nessun punto".to_owned()]
         );
         assert_eq!(
-            testo(&righe_tragitto(&[punto(45.0703, 0)])),
+            testo(&righe_tragitto(&[punto(45.0703, 0)], 1)),
             vec![
                 "Tragitto:    1 punto".to_owned(),
                 "  in:        45.07030, 7.68690  (00:00:00)".to_owned(),

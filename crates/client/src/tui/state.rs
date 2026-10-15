@@ -278,6 +278,7 @@ mod tests {
             average_speed_kmh: 36.0,
             stop_count: 0,
             route: Vec::new(),
+            route_points: 0,
         };
         let secondo = MovementSummary {
             total_distance_meters: 200.0,

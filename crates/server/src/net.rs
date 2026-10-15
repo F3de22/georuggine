@@ -53,7 +53,7 @@ use georuggine_common::protocol::{
     AckKind, AnalysisRange, ClientMessage, ErrorCode, PROTOCOL_VERSION, SESSION_REPLACED_MESSAGE,
     ServerMessage,
 };
-use georuggine_common::types::{Coordinate, PositionRecord, UserId, Username};
+use georuggine_common::types::{Coordinate, PositionRecord, UserId, UserState, Username};
 use thiserror::Error;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -1293,10 +1293,24 @@ async fn concludi_autenticazione(
     tracing::info!(%peer, utente = username.as_str(), "accesso riuscito");
 
     // Il token e' la risposta a Register o Login e parte per primo: il client sta
-    // aspettando quello. I messaggi rimasti in attesa lo seguono subito.
+    // aspettando quello. Subito dopo lo stato iniziale, cosi' il client mostra "fermo" fin
+    // dall'accesso invece di uno stato sconosciuto fino al primo cambio; poi i messaggi
+    // rimasti in attesa.
     if !uscita
         .invia(ServerMessage::SessionToken {
             token: token.as_str().to_owned(),
+        })
+        .await
+    {
+        return false;
+    }
+    let stato_iniziale = contesto
+        .stati
+        .current_state(user_id)
+        .unwrap_or(UserState::Still);
+    if !uscita
+        .invia(ServerMessage::StateChanged {
+            state: stato_iniziale,
         })
         .await
     {
@@ -1619,6 +1633,13 @@ mod tests {
                 ServerMessage::SessionToken { .. } => {}
                 altro => panic!("atteso SessionToken, ottenuto {altro:?}"),
             }
+            // Subito dopo il token il server comunica lo stato iniziale.
+            assert_eq!(
+                self.ricevi().await,
+                ServerMessage::StateChanged {
+                    state: UserState::Still
+                }
+            );
         }
 
         async fn registra(&mut self, nome: &str) {

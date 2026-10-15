@@ -1048,6 +1048,13 @@ impl ClientGrezzo {
             ServerMessage::SessionToken { .. } => {}
             altro => panic!("risposta inattesa all'accesso: {altro:?}"),
         }
+        // Subito dopo il token il server comunica lo stato iniziale.
+        match self.ricevi().await {
+            ServerMessage::StateChanged {
+                state: UserState::Still,
+            } => {}
+            altro => panic!("atteso lo stato iniziale, ottenuto {altro:?}"),
+        }
     }
 
     /// Scarta il ritorno a fermo che il battito della macchina a stati puo' avere gia'
