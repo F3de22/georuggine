@@ -184,21 +184,21 @@ impl PositionSource for FileSource {
 
         let zero = *self.zero.get_or_insert(now);
 
-        if let Some(punto) = self.punti.get(self.prossimo).copied() {
-            if now.signed_duration_since(zero) >= punto.offset {
-                self.prossimo += 1;
-                self.ultima = Some(punto.coordinate);
+        if let Some(punto) = self.punti.get(self.prossimo).copied()
+            && now.signed_duration_since(zero) >= punto.offset
+        {
+            self.prossimo += 1;
+            self.ultima = Some(punto.coordinate);
 
-                if self.prossimo >= self.punti.len() {
-                    if self.loop_forever {
-                        self.ricomincia(now);
-                    } else {
-                        self.esaurita = true;
-                    }
+            if self.prossimo >= self.punti.len() {
+                if self.loop_forever {
+                    self.ricomincia(now);
+                } else {
+                    self.esaurita = true;
                 }
-
-                return Some(punto.coordinate);
             }
+
+            return Some(punto.coordinate);
         }
 
         // Nessun punto nuovo e' scaduto: il veicolo e' fermo dove l'abbiamo lasciato.

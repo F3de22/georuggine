@@ -389,19 +389,25 @@ impl ConnectionRegistry {
     /// Serve alla pulizia finale di un gestore: se nel frattempo l'utente si e'
     /// ricollegato, la voce appartiene alla connessione nuova e toglierla scollegherebbe
     /// quella viva. Confronto e rimozione avvengono sotto lo stesso lock in scrittura.
+    ///
+    /// Vero se la voce era davvero di questa connessione ed e' stata tolta; falso se nel
+    /// frattempo la sessione e' passata a un'altra connessione dello stesso utente.
     async fn unregister_se_propria(
         &self,
         user_id: UserId,
         proprio: &mpsc::WeakSender<ServerMessage>,
-    ) {
+    ) -> bool {
         let mut connessioni = self.connessioni.write().await;
 
         let (Some(registrato), Some(nostro)) = (connessioni.get(&user_id), proprio.upgrade())
         else {
-            return;
+            return false;
         };
         if registrato.same_channel(&nostro) {
             connessioni.remove(&user_id);
+            true
+        } else {
+            false
         }
     }
 }
@@ -493,6 +499,8 @@ impl Limitatore {
 struct StatoConnessione {
     /// Utente autenticato, presente solo dopo un accesso riuscito.
     utente: Option<UserId>,
+    /// Username dell'utente autenticato, per i messaggi del log.
+    nome: Option<Username>,
     /// Limite di frequenza delle posizioni di questa connessione.
     limitatore: Limitatore,
 }
@@ -502,6 +510,7 @@ impl StatoConnessione {
     fn nuovo(adesso: DateTime<Utc>) -> Self {
         Self {
             utente: None,
+            nome: None,
             limitatore: Limitatore::nuovo(adesso),
         }
     }
@@ -834,7 +843,7 @@ async fn servi(
     let messaggio = match (stato.utente, messaggio) {
         (None, ClientMessage::Register { username, password }) => {
             let esito = auth::register(&contesto.repo, &contesto.auth, &username, &password).await;
-            return concludi_autenticazione(
+            let aperta = concludi_autenticazione(
                 esito,
                 &username,
                 uscita,
@@ -843,10 +852,14 @@ async fn servi(
                 peer,
             )
             .await;
+            if stato.utente.is_some() {
+                stato.nome = Some(username);
+            }
+            return aperta;
         }
         (None, ClientMessage::Login { username, password }) => {
             let esito = auth::login(&contesto.repo, &username, &password).await;
-            return concludi_autenticazione(
+            let aperta = concludi_autenticazione(
                 esito,
                 &username,
                 uscita,
@@ -855,6 +868,10 @@ async fn servi(
                 peer,
             )
             .await;
+            if stato.utente.is_some() {
+                stato.nome = Some(username);
+            }
+            return aperta;
         }
         (None, _) => {
             return uscita
@@ -905,7 +922,7 @@ async fn servi(
             servi_richiesta_analisi(user_id, range, uscita, contesto, peer).await
         }
         ClientMessage::TextToServer { body } => {
-            servi_testo(user_id, &body, uscita, contesto, peer).await
+            servi_testo(user_id, stato.nome.as_ref(), &body, uscita, contesto, peer).await
         }
         // Hello, Register o Login a sessione gia' aperta: fuori sequenza.
         _ => {
@@ -1006,11 +1023,13 @@ async fn servi_posizione(
 
 /// Prende in carico un testo inviato dal client; vero se la connessione resta aperta.
 ///
-/// Il messaggio viene solo persistito: al client torna un `Ack`, non una risposta di
+/// Il messaggio viene persistito e mostrato nel log del server, cosi' l'operatore lo legge
+/// sulla console senza aprire il database: al client torna un `Ack`, non una risposta di
 /// contenuto. Il testo troppo lungo e' l'unico caso imputabile a cio' che il client ha
 /// mandato, e solo per quello il messaggio d'errore riporta il dettaglio.
 async fn servi_testo(
     user_id: UserId,
+    nome: Option<&Username>,
     body: &str,
     uscita: &Uscita,
     contesto: &ConnectionContext,
@@ -1018,6 +1037,11 @@ async fn servi_testo(
 ) -> bool {
     match contesto.messaging.from_user(user_id, body).await {
         Ok(()) => {
+            // Lo username manca solo se la sessione si e' aperta per una via che non lo
+            // registra: si ripiega sull'id, che basta comunque a ritrovare il mittente.
+            let mittente =
+                nome.map_or_else(|| format!("#{}", user_id.0), |n| n.as_str().to_owned());
+            tracing::info!(%peer, utente = %mittente, testo = body, "messaggio ricevuto da un veicolo");
             uscita
                 .invia(ServerMessage::Ack {
                     request: AckKind::TextToServer,
@@ -1320,13 +1344,21 @@ async fn chiudi_sessione(
         return;
     };
 
-    if let Some(debole) = uscita.debole() {
-        contesto
-            .registry
-            .unregister_se_propria(user_id, debole)
-            .await;
+    let propria = match uscita.debole() {
+        Some(debole) => {
+            contesto
+                .registry
+                .unregister_se_propria(user_id, debole)
+                .await
+        }
+        None => true,
+    };
+    // Una sessione sostituita non segna l'utente come sconnesso: la sessione e' passata a
+    // una connessione nuova dello stesso utente, che e' viva e ha gia' riaperto il suo
+    // stato con `on_connect`.
+    if propria {
+        contesto.stati.on_disconnect(user_id);
     }
-    contesto.stati.on_disconnect(user_id);
 }
 
 #[cfg(test)]
@@ -2460,6 +2492,32 @@ mod tests {
         assert_eq!(
             banco.contesto.registry.connected_users().await,
             vec![UserId(1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn la_chiusura_della_sessione_sostituita_non_segna_l_utente_come_sconnesso() {
+        let banco = avvia_banco().await;
+
+        let mut primo = Cliente::connetti(banco.indirizzo).await;
+        primo.registra("veicolo_01").await;
+        let mut secondo = Cliente::connetti(banco.indirizzo).await;
+        secondo.accedi("veicolo_01").await;
+
+        // L'avviso e poi la chiusura della connessione vecchia.
+        primo.ricevi().await;
+        assert!(primo.e_chiusa().await);
+
+        // La pulizia del gestore vecchio corre dopo la chiusura del socket: si lascia il
+        // tempo di completarla prima di guardare lo stato.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        secondo.invia(ClientMessage::Ping).await;
+        assert_eq!(secondo.ricevi().await, ServerMessage::Pong);
+
+        assert_eq!(
+            banco.stato_di(UserId(1)),
+            Some(UserState::Still),
+            "l'utente e' ancora connesso con la sessione nuova"
         );
     }
 

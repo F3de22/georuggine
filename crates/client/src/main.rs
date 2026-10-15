@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use georuggine_client::core::{Avvio, ClientConfig, ClientHandle, Tempi, USO};
-use georuggine_client::tui::{self, UiState};
+use georuggine_client::tui::{self, Chiusura, UiState};
 use georuggine_common::clock::SystemClock;
 
 #[tokio::main]
@@ -49,7 +49,18 @@ async fn main() -> ExitCode {
     }
 
     match esito {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Chiusura::Utente) => ExitCode::SUCCESS,
+        // Il task di rete si e' fermato da se', di solito perche' il server ha rifiutato
+        // l'accesso: il motivo si stampa qui, a terminale gia' ripristinato, altrimenti
+        // sparirebbe con lo schermo della TUI e il client sembrerebbe essersi chiuso senza
+        // ragione.
+        Ok(Chiusura::Rete(motivo)) => {
+            eprintln!(
+                "client terminato: {}",
+                motivo.as_deref().unwrap_or("connessione chiusa dal server")
+            );
+            ExitCode::FAILURE
+        }
         Err(errore) => {
             eprintln!("interfaccia terminata per un errore: {errore}");
             ExitCode::FAILURE

@@ -14,7 +14,7 @@
 
 use chrono::{DateTime, Utc};
 use georuggine_common::protocol::MovementSummary;
-use georuggine_common::types::{Coordinate, UserState};
+use georuggine_common::types::{Coordinate, PositionRecord, UserState};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -182,7 +182,7 @@ fn pannello_analisi(stato: &UiState) -> Paragraph<'static> {
 
 /// Righe del riepilogo dei movimenti, gia' formattate per essere lette da una persona.
 fn righe_analisi(riepilogo: &MovementSummary) -> Vec<Line<'static>> {
-    vec![
+    let mut righe = vec![
         Line::from(format!(
             "Distanza:    {:.1} m",
             riepilogo.total_distance_meters
@@ -200,7 +200,37 @@ fn righe_analisi(riepilogo: &MovementSummary) -> Vec<Line<'static>> {
             formatta_durata(riepilogo.pause_duration_secs)
         )),
         Line::from(format!("Soste:       {}", riepilogo.stop_count)),
-    ]
+    ];
+    righe.extend(righe_tragitto(&riepilogo.route));
+    righe
+}
+
+/// Il tragitto in poche righe: quanti punti, da dove e fino a dove.
+///
+/// Il riquadro non ha spazio per migliaia di punti: partenza e arrivo con i loro orari
+/// dicono dove il veicolo e' andato, e il numero di punti quanto e' fitto il percorso.
+fn righe_tragitto(route: &[PositionRecord]) -> Vec<Line<'static>> {
+    let punto = |posizione: &PositionRecord| {
+        format!(
+            "{:.5}, {:.5}  ({})",
+            posizione.coordinate.lat(),
+            posizione.coordinate.lon(),
+            posizione.recorded_at.format("%H:%M:%S")
+        )
+    };
+
+    match route {
+        [] => vec![Line::from("Tragitto:    nessun punto")],
+        [solo] => vec![
+            Line::from("Tragitto:    1 punto"),
+            Line::from(format!("  in:        {}", punto(solo))),
+        ],
+        [primo, .., ultimo] => vec![
+            Line::from(format!("Tragitto:    {} punti", route.len())),
+            Line::from(format!("  da:        {}", punto(primo))),
+            Line::from(format!("  a:         {}", punto(ultimo))),
+        ],
+    }
 }
 
 /// Durata in secondi come la legge una persona: `2h 05m 30s`, `5m 30s`, `30s`.
@@ -229,4 +259,53 @@ fn pannello_input(stato: &UiState) -> Paragraph<'static> {
             " Input: /msg <testo> · /pos <lat> <lon> · /analisi <today|week|month> · /quit ",
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use georuggine_common::types::UserId;
+
+    fn punto(lat: f64, secondi: i64) -> PositionRecord {
+        PositionRecord {
+            user_id: UserId(1),
+            coordinate: Coordinate::new(lat, 7.6869).expect("coordinata di test valida"),
+            recorded_at: DateTime::from_timestamp(1_704_067_200 + secondi, 0)
+                .expect("istante valido"),
+        }
+    }
+
+    fn testo(righe: &[Line<'_>]) -> Vec<String> {
+        righe.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn il_tragitto_mostra_numero_di_punti_partenza_e_arrivo() {
+        let righe = righe_tragitto(&[punto(45.0703, 0), punto(45.0712, 30), punto(45.0721, 60)]);
+
+        assert_eq!(
+            testo(&righe),
+            vec![
+                "Tragitto:    3 punti".to_owned(),
+                "  da:        45.07030, 7.68690  (00:00:00)".to_owned(),
+                "  a:         45.07210, 7.68690  (00:01:00)".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn un_tragitto_vuoto_o_di_un_punto_resta_leggibile() {
+        assert_eq!(
+            testo(&righe_tragitto(&[])),
+            vec!["Tragitto:    nessun punto".to_owned()]
+        );
+        assert_eq!(
+            testo(&righe_tragitto(&[punto(45.0703, 0)])),
+            vec![
+                "Tragitto:    1 punto".to_owned(),
+                "  in:        45.07030, 7.68690  (00:00:00)".to_owned(),
+            ]
+        );
+    }
 }
