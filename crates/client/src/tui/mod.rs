@@ -49,6 +49,19 @@ use crate::core::{ClientCommand, ClientHandle};
 /// Intervallo fra un `poll` di tastiera e il successivo: circa 20 fotogrammi al secondo.
 const INTERVALLO_POLL: Duration = Duration::from_millis(50);
 
+/// Perche' la TUI si e' chiusa.
+///
+/// Serve al chiamante per decidere che cosa dire una volta ripristinato il terminale: un
+/// messaggio scritto mentre lo schermo alternativo e' attivo sparirebbe con esso.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Chiusura {
+    /// L'operatore ha chiesto di uscire, con `/quit` o con Ctrl+C.
+    Utente,
+    /// Il task di rete e' terminato da se' (accesso rifiutato, versione incompatibile,
+    /// sessione sostituita); il campo riporta l'ultimo errore ricevuto, se c'e'.
+    Rete(Option<String>),
+}
+
 /// Avvia la TUI: inizializza il terminale, ci gira dentro finche' l'operatore non chiede di
 /// uscire (o la connessione termina in modo non recuperabile), poi lo ripristina.
 ///
@@ -63,11 +76,13 @@ const INTERVALLO_POLL: Duration = Duration::from_millis(50);
 /// L'handle arriva per riferimento: chiuderlo con `ClientHandle::chiudi` e' responsabilita'
 /// di chi lo ha avviato, e consumarlo qui lo lascerebbe cadere senza attenderlo.
 ///
+/// Restituisce il motivo della chiusura, che il chiamante mostra a terminale ripristinato.
+///
 /// # Errori
 ///
 /// L'errore di I/O se l'inizializzazione del terminale, il disegno di un fotogramma o la
 /// lettura di un evento di tastiera falliscono.
-pub async fn esegui(handle: &mut ClientHandle, mut stato: UiState) -> io::Result<()> {
+pub async fn esegui(handle: &mut ClientHandle, mut stato: UiState) -> io::Result<Chiusura> {
     let mut terminal = ratatui::try_init()?;
 
     let esito = ciclo_principale(&mut terminal, handle, &mut stato).await;
@@ -82,7 +97,7 @@ async fn ciclo_principale(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     handle: &mut ClientHandle,
     stato: &mut UiState,
-) -> io::Result<()> {
+) -> io::Result<Chiusura> {
     loop {
         terminal.draw(|frame| render::disegna(frame, stato))?;
 
@@ -92,7 +107,7 @@ async fn ciclo_principale(
             if tasto.kind == KeyEventKind::Press
                 && !gestisci_tasto(tasto, stato, &handle.command_tx).await
             {
-                return Ok(());
+                return Ok(Chiusura::Utente);
             }
         }
 
@@ -101,8 +116,11 @@ async fn ciclo_principale(
                 Ok(evento) => stato.applica_evento(evento, Utc::now()),
                 Err(TryRecvError::Empty) => break,
                 // Il task di rete e' terminato: non arriveranno altri eventi, quindi anche
-                // la TUI chiude.
-                Err(TryRecvError::Disconnected) => return Ok(()),
+                // la TUI chiude. Il motivo e' l'ultimo errore ricevuto, che gli eventi
+                // appena drenati hanno gia' scritto nello stato.
+                Err(TryRecvError::Disconnected) => {
+                    return Ok(Chiusura::Rete(stato.ultimo_errore.clone()));
+                }
             }
         }
     }

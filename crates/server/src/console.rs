@@ -8,7 +8,7 @@
 //! # Come si scrivono i comandi
 //!
 //! ```text
-//! /utenti                                  elenco dei veicoli connessi
+//! /utenti                                  elenco dei veicoli e del loro stato
 //! /broadcast <testo>                       avviso a tutta la flotta
 //! /msg <username> <testo>                  messaggio diretto a un veicolo
 //! /analisi <username> <today|week|month>   riepilogo dei movimenti
@@ -23,17 +23,17 @@
 //! [`str::split_whitespace`], mai indicizzando i byte: una riga multibyte non puo' far
 //! cadere il server su un indice fuori da un confine di carattere.
 //!
-//! `/utenti` mostra "connesso" e non lo stato di movimento, che vive in
-//! [`StateTracker`](crate::state::StateTracker) e non e' fra le dipendenze della console.
-//! L'ultima posizione nota si ottiene leggendo tutto lo storico e tenendone la coda,
-//! perche' il [`Repository`] non ha un metodo dedicato.
+//! `/utenti` elenca tutti gli utenti registrati con lo stato (sconnesso, fermo o in
+//! movimento): la connessione la dice il registro, il movimento lo
+//! [`StateTracker`]. L'ultima posizione nota si ottiene leggendo tutto lo storico e
+//! tenendone la coda, perche' il [`Repository`] non ha un metodo dedicato.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use georuggine_common::clock::Clock;
 use georuggine_common::protocol::AnalysisRange;
-use georuggine_common::types::{PositionRecord, UserId};
+use georuggine_common::types::{PositionRecord, UserId, UserState};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::task;
@@ -41,12 +41,13 @@ use tokio::task;
 use crate::analysis::{self, AnalysisRangeExt as _};
 use crate::messaging::{MessageHub, MessagingError};
 use crate::net::ConnectionRegistry;
+use crate::state::StateTracker;
 use crate::storage::{Repository, StorageError};
 
 /// Elenco dei comandi, stampato da `/aiuto`.
 const AIUTO: &str = "\
 Comandi disponibili:
-  /utenti                                  elenco dei veicoli connessi, con ultima posizione
+  /utenti                                  elenco dei veicoli con stato e ultima posizione
   /broadcast <testo>                       manda un avviso a tutta la flotta
   /msg <username> <testo>                  manda un messaggio diretto a un veicolo
   /analisi <username> <today|week|month>   riepiloga i movimenti di un veicolo
@@ -163,6 +164,8 @@ pub struct ConsoleContext {
     pub messaging: Arc<MessageHub>,
     /// Sorgente dell'ora: la console non chiama mai `Utc::now()` da se'.
     pub clock: Arc<dyn Clock>,
+    /// Macchina a stati fermo/movimento, la stessa che il livello di rete aggiorna.
+    pub stati: Arc<StateTracker>,
     /// Canale su cui `/esci` annuncia lo spegnimento.
     pub shutdown: broadcast::Sender<()>,
 }
@@ -339,7 +342,10 @@ fn riferisci(esito: Result<String, ErroreEsecuzione>) -> Esito {
     }
 }
 
-/// Elenca i veicoli connessi con la loro ultima posizione nota.
+/// Elenca tutti i veicoli registrati con il loro stato e l'ultima posizione nota.
+///
+/// Lo stato combina due fonti: chi non ha una voce nel registro delle connessioni e'
+/// sconnesso; per chi ce l'ha, fermo o in movimento lo dice lo [`StateTracker`].
 ///
 /// # Errori
 ///
@@ -347,56 +353,73 @@ fn riferisci(esito: Result<String, ErroreEsecuzione>) -> Esito {
 /// leggibile.
 async fn elenca_utenti(contesto: &ConsoleContext) -> Result<String, ErroreEsecuzione> {
     let connessi = contesto.registry.connected_users().await;
-    if connessi.is_empty() {
-        return Ok("Nessun veicolo connesso.".to_owned());
-    }
-
     let repo = Arc::clone(&contesto.repo);
     let adesso = contesto.clock.now();
-    let voci = in_background(move || raccogli_voci(repo.as_ref(), &connessi, adesso)).await?;
+    let voci = in_background(move || raccogli_voci(repo.as_ref(), adesso)).await?;
 
-    let mut testo = format!("Veicoli connessi ({}):", voci.len());
+    if voci.is_empty() {
+        return Ok("Nessun veicolo registrato.".to_owned());
+    }
+
+    let quanti_connessi = voci
+        .iter()
+        .filter(|voce| connessi.contains(&voce.id))
+        .count();
+    let mut testo = format!(
+        "Veicoli registrati ({}), di cui {}:",
+        voci.len(),
+        concorda(quanti_connessi, "connesso", "connessi")
+    );
     for voce in &voci {
+        let stato = stato_di(voce.id, &connessi, &contesto.stati);
         testo.push_str("\n  ");
-        testo.push_str(&voce.riga());
+        testo.push_str(&voce.riga(stato));
     }
 
     Ok(testo)
 }
 
-/// Riga dell'elenco di `/utenti`: chi e' connesso e dove si trovava l'ultima volta.
+/// Stato da mostrare per un utente.
+///
+/// Un utente connesso di cui la macchina a stati non sa ancora nulla e' fermo: e' lo stato
+/// con cui ogni sessione si apre.
+fn stato_di(id: UserId, connessi: &[UserId], stati: &StateTracker) -> UserState {
+    if !connessi.contains(&id) {
+        return UserState::Disconnected;
+    }
+    match stati.current_state(id) {
+        Some(UserState::Moving) => UserState::Moving,
+        _ => UserState::Still,
+    }
+}
+
+/// Riga dell'elenco di `/utenti`: chi e' il veicolo e dove si trovava l'ultima volta.
 struct Voce {
-    /// Identificatore dell'utente connesso.
+    /// Identificatore dell'utente.
     id: UserId,
-    /// Username, assente se il repository non conosce piu' quell'id.
-    nome: Option<String>,
+    /// Username dell'utente.
+    nome: String,
     /// Ultima posizione nota, assente se l'utente non ne ha mai inviata una.
     ultima: Option<PositionRecord>,
 }
 
 impl Voce {
-    /// Riga da mostrare all'operatore.
-    fn riga(&self) -> String {
-        // Un utente connesso e' per forza registrato: il caso senza nome puo' nascere
-        // solo da un archivio manomesso, e mostrare l'id e' piu' utile che tacere.
-        let nome = self
-            .nome
-            .clone()
-            .unwrap_or_else(|| format!("#{} (utente non registrato)", self.id.0));
-
+    /// Riga da mostrare all'operatore, con lo stato dell'utente.
+    fn riga(&self, stato: UserState) -> String {
         match &self.ultima {
             Some(posizione) => format!(
-                "{nome}  connesso  ultimo contatto {} a {:.6}, {:.6}",
+                "{}  {stato}  ultimo contatto {} a {:.6}, {:.6}",
+                self.nome,
                 istante(posizione.recorded_at),
                 posizione.coordinate.lat(),
                 posizione.coordinate.lon(),
             ),
-            None => format!("{nome}  connesso  nessuna posizione registrata"),
+            None => format!("{}  {stato}  nessuna posizione registrata", self.nome),
         }
     }
 }
 
-/// Raccoglie nome e ultima posizione di ogni utente connesso.
+/// Raccoglie nome e ultima posizione di ogni utente registrato, in ordine di id.
 ///
 /// E' sincrona perche' il [`Repository`] lo e': il chiamante la porta su un thread da
 /// lavoro. Le letture stanno in una chiamata sola invece di una per utente, cosi' il
@@ -405,29 +428,21 @@ impl Voce {
 /// # Errori
 ///
 /// [`StorageError`] se l'elenco degli utenti o lo storico non sono leggibili.
-fn raccogli_voci(
-    repo: &dyn Repository,
-    connessi: &[UserId],
-    adesso: DateTime<Utc>,
-) -> Result<Vec<Voce>, StorageError> {
-    let utenti = repo.list_users()?;
+fn raccogli_voci(repo: &dyn Repository, adesso: DateTime<Utc>) -> Result<Vec<Voce>, StorageError> {
     let fine = fine_dello_storico(adesso);
 
-    connessi
-        .iter()
-        .map(|id| {
-            let nome = utenti
-                .iter()
-                .find(|utente| utente.id == *id)
-                .map(|utente| utente.username.as_str().to_owned());
+    repo.list_users()?
+        .into_iter()
+        .map(|utente| {
             // Manca un modo diretto di chiedere l'ultima posizione: si legge lo storico e
             // se ne tiene la coda, che e' la piu' recente perche' `positions_in_range`
             // ordina per `recorded_at` crescente.
-            let mut posizioni = repo.positions_in_range(*id, DateTime::<Utc>::MIN_UTC, fine)?;
+            let mut posizioni =
+                repo.positions_in_range(utente.id, DateTime::<Utc>::MIN_UTC, fine)?;
 
             Ok(Voce {
-                id: *id,
-                nome,
+                id: utente.id,
+                nome: utente.username.as_str().to_owned(),
                 ultima: posizioni.pop(),
             })
         })
@@ -512,7 +527,8 @@ async fn riepiloga(
          velocita' media:    {:.1} km/h\n  \
          tempo in movimento: {}\n  \
          tempo in pausa:     {}\n  \
-         soste:              {}",
+         soste:              {}\n  \
+         tragitto:           {}",
         nome_intervallo(range),
         istante(from),
         istante(to),
@@ -522,7 +538,35 @@ async fn riepiloga(
         formatta_durata(riepilogo.moving_duration_secs),
         formatta_durata(riepilogo.pause_duration_secs),
         riepilogo.stop_count,
+        descrivi_tragitto(&riepilogo.route),
     ))
+}
+
+/// Il tragitto in una riga: quanti punti, da dove e fino a dove.
+///
+/// Elencare tutti i punti non servirebbe all'operatore, perche' un giorno di invii ogni 30
+/// secondi ne conta migliaia: partenza e arrivo con i loro istanti dicono dove il veicolo
+/// e' andato, e il numero di punti quanto e' fitto il percorso.
+fn descrivi_tragitto(route: &[PositionRecord]) -> String {
+    let punto = |posizione: &PositionRecord| {
+        format!(
+            "{:.6}, {:.6} ({})",
+            posizione.coordinate.lat(),
+            posizione.coordinate.lon(),
+            istante(posizione.recorded_at),
+        )
+    };
+
+    match route {
+        [] => "nessun punto".to_owned(),
+        [solo] => format!("1 punto, a {}", punto(solo)),
+        [primo, .., ultimo] => format!(
+            "{} punti, da {} a {}",
+            route.len(),
+            punto(primo),
+            punto(ultimo)
+        ),
+    }
 }
 
 /// Cerca l'id dell'utente che ha lo username indicato.
@@ -850,6 +894,7 @@ mod tests {
                 registry,
                 messaging,
                 clock: Arc::clone(&orologio) as Arc<dyn Clock>,
+                stati: Arc::new(StateTracker::new(Arc::clone(&orologio) as Arc<dyn Clock>)),
                 shutdown: broadcast::channel(1).0,
             },
             repo,
@@ -889,35 +934,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn utenti_elenca_i_soli_connessi_con_l_ultima_posizione() {
+    async fn utenti_elenca_tutti_i_registrati_con_stato_e_ultima_posizione() {
         let banco = banco();
         assert_eq!(
             esegui(Comando::Utenti, &banco.contesto).await.testo,
-            "Nessun veicolo connesso."
+            "Nessun veicolo registrato."
         );
 
         let primo = registra(&banco, "veicolo_01");
         let secondo = registra(&banco, "veicolo_02");
-        // Il terzo utente e' registrato ma non collegato: non deve comparire.
+        // Il terzo utente e' registrato ma non collegato: compare come sconnesso.
         registra(&banco, "veicolo_03");
         let _code = (
             connetti(&banco, primo).await,
             connetti(&banco, secondo).await,
         );
+        // Il primo si sposta di circa 100 m fra due posizioni: e' in movimento. Il secondo
+        // si e' appena collegato e non ha ancora inviato nulla: e' fermo.
+        banco.contesto.stati.on_connect(primo);
+        banco.contesto.stati.on_connect(secondo);
+        let partenza = Coordinate::new(LAT_PARTENZA, LON_PARTENZA).expect("coordinata valida");
+        let arrivo = Coordinate::new(LAT_PARTENZA + GRADI_PER_CENTO_METRI, LON_PARTENZA)
+            .expect("coordinata valida");
+        banco.contesto.stati.on_position(primo, partenza);
+        banco.contesto.stati.on_position(primo, arrivo);
         registra_posizione(&banco, primo, 0.0, -120);
         registra_posizione(&banco, primo, 1.0, -60);
 
         let esito = esegui(Comando::Utenti, &banco.contesto).await;
 
         assert!(
-            esito.testo.starts_with("Veicoli connessi (2):"),
+            esito
+                .testo
+                .starts_with("Veicoli registrati (3), di cui 2 connessi:"),
             "intestazione inattesa: {}",
             esito.testo
         );
         assert!(
             esito
                 .testo
-                .contains("veicolo_01  connesso  ultimo contatto"),
+                .contains("veicolo_01  In movimento  ultimo contatto"),
             "manca il primo veicolo: {}",
             esito.testo
         );
@@ -931,13 +987,15 @@ mod tests {
         assert!(
             esito
                 .testo
-                .contains("veicolo_02  connesso  nessuna posizione registrata"),
+                .contains("veicolo_02  Fermo  nessuna posizione registrata"),
             "manca il secondo veicolo: {}",
             esito.testo
         );
         assert!(
-            !esito.testo.contains("veicolo_03"),
-            "un utente non connesso non va elencato: {}",
+            esito
+                .testo
+                .contains("veicolo_03  Disconnesso  nessuna posizione registrata"),
+            "un utente non connesso va elencato come sconnesso: {}",
             esito.testo
         );
     }
@@ -1079,6 +1137,8 @@ mod tests {
             "tempo in movimento: 1m 30s",
             "tempo in pausa:     0s",
             "soste:              0",
+            "tragitto:           10 punti, da 45.070300, 7.686900",
+            "a 45.078400, 7.686900",
         ] {
             assert!(
                 esito.testo.contains(atteso),
@@ -1108,6 +1168,7 @@ mod tests {
             esito.testo
         );
         assert!(esito.testo.contains("distanza percorsa:  0.0 m"));
+        assert!(esito.testo.contains("tragitto:           nessun punto"));
     }
 
     #[tokio::test]

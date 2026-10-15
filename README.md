@@ -17,7 +17,8 @@ postcard e framing a prefisso di lunghezza. Le dipendenze vanno da `common` vers
 
 ## Requisiti
 
-- Rust stabile **1.85 o superiore** (edition 2024), via [rustup](https://rustup.rs).
+- Rust stabile **1.88 o superiore** (edition 2024; la versione minima la impone
+  `ratatui` 0.30), via [rustup](https://rustup.rs).
 - Un compilatore C, richiesto da `rusqlite` con feature `bundled` che compila SQLite dai
   sorgenti: `build-essential` su Linux, Command Line Tools su macOS, Build Tools per Visual
   Studio con workload C++ su Windows.

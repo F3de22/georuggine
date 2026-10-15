@@ -123,6 +123,7 @@ async fn avvia(config: ServerConfig) -> anyhow::Result<()> {
         registry: Arc::clone(&registry),
         messaging: Arc::clone(&messaging),
         clock: Arc::clone(&orologio),
+        stati: Arc::clone(&stati),
         shutdown: spegnimento.clone(),
     });
 
