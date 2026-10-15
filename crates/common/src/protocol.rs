@@ -27,7 +27,10 @@ use thiserror::Error;
 use crate::types::{Coordinate, PositionRecord, UserState, Username};
 
 /// Versione del protocollo implementata da questo crate, scambiata nell'handshake.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// La 2 ha aggiunto [`MovementSummary::route_points`]: un campo in piu' cambia la
+/// codifica del riepilogo, e un peer della versione 1 lo leggerebbe male senza accorgersene.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Testo con cui il server annuncia che la sessione e' stata sostituita da una nuova
 /// connessione dello stesso utente.
@@ -203,8 +206,13 @@ pub struct MovementSummary {
     pub average_speed_kmh: f64,
     /// Numero di soste rilevate.
     pub stop_count: u32,
-    /// Posizioni che compongono il percorso, in ordine cronologico.
+    /// Tragitto percorso, in ordine cronologico: tutte le posizioni analizzate se sono
+    /// poche, altrimenti un loro campione a intervalli regolari che comprende sempre la
+    /// prima e l'ultima. Il campione tiene il messaggio ben sotto il limite di un frame
+    /// anche su un mese di dati.
     pub route: Vec<PositionRecord>,
+    /// Numero di posizioni del tragitto completo, prima del campionamento.
+    pub route_points: u64,
 }
 
 #[cfg(test)]
@@ -251,6 +259,7 @@ mod tests {
                 coordinate: coordinata(45.0703, 7.6869),
                 recorded_at: istante(1_700_000_000),
             }],
+            route_points: 1,
         }
     }
 

@@ -37,6 +37,14 @@ const MINUTI_IN_UN_GIORNO: u32 = 24 * 60;
 /// Passo in minuti della stessa ricerca.
 const PASSO_RICERCA_MINUTI: usize = 15;
 
+/// Punti al massimo nel tragitto di un riepilogo.
+///
+/// Una posizione occupa circa 45 byte sul filo: mille punti stanno sotto i 50 KB, molto
+/// lontano dal MiB di un frame, mentre un mese di invii ogni 30 secondi ne conterebbe
+/// decine di migliaia e non si potrebbe nemmeno spedire. Mille bastano a disegnare il
+/// percorso di un giorno con un punto ogni minuto e mezzo circa.
+pub const MAX_PUNTI_TRAGITTO: usize = 1_000;
+
 /// Riepiloga i movimenti descritti da una sequenza di posizioni.
 ///
 /// # Precondizione
@@ -58,8 +66,9 @@ const PASSO_RICERCA_MINUTI: usize = 15;
 /// secondi in movimento vale `0.0` e mai `NaN` o infinito. Con meno di due posizioni non
 /// esiste nessun segmento e tutti i campi numerici valgono zero.
 ///
-/// Il costo e' lineare, ma `route` e' una copia dell'intero ingresso: su percorsi da
-/// qualche migliaio di punti la memoria cresce di conseguenza.
+/// Distanze e durate si calcolano su **tutte** le posizioni; solo `route`, il tragitto
+/// restituito, e' un campione di al massimo [`MAX_PUNTI_TRAGITTO`] punti (vedi
+/// [`campiona_tragitto`]), mentre `route_points` dice quante erano in origine.
 pub fn analyze(positions: &[PositionRecord]) -> MovementSummary {
     let mut total_distance_meters = 0.0;
     let mut moving_duration_secs: u64 = 0;
@@ -98,8 +107,36 @@ pub fn analyze(positions: &[PositionRecord]) -> MovementSummary {
         pause_duration_secs,
         average_speed_kmh: velocita_media_kmh(total_distance_meters, moving_duration_secs),
         stop_count,
-        route: positions.to_vec(),
+        route: campiona_tragitto(positions, MAX_PUNTI_TRAGITTO),
+        route_points: u64::try_from(positions.len()).unwrap_or(u64::MAX),
     }
+}
+
+/// Riduce il tragitto ad al massimo `massimo` punti presi a intervalli regolari.
+///
+/// Sotto il limite il tragitto torna intero. Sopra, il punto `i` del campione e' la
+/// posizione di indice `i * (n - 1) / (massimo - 1)`: il primo e l'ultimo restano sempre
+/// quelli veri, cosi' partenza e arrivo non cambiano, e gli indici crescono strettamente
+/// perche' `n > massimo`, quindi nessun punto si ripete e l'ordine cronologico resta.
+fn campiona_tragitto(positions: &[PositionRecord], massimo: usize) -> Vec<PositionRecord> {
+    let n = positions.len();
+    if n <= massimo {
+        return positions.to_vec();
+    }
+    // Con meno di due punti non c'e' un intervallo da dividere: la formula sotto
+    // dividerebbe per zero.
+    if massimo < 2 {
+        return positions.iter().take(massimo).cloned().collect();
+    }
+
+    (0..massimo)
+        .filter_map(|i| {
+            // Il prodotto non trabocca: `i < massimo` e `n` e' la lunghezza di una fetta,
+            // e su 64 bit servirebbero miliardi di miliardi di posizioni.
+            let indice = i.saturating_mul(n - 1) / (massimo - 1);
+            positions.get(indice).cloned()
+        })
+        .collect()
 }
 
 /// Aggiunge una sosta al conteggio se la pausa appena chiusa era abbastanza lunga.
@@ -622,5 +659,52 @@ mod tests {
                 .expect("istante valido")
                 .and_utc()
         );
+    }
+
+    #[test]
+    fn un_tragitto_lungo_viene_campionato_ma_i_totali_restano_completi() {
+        // Un mese abbondante di invii ogni 30 secondi, un passo di 100 m ciascuno.
+        let posizioni: Vec<PositionRecord> = (0..50_000)
+            .map(|i| punto(f64::from(i % 100), 0.0, i64::from(i) * 30))
+            .collect();
+
+        let riepilogo = analyze(&posizioni);
+
+        assert_eq!(riepilogo.route_points, 50_000);
+        assert_eq!(riepilogo.route.len(), MAX_PUNTI_TRAGITTO);
+        assert_eq!(
+            riepilogo.route.first(),
+            posizioni.first(),
+            "la partenza resta vera"
+        );
+        assert_eq!(
+            riepilogo.route.last(),
+            posizioni.last(),
+            "l'arrivo resta vero"
+        );
+        assert!(
+            riepilogo
+                .route
+                .windows(2)
+                .all(|coppia| coppia[0].recorded_at < coppia[1].recorded_at),
+            "il campione resta in ordine cronologico e senza ripetizioni"
+        );
+        // Le durate si calcolano su tutte le posizioni, non sul campione.
+        assert_eq!(
+            riepilogo.moving_duration_secs + riepilogo.pause_duration_secs,
+            49_999 * 30
+        );
+    }
+
+    #[test]
+    fn un_tragitto_corto_torna_intero() {
+        let posizioni: Vec<PositionRecord> = (0..10)
+            .map(|i| punto(f64::from(i), 0.0, i64::from(i) * 10))
+            .collect();
+
+        let riepilogo = analyze(&posizioni);
+
+        assert_eq!(riepilogo.route, posizioni);
+        assert_eq!(riepilogo.route_points, 10);
     }
 }
