@@ -106,7 +106,7 @@ async fn le_posizioni_prodotte_da_scollegato_partono_al_rientro() {
         cliente
             .attendi(
                 "l'invio di una posizione accumulata",
-                |evento| matches!(evento, ClientEvent::PositionSent(dove) if *dove == atteso),
+                |evento| matches!(evento, ClientEvent::PositionSent(dove, _) if *dove == atteso),
             )
             .await;
     }

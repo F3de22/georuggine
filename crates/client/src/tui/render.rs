@@ -89,7 +89,7 @@ fn testo_movimento(stato: Option<UserState>) -> String {
 fn testo_ultima_posizione(ultima: Option<(Coordinate, DateTime<Utc>)>) -> String {
     match ultima {
         Some((coordinate, quando)) => format!(
-            "{:.5}, {:.5}  ({})",
+            "{:.6}, {:.6}  ({})",
             coordinate.lat(),
             coordinate.lon(),
             quando.format("%H:%M:%S")
@@ -107,7 +107,7 @@ fn pannello_storico(stato: &UiState) -> List<'static> {
         .rev()
         .map(|(coordinate, quando, distanza)| {
             ListItem::new(format!(
-                "{}  {:.5}, {:.5}  Δ{:.1} m",
+                "{}  {:.6}, {:.6}  Δ{:.1} m",
                 quando.format("%H:%M:%S"),
                 coordinate.lat(),
                 coordinate.lon(),
@@ -193,7 +193,7 @@ fn righe_analisi(riepilogo: &MovementSummary) -> Vec<Line<'static>> {
 fn righe_tragitto(route: &[PositionRecord], totale: u64) -> Vec<Line<'static>> {
     let punto = |posizione: &PositionRecord| {
         format!(
-            "{:.5}, {:.5}  ({})",
+            "{:.6}, {:.6}  ({})",
             posizione.coordinate.lat(),
             posizione.coordinate.lon(),
             posizione.recorded_at.format("%H:%M:%S")
@@ -270,8 +270,8 @@ mod tests {
             testo(&righe),
             vec![
                 "Tragitto:    2880 punti".to_owned(),
-                "  da:        45.07030, 7.68690  (00:00:00)".to_owned(),
-                "  a:         45.07210, 7.68690  (00:01:00)".to_owned(),
+                "  da:        45.070300, 7.686900  (00:00:00)".to_owned(),
+                "  a:         45.072100, 7.686900  (00:01:00)".to_owned(),
             ]
         );
     }
@@ -286,7 +286,7 @@ mod tests {
             testo(&righe_tragitto(&[punto(45.0703, 0)], 1)),
             vec![
                 "Tragitto:    1 punto".to_owned(),
-                "  in:        45.07030, 7.68690  (00:00:00)".to_owned(),
+                "  in:        45.070300, 7.686900  (00:00:00)".to_owned(),
             ]
         );
     }

@@ -768,7 +768,7 @@ impl TestClient {
         self.comanda(ClientCommand::SetManualPosition(dove)).await;
         self.attendi(
             "l'invio della posizione",
-            |evento| matches!(evento, ClientEvent::PositionSent(coordinate) if *coordinate == dove),
+            |evento| matches!(evento, ClientEvent::PositionSent(coordinate, _) if *coordinate == dove),
         )
         .await;
     }

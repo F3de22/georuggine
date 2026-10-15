@@ -75,7 +75,7 @@ impl UiState {
             ClientEvent::StateChanged(stato) => {
                 self.stato_movimento = Some(stato);
             }
-            ClientEvent::PositionSent(coordinate) => {
+            ClientEvent::PositionSent(coordinate, recorded_at) => {
                 let distanza = self
                     .storico_posizioni
                     .back()
@@ -83,10 +83,10 @@ impl UiState {
                     .unwrap_or(0.0);
                 accoda(
                     &mut self.storico_posizioni,
-                    (coordinate, adesso, distanza),
+                    (coordinate, recorded_at, distanza),
                     STORICO_POSIZIONI_MAX,
                 );
-                self.ultima_posizione = Some((coordinate, adesso));
+                self.ultima_posizione = Some((coordinate, recorded_at));
             }
             ClientEvent::AnalysisReceived(riepilogo) => {
                 self.ultima_analisi = Some(riepilogo);
@@ -166,13 +166,13 @@ mod tests {
         let torino = coord(45.0703, 7.6869);
         let milano = coord(45.4642, 9.1900);
 
-        stato.applica_evento(ClientEvent::PositionSent(torino), a(0));
+        stato.applica_evento(ClientEvent::PositionSent(torino, a(0)), a(0));
         assert_eq!(
             stato.storico_posizioni.back().map(|(_, _, d)| *d),
             Some(0.0)
         );
 
-        stato.applica_evento(ClientEvent::PositionSent(milano), a(60));
+        stato.applica_evento(ClientEvent::PositionSent(milano, a(60)), a(60));
         let (coordinata, quando, distanza) = *stato
             .storico_posizioni
             .back()
@@ -191,7 +191,10 @@ mod tests {
         let mut stato = stato();
         for i in 0..30 {
             let punto = coord(45.0 + f64::from(i) * 0.001, 7.0);
-            stato.applica_evento(ClientEvent::PositionSent(punto), a(i64::from(i)));
+            stato.applica_evento(
+                ClientEvent::PositionSent(punto, a(i64::from(i))),
+                a(i64::from(i)),
+            );
         }
 
         assert_eq!(stato.storico_posizioni.len(), 20);

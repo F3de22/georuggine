@@ -398,8 +398,8 @@ pub enum ClientEvent {
     },
     /// Il server ha notificato un cambio di stato di movimento.
     StateChanged(UserState),
-    /// Una posizione e' stata inviata con successo al server.
-    PositionSent(Coordinate),
+    /// Una posizione e' stata inviata con successo al server, con il suo `recorded_at`.
+    PositionSent(Coordinate, DateTime<Utc>),
     /// Il server ha risposto a [`ClientCommand::RequestAnalysis`].
     AnalysisReceived(MovementSummary),
     /// Errore non fatale, per esempio una richiesta rifiutata dal server.
@@ -906,7 +906,9 @@ async fn svuota_coda(
             coda.push_front((coordinate, recorded_at));
             return Err(errore.to_string());
         }
-        let _ = event_tx.send(ClientEvent::PositionSent(coordinate)).await;
+        let _ = event_tx
+            .send(ClientEvent::PositionSent(coordinate, recorded_at))
+            .await;
     }
     Ok(())
 }
@@ -1308,13 +1310,16 @@ mod tests {
 
         // Due scatti consecutivi dimostrano che il ticker si ripete.
         for numero in 1..=2u32 {
-            let coordinate = match connessione.ricevi().await {
-                ClientMessage::Position { coordinate, .. } => coordinate,
+            let (coordinate, recorded_at) = match connessione.ricevi().await {
+                ClientMessage::Position {
+                    coordinate,
+                    recorded_at,
+                } => (coordinate, recorded_at),
                 altro => panic!("atteso Position, ottenuto {altro:?}"),
             };
             assert_eq!(
                 prossimo_evento(&mut handle).await,
-                ClientEvent::PositionSent(coordinate)
+                ClientEvent::PositionSent(coordinate, recorded_at)
             );
 
             // Solo un minimo: il primo tick e' consumato all'avvio, quindi l'n-esimo
