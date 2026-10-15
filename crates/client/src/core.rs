@@ -375,7 +375,7 @@ fn costruisci_source_kind(
     }
 }
 
-/// Comando che l'interfaccia manda al task di rete. Per invio di messaggi 
+/// Comando che l'interfaccia manda al task di rete. Per invio di messaggi
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientCommand {
     /// Manda un messaggio testuale al server.
