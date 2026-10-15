@@ -1,16 +1,6 @@
 //! Disegno dei quattro riquadri e della riga di input della TUI.
 //!
-//! Separato dal resto del modulo `tui` perche' e' l'unica parte che tocca
-//! `ratatui::Frame`: [`UiState`] e [`super::input::analizza_input`] restano testabili
-//! senza aprire un terminale, e questo file e' l'unico che non lo e'.
-//!
-//! # Colori e leggibilita'
-//!
-//! Verde e rosso restano leggibili sia su un terminale a sfondo scuro sia su uno a
-//! sfondo chiaro, a differenza per esempio di un blu scuro o di un giallo tenue, che su
-//! uno dei due sparisce quasi del tutto. Lo stato di connessione non si affida comunque
-//! al solo colore: ogni riquadro che lo mostra affianca al colore un simbolo (● / ○) o
-//! una parola ("Connesso" / "Disconnesso"), leggibile anche senza distinguere i colori.
+//! Lo stato di connessione e' indicato anche con simbolo e testo, non solo con il colore.
 
 use chrono::{DateTime, Utc};
 use georuggine_common::protocol::MovementSummary;
@@ -29,12 +19,8 @@ const COLORE_CONNESSO: Color = Color::Green;
 /// Colore del simbolo e del testo di stato quando il client non e' connesso.
 const COLORE_DISCONNESSO: Color = Color::Red;
 
-/// Disegna l'intera schermata: quattro riquadri piu' una riga di input in fondo.
-///
-/// Layout, dall'alto: a sinistra stato/username/coordinate correnti/ultimo invio/
-/// sorgente, a destra le ultime posizioni inviate; in basso a sinistra il log dei
-/// messaggi, a destra l'ultima analisi ricevuta. La riga di input occupa il fondo dello
-/// schermo su tutta la larghezza.
+/// Disegna la schermata: stato e ultime posizioni in alto, messaggi e ultima analisi in
+/// basso, riga di input in fondo.
 pub(super) fn disegna(frame: &mut Frame, stato: &UiState) {
     let area = frame.area();
 
@@ -54,8 +40,8 @@ pub(super) fn disegna(frame: &mut Frame, stato: &UiState) {
     frame.render_widget(pannello_input(stato), riga_input);
 }
 
-/// Riquadro in alto a sinistra: stato di connessione, username, movimento, sorgente,
-/// ultima posizione inviata e, se presente, l'ultimo errore.
+/// Riquadro dello stato: connessione, utente, movimento, sorgente, ultimo invio ed
+/// eventuale errore.
 fn pannello_stato(stato: &UiState) -> Paragraph<'static> {
     let (simbolo, testo_stato, colore) = if stato.connesso {
         ("●", "Connesso", COLORE_CONNESSO)
@@ -92,16 +78,14 @@ fn pannello_stato(stato: &UiState) -> Paragraph<'static> {
         .wrap(Wrap { trim: true })
 }
 
-/// Testo dello stato di movimento, o un segnaposto se il server non lo ha ancora
-/// notificato.
+/// Testo dello stato di movimento, o un segnaposto se non e' ancora noto.
 fn testo_movimento(stato: Option<UserState>) -> String {
     stato
         .map(|stato| stato.to_string())
         .unwrap_or_else(|| "sconosciuto".to_owned())
 }
 
-/// Testo dell'ultima posizione inviata, o un segnaposto se non ne e' ancora partita
-/// nessuna.
+/// Testo dell'ultima posizione inviata, o un segnaposto.
 fn testo_ultima_posizione(ultima: Option<(Coordinate, DateTime<Utc>)>) -> String {
     match ultima {
         Some((coordinate, quando)) => format!(
@@ -114,8 +98,8 @@ fn testo_ultima_posizione(ultima: Option<(Coordinate, DateTime<Utc>)>) -> String
     }
 }
 
-/// Riquadro in alto a destra: le ultime posizioni inviate, la piu' recente in cima, con
-/// la distanza dalla precedente.
+/// Riquadro delle ultime posizioni, la piu' recente in cima, con la distanza dalla
+/// precedente.
 fn pannello_storico(stato: &UiState) -> List<'static> {
     let mut voci: Vec<ListItem> = stato
         .storico_posizioni
@@ -139,8 +123,7 @@ fn pannello_storico(stato: &UiState) -> List<'static> {
     List::new(voci).block(Block::bordered().title(" Ultime posizioni "))
 }
 
-/// Riquadro in basso a sinistra: i messaggi ricevuti dal server, il piu' recente in
-/// cima, con orario e se il messaggio era diretto o un broadcast.
+/// Riquadro dei messaggi, il piu' recente in cima, con orario e tipo.
 fn pannello_messaggi(stato: &UiState) -> List<'static> {
     let mut voci: Vec<ListItem> = stato
         .messaggi
@@ -166,7 +149,7 @@ fn pannello_messaggi(stato: &UiState) -> List<'static> {
     List::new(voci).block(Block::bordered().title(" Messaggi "))
 }
 
-/// Riquadro in basso a destra: l'ultimo riepilogo dei movimenti ricevuto.
+/// Riquadro dell'ultima analisi.
 fn pannello_analisi(stato: &UiState) -> Paragraph<'static> {
     let righe = match &stato.ultima_analisi {
         Some(riepilogo) => righe_analisi(riepilogo),
@@ -180,7 +163,7 @@ fn pannello_analisi(stato: &UiState) -> Paragraph<'static> {
         .wrap(Wrap { trim: true })
 }
 
-/// Righe del riepilogo dei movimenti, gia' formattate per essere lette da una persona.
+/// Righe del riepilogo dei movimenti.
 fn righe_analisi(riepilogo: &MovementSummary) -> Vec<Line<'static>> {
     let mut righe = vec![
         Line::from(format!(
@@ -205,11 +188,8 @@ fn righe_analisi(riepilogo: &MovementSummary) -> Vec<Line<'static>> {
     righe
 }
 
-/// Il tragitto in poche righe: quanti punti, da dove e fino a dove.
-///
-/// Il riquadro non ha spazio per migliaia di punti: partenza e arrivo con i loro orari
-/// dicono dove il veicolo e' andato, e il numero di punti quanto e' fitto il percorso. Il
-/// numero e' `totale`, quello del tragitto completo: `route` puo' esserne un campione.
+/// Il tragitto in poche righe: numero di punti (`totale`, del tragitto completo),
+/// partenza e arrivo.
 fn righe_tragitto(route: &[PositionRecord], totale: u64) -> Vec<Line<'static>> {
     let punto = |posizione: &PositionRecord| {
         format!(
@@ -234,11 +214,8 @@ fn righe_tragitto(route: &[PositionRecord], totale: u64) -> Vec<Line<'static>> {
     }
 }
 
-/// Durata in secondi come la legge una persona: `2h 05m 30s`, `5m 30s`, `30s`.
-///
-/// Duplica `formatta_durata` di `console.rs` nel server: e' privata li' e vive in un
-/// crate diverso, quindi non c'e' modo di riusarla senza spostarla in `common` per una
-/// singola funzione di formattazione testuale.
+/// Durata in formato leggibile: `2h 05m 30s`, `5m 30s`, `30s`. Uguale a quella della
+/// console del server, che sta in un altro crate.
 fn formatta_durata(secondi: u64) -> String {
     let ore = secondi / 3_600;
     let minuti = (secondi % 3_600) / 60;
@@ -283,7 +260,7 @@ mod tests {
 
     #[test]
     fn il_tragitto_mostra_numero_di_punti_partenza_e_arrivo() {
-        // Tre punti di un campione che ne riassume 2880: conta il totale, non il campione.
+        // Campione di tre punti su 2880: conta il totale.
         let righe = righe_tragitto(
             &[punto(45.0703, 0), punto(45.0712, 30), punto(45.0721, 60)],
             2_880,

@@ -1,16 +1,17 @@
 # Georuggine
 
-Sistema client/server di geolocalizzazione per una flotta di veicoli: i veicoli inviano
-periodicamente la propria posizione, il server la persiste e la ridistribuisce ai client di
-monitoraggio. Progetto per l'esame di Programmazione di Sistema.
+Sistema client/server di geolocalizzazione per una flotta di veicoli: ogni veicolo invia la
+propria posizione ogni 30 secondi, il server la salva, ne ricava lo stato di movimento e le
+analisi dei percorsi e scambia messaggi con i veicoli. Progetto per l'esame di Programmazione
+di Sistema.
 
 ## Architettura
 
-Workspace Cargo con tre crate sotto `crates/`:
+Workspace Cargo con tre crate sotto `crates/` e i test end-to-end in `tests/`:
 
-- `common` — libreria di protocollo: tipi di dominio, messaggi e codec `Encoder`/`Decoder`;
-- `server` — accetta le connessioni TCP, autentica i veicoli, persiste su SQLite;
-- `client` — invia la posizione del veicolo e mostra la flotta in una TUI.
+- `common`: tipi di dominio, messaggi e codec `Encoder`/`Decoder`;
+- `server`: accetta le connessioni TCP, autentica i veicoli, salva i dati su SQLite;
+- `client`: simula un veicolo, ne invia la posizione e lo mostra in una TUI.
 
 Il client apre una connessione TCP verso il server e vi scambia messaggi serializzati con
 postcard e framing a prefisso di lunghezza. Le dipendenze vanno da `common` verso i binari.
@@ -49,7 +50,8 @@ La CI esegue gli stessi comandi su `ubuntu-latest` e `windows-latest`. Invariant
 - niente `unwrap`, `expect` o `panic!` in produzione: errori propagati con `Result` e `?`;
 - `thiserror` nelle librerie, `anyhow` solo nei `main`;
 - nessuna operazione bloccante in un task async: SQLite e I/O su file passano da
-  `tokio::task::spawn_blocking`;
+  `tokio::task::spawn_blocking` (fa eccezione la lettura del CSV della sorgente, una sola
+  volta all'avvio del client);
 - nessun lock tenuto attraverso un `.await`: il guard va rilasciato prima della sospensione;
 - la logica di dominio non chiama `Utc::now()` ma riceve il tempo dal trait `Clock`, così i
   test possono iniettare un orologio deterministico;

@@ -1,12 +1,5 @@
-//! Scenario end-to-end: messaggi fra il server e i veicoli.
-//!
-//! Copre i tre versi della messaggistica: l'avviso che il server manda a tutta la flotta
-//! (R11), il messaggio diretto a un solo veicolo, anche quando e' scollegato (R12), e il
-//! testo che un veicolo manda al server (R13). Il server parla attraverso il proprio
-//! [`MessageHub`], che e' quello che usa anche la console amministrativa; i veicoli sono
-//! client veri collegati via TCP.
-//!
-//! [`MessageHub`]: georuggine_server::messaging::MessageHub
+//! Scenario end-to-end: broadcast a tutta la flotta, messaggi diretti anche a utenti
+//! scollegati e testi dei veicoli verso il server.
 
 mod support;
 
@@ -20,7 +13,7 @@ use tokio::time::{Instant, sleep};
 
 use support::{ATTESA, MessaggioSpiato, TestClient, TestServer, attendi_messaggio};
 
-/// Intervallo fra due letture quando si aspetta una condizione che non ha un evento.
+/// Intervallo fra due controlli di una condizione.
 const PASSO_DI_ATTESA: Duration = Duration::from_millis(10);
 
 #[tokio::test]
@@ -33,8 +26,7 @@ async fn il_testo_di_un_veicolo_arriva_al_server() {
         .comanda(ClientCommand::SendText("in arrivo al deposito".to_owned()))
         .await;
 
-    // Al client torna solo un `Ack`, che non produce un evento: la prova che il testo sia
-    // stato preso in carico e' la riga scritta a storico.
+    // Il client riceve solo un Ack: si verifica la riga salvata.
     attendi_messaggio(&server, MessageDirection::Inbound, "in arrivo al deposito").await;
     assert!(
         server.archivio.messaggi().contains(&MessaggioSpiato {
@@ -64,8 +56,7 @@ async fn un_testo_troppo_lungo_viene_rifiutato_senza_chiudere_la_sessione() {
         errore.contains(&MAX_CARATTERI.to_string()),
         "l'errore non dice qual e' il limite: {errore}"
     );
-    // Il rifiuto riguarda la singola richiesta: la sessione resta aperta, e un testo
-    // valido subito dopo passa.
+    // Il rifiuto riguarda la singola richiesta: un testo valido subito dopo passa.
     cliente
         .comanda(ClientCommand::SendText("riprovo".to_owned()))
         .await;
@@ -116,9 +107,8 @@ async fn un_messaggio_diretto_arriva_al_solo_destinatario() {
     assert!(consegnato, "il destinatario e' collegato");
     assert_eq!(destinatario.attendi_testo(true).await, "rientra in sede");
 
-    // Che l'altro veicolo non lo abbia ricevuto si dimostra mandando subito dopo un
-    // avviso alla flotta: il primo testo che vede deve essere quello, perche' il canale
-    // conserva l'ordine e un messaggio diretto sarebbe arrivato prima.
+    // Un broadcast subito dopo dimostra che l'altro veicolo non ha ricevuto il diretto:
+    // il canale conserva l'ordine.
     server
         .messaggistica
         .broadcast("manutenzione alle 18")
@@ -147,7 +137,7 @@ async fn i_messaggi_arrivati_da_scollegato_si_ricevono_al_ritorno() {
     let server = TestServer::avvia().await;
     let id = server.registra("veicolo_01").await;
 
-    // Il veicolo non si e' mai collegato: il messaggio non puo' essere recapitato adesso.
+    // Il veicolo non si e' mai collegato.
     let consegnato = server
         .messaggistica
         .direct(id, "passa dall'officina")
@@ -163,8 +153,7 @@ async fn i_messaggi_arrivati_da_scollegato_si_ricevono_al_ritorno() {
         1
     );
 
-    // All'accesso il server consegna cio' che era rimasto in attesa, prima di qualunque
-    // altra cosa possa mandare.
+    // All'accesso il server consegna i messaggi in attesa.
     let mut cliente = TestClient::accedi(&server, "veicolo_01").await;
     assert_eq!(cliente.attendi_testo(true).await, "passa dall'officina");
     attendi_attesa_vuota(&server, id).await;
@@ -173,10 +162,7 @@ async fn i_messaggi_arrivati_da_scollegato_si_ricevono_al_ritorno() {
     server.spegni().await;
 }
 
-/// Attende che l'utente non abbia piu' messaggi in attesa.
-///
-/// La marcatura avviene dopo l'invio, quindi arriva un momento dopo il messaggio che il
-/// client ha gia' visto: senza questa attesa il controllo correrebbe contro la scrittura.
+/// Attende che l'utente non abbia piu' messaggi in attesa: la marcatura segue l'invio.
 async fn attendi_attesa_vuota(server: &TestServer, utente: UserId) {
     let scadenza = Instant::now() + ATTESA;
 

@@ -1,14 +1,7 @@
-//! Scenario end-to-end: cio' che il server rifiuta.
+//! Scenario end-to-end: richieste che il server rifiuta, inviate da un client grezzo.
 //!
-//! Raccoglie le difese che non si possono verificare dal solo client vero, perche' il
-//! client vero il protocollo lo rispetta: una versione sconosciuta, una richiesta fuori
-//! sequenza, una posizione datata nel futuro, un fiume di posizioni. Per quelle c'e' il
-//! client grezzo, che scrive i messaggi a mano sugli stessi codec.
-//!
-//! Vale una distinzione che percorre tutto lo scenario: una violazione della **sequenza**
-//! chiude la connessione, perche' non c'e' nulla su cui proseguire; un rifiuto della
-//! **singola richiesta** la lascia aperta, perche' il veicolo puo' semplicemente
-//! riprovare con dati validi.
+//! Una violazione della sequenza chiude la connessione; il rifiuto di una singola
+//! richiesta la lascia aperta.
 
 mod support;
 
@@ -24,10 +17,7 @@ use support::{
     ClientGrezzo, PASSWORD, PASSWORD_DEBOLE, TestClient, TestServer, partenza, tempi_fermi, utente,
 };
 
-/// Quante posizioni si e' disposti a mandare prima di dire che il limite non esiste.
-///
-/// Il valore vero e' una costante privata del server: il test non lo ripete, si limita a
-/// verificare che una soglia ci sia e che scatti molto prima di questo tetto.
+/// Posizioni massime inviate prima di concludere che il limite di frequenza non esiste.
 const POSIZIONI_MASSIME: u32 = 200;
 
 #[tokio::test]
@@ -45,8 +35,7 @@ async fn una_versione_di_protocollo_sconosciuta_chiude_la_connessione() {
         ServerMessage::Error { code, .. } => assert_eq!(code, ErrorCode::UnsupportedVersion),
         altro => panic!("risposta inattesa a una versione sconosciuta: {altro:?}"),
     }
-    // La versione non e' negoziabile: non c'e' nessun seguito possibile su questa
-    // connessione, e il server la chiude.
+    // Versione non supportata: il server chiude.
     estraneo.attendi_chiusura().await;
 
     server.spegni().await;
@@ -58,7 +47,7 @@ async fn la_connessione_si_apre_con_hello_e_non_con_altro() {
     server.registra("veicolo_01").await;
     let mut estraneo = ClientGrezzo::connetti(&server).await;
 
-    // Credenziali giuste, ma prima dell'handshake: la sequenza viene comunque violata.
+    // Credenziali corrette ma prima dell'handshake: sequenza violata.
     estraneo
         .invia(ClientMessage::Login {
             username: utente("veicolo_01"),
@@ -93,7 +82,7 @@ async fn una_richiesta_prima_dell_accesso_e_rifiutata_senza_chiudere() {
         ServerMessage::Error { code, .. } => assert_eq!(code, ErrorCode::NotAuthenticated),
         altro => panic!("risposta inattesa a una richiesta senza sessione: {altro:?}"),
     }
-    // La connessione resta aperta: la sequenza prevede proprio che ora arrivi l'accesso.
+    // La connessione resta aperta in attesa dell'accesso.
     veicolo
         .invia(ClientMessage::Login {
             username: utente("veicolo_01"),
@@ -117,8 +106,7 @@ async fn una_password_sbagliata_non_apre_la_sessione_e_non_si_ripete() {
 
     let errore = cliente.attendi_errore().await;
     assert_eq!(errore, ErrorCode::InvalidCredentials.to_string());
-    // Riprovare con la stessa password darebbe di nuovo lo stesso esito: il task di rete
-    // termina invece di ripetere l'accesso all'infinito.
+    // Credenziali rifiutate: il task di rete termina senza riprovare.
     cliente.attendi_fine().await;
     assert_eq!(server.registro.connected_users().await, Vec::new());
 
@@ -152,7 +140,7 @@ async fn una_password_troppo_debole_non_si_registra() {
         "l'errore non spiega perche' la password non va bene: {errore}"
     );
     cliente.attendi_fine().await;
-    // Nessun utente e' stato creato: la policy si applica prima di toccare il database.
+    // La validazione precede ogni accesso al database.
     assert!(
         server
             .archivio
@@ -171,9 +159,7 @@ async fn una_posizione_datata_nel_futuro_e_rifiutata_senza_chiudere() {
     let mut veicolo = ClientGrezzo::connetti(&server).await;
     veicolo.saluta_e_accedi("veicolo_01").await;
 
-    // L'istante lo misura il client, il cui orologio puo' derivare di qualche minuto: dieci
-    // minuti di anticipo non sono piu' spiegabili con una deriva, e accettarli sposterebbe
-    // in avanti ogni analisi calcolata sullo storico.
+    // Dieci minuti di anticipo superano la tolleranza sulla deriva dell'orologio.
     veicolo
         .invia(ClientMessage::Position {
             coordinate: partenza(),
@@ -185,7 +171,7 @@ async fn una_posizione_datata_nel_futuro_e_rifiutata_senza_chiudere() {
         ServerMessage::Error { code, .. } => assert_eq!(code, ErrorCode::MalformedMessage),
         altro => panic!("risposta inattesa a una posizione nel futuro: {altro:?}"),
     }
-    // E' il rifiuto di una richiesta, non della sequenza: la sessione resta aperta.
+    // Rifiuto della singola richiesta: la sessione resta aperta.
     veicolo.invia(ClientMessage::Ping).await;
     assert_eq!(veicolo.ricevi().await, ServerMessage::Pong);
     assert!(
@@ -203,9 +189,8 @@ async fn troppe_posizioni_in_poco_tempo_vengono_limitate() {
     let mut veicolo = ClientGrezzo::connetti(&server).await;
     veicolo.saluta_e_accedi("veicolo_01").await;
 
-    // L'orologio di dominio resta fermo, quindi la finestra del limitatore non si riapre
-    // mai: prima o poi il rifiuto deve arrivare. Le posizioni sono tutte sullo stesso
-    // punto, cosi' nessuna produce un cambio di stato che si intrometta fra le risposte.
+    // Con l'orologio fermo la finestra non si riapre; posizioni identiche per non
+    // avere cambi di stato fra le risposte.
     let mut confermate: u32 = 0;
     let codice = loop {
         veicolo
@@ -235,7 +220,7 @@ async fn troppe_posizioni_in_poco_tempo_vengono_limitate() {
         confermate > 0,
         "il limite non deve scattare prima della prima posizione"
     );
-    // Come gli altri rifiuti di una singola richiesta, non chiude la connessione.
+    // Non chiude la connessione.
     veicolo.invia(ClientMessage::Ping).await;
     assert_eq!(veicolo.ricevi().await, ServerMessage::Pong);
 

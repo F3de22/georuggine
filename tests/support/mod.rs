@@ -1,37 +1,17 @@
-//! Impalcatura condivisa dai sei scenari end-to-end.
+//! Supporto condiviso dagli scenari end-to-end.
 //!
-//! [`TestServer`] avvia il server vero, cioe' [`net::run`] con le stesse dipendenze che
-//! costruisce il binario, su una porta effimera del loopback; [`TestClient`] avvia il
-//! client vero e lo pilota dai suoi due canali. Fra i due passa un socket TCP e il
-//! protocollo di `georuggine-common`: nessuno dei due sa di essere dentro un test. Dove
-//! serve parlare al server fuori dalla sequenza che il client rispetta c'e'
-//! [`ClientGrezzo`], che scrive i messaggi a mano sugli stessi codec.
+//! [`TestServer`] avvia il server vero su una porta effimera; [`TestClient`] avvia il client
+//! vero e lo pilota dai suoi canali; [`ClientGrezzo`] invia messaggi a mano per le prove
+//! fuori sequenza.
 //!
-//! # I due tempi
+//! Il tempo di dominio viene da un [`FakeClock`] condiviso fra client e server e spostato
+//! con [`TestServer::avanza`]; i timer di tokio usano tempo reale, quindi
+//! [`ConnectionTimeouts`] e [`Tempi`] vengono accorciati.
 //!
-//! Il **tempo di dominio** e' quello che server e client leggono dal [`Clock`]: il
-//! `recorded_at` delle posizioni, la scadenza dei tre minuti, gli estremi delle analisi,
-//! la finestra del limitatore. Qui e' un [`FakeClock`] **condiviso fra i due programmi**,
-//! che lo scenario sposta con [`TestServer::avanza`]: tre minuti di requisito costano
-//! microsecondi invece di tre minuti di attesa.
-//!
-//! Il **tempo vero** e' quello dei timer di tokio: l'intervallo del ticker, il backoff, le
-//! scadenze di una connessione, il battito del task periodico. Nessun orologio finto lo
-//! puo' saltare, quindi lo si accorcia — ed e' per questo che [`ConnectionTimeouts`] e
-//! [`Tempi`] sono parametri.
-//!
-//! # Perche' la registrazione sta fuori dal client
-//!
-//! [`TestClient::accedi`] apre sempre la sessione con `Login`. Il motivo e' la
-//! riconnessione: un client nato con `register: true` che perde la connessione
-//! ripresenterebbe `Register` e si prenderebbe `UsernameTaken`, che e' terminale, e
-//! smetterebbe di riprovare. L'utente si crea percio' prima, con [`TestServer::registra`].
-//! Fa eccezione [`TestClient::registrandosi`], che verifica la registrazione dal filo e va
-//! usata dove nessuna caduta e' prevista.
+//! [`TestClient::accedi`] usa sempre Login: l'utente si crea prima con
+//! [`TestServer::registra`].
 
-// Ogni scenario e' un binario di test a se' e compila questo modulo per intero, ma ne usa
-// solo la parte che gli serve: senza questo permesso cio' che un singolo scenario non
-// tocca diventerebbe un warning, e la build e' con `-D warnings`.
+// Ogni scenario usa solo una parte di questo modulo.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
@@ -68,27 +48,14 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-/// Quanto uno scenario aspetta cio' che si attende prima di dichiararlo mancato.
-///
-/// E' generoso perche' lo si paga solo quando il test sta gia' fallendo: nel caso normale
-/// l'evento arriva in pochi millisecondi. Su una macchina carica, o in una build di debug,
-/// qualche secondo di margine evita i fallimenti che non dipendono dal codice in esame.
+/// Attesa massima di un evento atteso: ampia, perche' si paga solo quando il test fallisce.
 pub const ATTESA: Duration = Duration::from_secs(10);
 
-/// Margine che [`TestServer::spegni`] concede alle connessioni dopo che il ciclo di
-/// accettazione e' finito.
-///
-/// Il ciclo termina appena riceve il segnale, ma le connessioni che ha spawnato sono
-/// ancora dentro la propria chiusura: senza questa finestra un panic che avviene proprio
-/// li' non sarebbe ancora stato registrato dalla spia. Basta poco, perche' sotto un
-/// runtime `current_thread` questa attesa cede lo scheduler e i task pronti arrivano in
-/// fondo; non e' un'attesa attiva su una scadenza lunga.
+/// Margine concesso alle connessioni per chiudersi dopo lo spegnimento, prima di
+/// controllare i panic.
 const ATTESA_CHIUSURA_CONNESSIONI: Duration = Duration::from_millis(50);
 
-/// Intervallo fra due letture quando si aspetta una condizione che non ha un evento.
-///
-/// Riguarda lo stato che vive dentro il server — il registro delle connessioni, la
-/// macchina a stati — e che dall'esterno si puo' solo rileggere finche' non cambia.
+/// Intervallo fra due controlli di uno stato interno del server.
 const PASSO_DI_ATTESA: Duration = Duration::from_millis(10);
 
 /// Password che rispetta la policy di `georuggine_server::auth::valida_password`.
@@ -97,32 +64,15 @@ pub const PASSWORD: &str = "veicolo12";
 /// Password che la policy rifiuta: troppo corta e senza cifre.
 pub const PASSWORD_DEBOLE: &str = "corta";
 
-/// Intervallo del battito della macchina a stati nei test.
-///
-/// E' tempo vero, quindi si accorcia: e' solo la frequenza con cui il task periodico si
-/// sveglia a chiedere chi e' tornato fermo. La soglia dei tre minuti resta invece quella
-/// di produzione, perche' e' tempo di dominio e la si supera muovendo il [`FakeClock`].
+/// Intervallo del task periodico della macchina a stati nei test (tempo reale).
 const BATTITO: Duration = Duration::from_millis(20);
 
-/// Attesa concessa a un cambio di stato che puo' esserci oppure no.
-///
-/// La usa [`ClientGrezzo::scarta_ritorno_a_fermo`] dove il battito della macchina a stati
-/// e' nel suo diritto di accodare un [`ServerMessage::StateChanged`] ma non e' detto che
-/// lo abbia gia' fatto: l'assenza di un messaggio entro questa finestra e' un esito
-/// normale e non un fallimento, quindi la scadenza e' breve invece che generosa come
-/// [`ATTESA`], che si paga solo quando uno scenario sta gia' fallendo.
-///
-/// Sono tre periodi di [`BATTITO`] e non uno solo perche' il battito e' tempo vero: su una
-/// macchina carica uno scatto puo' arrivare in ritardo sul proprio periodo, e una finestra
-/// larga quanto il periodo lo mancherebbe. Restano poche decine di millisecondi, pagate
-/// una volta per scenario e solo nel caso in cui il cambio non arrivi.
+/// Attesa breve di un cambio di stato che potrebbe non arrivare, pari a tre periodi di
+/// [`BATTITO`].
 const ATTESA_DEL_BATTITO: Duration = BATTITO.saturating_mul(3);
 
-/// Istante su cui parte l'orologio finto: 2024-01-01T12:00:00Z.
-///
-/// E' mezzogiorno e non mezzanotte perche' gli intervalli di calendario delle analisi si
-/// risolvono nel fuso locale della macchina: partendo da meta' giornata, i pochi minuti di
-/// tempo di dominio che uno scenario attraversa non scavalcano mai un cambio di data.
+/// Istante iniziale dell'orologio finto: mezzogiorno, per non attraversare un cambio di
+/// data nel fuso locale.
 pub fn istante_base() -> DateTime<Utc> {
     DateTime::from_timestamp(1_704_110_400, 0).expect("istante di test valido")
 }
@@ -147,27 +97,17 @@ pub fn a_un_metro() -> Coordinate {
     coordinata(45.0703 + 0.000_009, 7.6869)
 }
 
-/// Punto circa cinquanta metri a nord di [`partenza`]: dieci volte la soglia di movimento,
-/// abbastanza perche' il test non dipenda dalla precisione della formula.
+/// Punto circa cinquanta metri a nord di [`partenza`], ben oltre la soglia.
 pub fn a_cinquanta_metri() -> Coordinate {
     coordinata(45.0703 + 0.000_45, 7.6869)
 }
 
-/// Punto circa cento metri a nord di [`partenza`], dove serve un terzo punto distante da
-/// entrambi gli altri.
+/// Punto circa cento metri a nord di [`partenza`].
 pub fn a_cento_metri() -> Coordinate {
     coordinata(45.0703 + 0.000_9, 7.6869)
 }
 
-/// Tempi con cui il ticker delle posizioni non scatta mai da solo.
-///
-/// L'intervallo e' un'ora di tempo vero, cioe' molto oltre la durata di qualunque
-/// scenario: il client resta muto e le sole cose che il server vede sono quelle che il
-/// test gli fa fare. Serve a tutti gli scenari che non parlano di posizioni, dove un invio
-/// periodico sarebbe rumore — e finirebbe per esaurire il limite di frequenza, dato che la
-/// finestra del limitatore non si riapre mentre l'orologio di dominio sta fermo.
-///
-/// Il backoff e' invece cortissimo, perche' una riconnessione non deve costare secondi.
+/// Tempi con cui il client non invia mai posizioni da solo e si riconnette subito.
 pub fn tempi_fermi() -> Tempi {
     Tempi {
         intervallo_posizione: Duration::from_secs(3_600),
@@ -181,14 +121,8 @@ pub fn tempi_fermi() -> Tempi {
     }
 }
 
-/// Tempi con cui il ticker delle posizioni scatta di continuo.
-///
-/// Serve agli scenari che verificano l'invio periodico e la coda delle posizioni prodotte
-/// mentre la connessione e' caduta. Il ticker ripete l'ultima coordinata nota, quindi fra
-/// un invio voluto e il successivo il server riceve dei duplicati: sono innocui per la
-/// macchina a stati e per le analisi, perche' non spostano nulla, ma contano nel limite di
-/// frequenza, e per questo gli scenari che li usano restano brevi oppure spostano
-/// l'orologio di dominio, cosa che riapre la finestra del limitatore.
+/// Tempi con cui il client invia posizioni di continuo, per gli scenari sull'invio
+/// periodico e sulla coda.
 pub fn tempi_con_invii() -> Tempi {
     Tempi {
         intervallo_posizione: Duration::from_millis(50),
@@ -196,12 +130,8 @@ pub fn tempi_con_invii() -> Tempi {
     }
 }
 
-/// Scadenze del server nei test.
-///
-/// L'inattivita' resta lunga apposta: quasi tutti gli scenari verificano che la connessione
-/// si chiuda per un motivo preciso, e una scadenza breve la chiuderebbe comunque, facendoli
-/// passare anche se il meccanismo in esame non funzionasse. Chi vuole verificare proprio
-/// quella scadenza la accorcia da se'.
+/// Scadenze del server nei test; l'inattivita' resta lunga per non chiudere le connessioni
+/// per il motivo sbagliato.
 pub fn timeouts_di_prova() -> ConnectionTimeouts {
     ConnectionTimeouts {
         handshake: Duration::from_secs(2),
@@ -211,11 +141,7 @@ pub fn timeouts_di_prova() -> ConnectionTimeouts {
     }
 }
 
-/// Parametri di Argon2 al minimo utile.
-///
-/// L'hashing di produzione e' lento apposta, e decine di millisecondi per ogni accesso,
-/// moltiplicate per i client di sei scenari, si sentono. Il costo dell'hashing non fa
-/// parte di cio' che questi test verificano.
+/// Parametri di Argon2 minimi, per test veloci.
 pub fn autenticazione_rapida() -> AuthConfig {
     AuthConfig {
         memory_kib: 32,
@@ -224,7 +150,7 @@ pub fn autenticazione_rapida() -> AuthConfig {
     }
 }
 
-/// Messaggio come la spia lo ha visto passare verso la persistenza.
+/// Messaggio registrato dalla spia.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessaggioSpiato {
     /// Destinatario, assente per gli avvisi alla flotta.
@@ -235,16 +161,10 @@ pub struct MessaggioSpiato {
     pub corpo: String,
 }
 
-/// Persistenza vera con un registratore davanti.
-///
-/// Il [`Repository`] espone in lettura le posizioni e i messaggi ancora da consegnare, ma
-/// non quelli che un veicolo ha mandato al server: sono scritti e basta, e dall'esterno non
-/// si rileggono. Uno scenario end-to-end del requisito R13 non avrebbe percio' modo di dire
-/// se il testo sia arrivato davvero fino al database. La spia riempie quel buco senza
-/// toccare il server: il livello di rete continua a vedere un `Arc<dyn Repository>`
-/// qualunque, e ogni chiamata prosegue verso lo SQLite sottostante.
+/// Repository vero con un registratore davanti, per verificare anche i messaggi che il
+/// trait non permette di rileggere.
 pub struct RepositorySpia {
-    /// Persistenza vera: uno SQLite in memoria, che vive quanto il test.
+    /// Repository vero, SQLite in memoria.
     interno: SqliteRepository,
     /// Messaggi passati di qui, nell'ordine in cui sono stati scritti.
     messaggi: Mutex<Vec<MessaggioSpiato>>,
@@ -274,10 +194,7 @@ impl RepositorySpia {
             .collect()
     }
 
-    /// Prende il lock sul registro, riprendendolo anche se e' avvelenato.
-    ///
-    /// Come altrove nel progetto: la sezione critica e' un `push` o una copia, quindi non
-    /// puo' lasciare lo stato a meta', e si continua invece di andare in panico.
+    /// Prende il lock anche se avvelenato.
     fn blocca(&self) -> MutexGuard<'_, Vec<MessaggioSpiato>> {
         self.messaggi.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -319,8 +236,7 @@ impl Repository for RepositorySpia {
         body: &str,
         at: DateTime<Utc>,
     ) -> Result<MessageId, StorageError> {
-        // Si registra prima di scrivere e non dopo: il test vuole sapere che cosa il
-        // server ha chiesto di persistere, anche quando la scrittura fallisce.
+        // Si registra prima di scrivere, anche se la scrittura fallisce.
         self.blocca().push(MessaggioSpiato {
             destinatario: user_id,
             verso: direction,
@@ -346,36 +262,27 @@ impl Repository for RepositorySpia {
     }
 }
 
-// --- spia sui panic dei task del server ---
+// --- panic dei task del server ---
 //
-// Il server vive in task di cui nessuno tiene la `JoinHandle`: le connessioni, il loro
-// task di scrittura, il battito della macchina a stati. Un panic li dentro non fa fallire
-// niente — tokio lo cattura e lo scenario prosegue — e libtest ne nasconde anche la
-// traccia. Il gancio qui sotto lo rende un fallimento vero: ogni `#[tokio::test]` gira su
-// un runtime `current_thread` sul proprio thread, quindi un panic nei task di quel server
-// porta l'identita' di quel thread e si attribuisce allo scenario giusto anche con i test
-// in parallelo. Restano fuori i soli `spawn_blocking`, dove c'e' pero' solo l'accesso a
-// SQLite, che gia' propaga i suoi errori come `Result`.
+// I task del server non hanno una `JoinHandle` attesa dal test, quindi un loro panic
+// passerebbe inosservato. Il gancio registra i panic per thread, cioe' per scenario, e
+// [`TestServer::spegni`] li trasforma in un fallimento.
 
 /// Un panic osservato dal gancio globale.
 struct PanicSpiato {
-    /// Thread su cui e' avvenuto, cioe' lo scenario a cui appartiene.
+    /// Thread su cui e' avvenuto, cioe' lo scenario.
     thread: ThreadId,
-    /// Messaggio e posizione, gia' formattati per il rapporto.
+    /// Messaggio e posizione.
     descrizione: String,
 }
 
-/// Panic osservati e non ancora rivendicati da nessuno scenario.
+/// Panic osservati e non ancora riportati.
 static PANIC_SPIATI: OnceLock<Mutex<Vec<PanicSpiato>>> = OnceLock::new();
 
-/// Ricordo che il gancio e' gia' stato installato: va messo una volta per binario.
+/// Indica se il gancio e' gia' installato.
 static SPIA_ARMATA: OnceLock<()> = OnceLock::new();
 
-/// Accesso alla lista dei panic osservati.
-///
-/// Il lock avvelenato non e' un caso da trattare, per lo stesso motivo di
-/// [`RepositorySpia::blocca`]: dentro c'e' una lista, e una lista non si corrompe perche'
-/// chi la teneva e' andato in panico.
+/// Lista dei panic osservati, anche con lock avvelenato.
 fn panic_spiati() -> MutexGuard<'static, Vec<PanicSpiato>> {
     PANIC_SPIATI
         .get_or_init(|| Mutex::new(Vec::new()))
@@ -383,11 +290,7 @@ fn panic_spiati() -> MutexGuard<'static, Vec<PanicSpiato>> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Installa il gancio sui panic, una volta sola per binario di test.
-///
-/// Il gancio precedente viene richiamato in coda, cosi' il messaggio e la traccia
-/// continuano ad arrivare su stderr come sempre: qui si aggiunge la registrazione, non si
-/// sostituisce il comportamento normale.
+/// Installa il gancio sui panic una volta per binario, mantenendo quello precedente.
 fn arma_la_spia_sui_panic() {
     SPIA_ARMATA.get_or_init(|| {
         let precedente = std::panic::take_hook();
@@ -418,11 +321,7 @@ fn descrivi_panic(informazioni: &PanicHookInfo<'_>) -> String {
     }
 }
 
-/// Toglie dalla lista i panic avvenuti su questo scenario e li restituisce.
-///
-/// Si tolgono invece di limitarsi a leggerli perche' un panic va riportato una volta
-/// sola: [`TestServer::spegni`] lo rivendica, e il `Drop` che viene subito dopo non lo
-/// ritrova piu'.
+/// Toglie dalla lista e restituisce i panic avvenuti in questo scenario.
 fn panic_di_questo_scenario() -> Vec<String> {
     let corrente = std::thread::current().id();
     let mut spiati = panic_spiati();
@@ -445,11 +344,7 @@ fn pretendi_nessun_panic_nei_task() {
     );
 }
 
-/// Il server vero, in ascolto su una porta effimera del loopback.
-///
-/// Tiene un riferimento a tutto cio' che ha passato a [`net::run`], cosi' lo scenario
-/// puo' guardare il server da dentro — chi e' connesso, in che stato e' un veicolo, che
-/// cosa e' finito a storico — mentre lo interroga da fuori attraverso il protocollo.
+/// Server vero su una porta effimera, con accesso alle sue dipendenze interne.
 pub struct TestServer {
     /// Indirizzo a cui i client si collegano.
     pub indirizzo: SocketAddr,
@@ -459,17 +354,14 @@ pub struct TestServer {
     pub archivio: Arc<RepositorySpia>,
     /// Connessioni aperte, una per utente.
     pub registro: Arc<ConnectionRegistry>,
-    /// Messaggistica: e' da qui che lo scenario fa parlare il server.
+    /// Messaggistica, usata dagli scenari per far parlare il server.
     pub messaggistica: Arc<MessageHub>,
     /// Macchina a stati fermo/movimento.
     pub stati: Arc<StateTracker>,
     /// Segnale di spegnimento, condiviso con le connessioni.
     spegnimento: broadcast::Sender<()>,
-    /// Ciclo di accettazione, atteso da [`TestServer::spegni`].
-    ///
-    /// E' un'opzione perche' `spegni` prende `self` per valore ma la struttura ha un
-    /// `Drop`: da `self` non si puo' spostare via un campo, quindi la handle si prende
-    /// con `take` invece che per movimento.
+    /// Ciclo di accettazione; un `Option` per poterlo prendere in `spegni` nonostante il
+    /// `Drop`.
     ciclo: Option<JoinHandle<std::io::Result<()>>>,
 }
 
@@ -479,14 +371,9 @@ impl TestServer {
         Self::con_timeouts(timeouts_di_prova()).await
     }
 
-    /// Avvia il server con le scadenze indicate.
-    ///
-    /// Il ritorno avviene solo quando la porta accetta davvero connessioni: senza questa
-    /// attesa il primo client potrebbe presentarsi prima che [`net::run`] abbia aperto
-    /// l'ascolto e vedersi rifiutare la connessione.
+    /// Avvia il server con le scadenze indicate e ritorna quando accetta connessioni.
     pub async fn con_timeouts(timeouts: ConnectionTimeouts) -> Self {
-        // Prima di far partire qualunque task del server: da qui in poi un panic al loro
-        // interno non e' piu' silenzioso.
+        // Il gancio va installato prima di avviare i task del server.
         arma_la_spia_sui_panic();
 
         let orologio = Arc::new(FakeClock::new(istante_base()));
@@ -495,8 +382,7 @@ impl TestServer {
         let archivio = Arc::new(RepositorySpia::nuova(Arc::clone(&sorgente_ora)));
         let repo: Arc<dyn Repository> = Arc::clone(&archivio) as Arc<dyn Repository>;
         let registro = Arc::new(ConnectionRegistry::new());
-        // La messaggistica riceve lo stesso registro del livello di rete, come nel
-        // binario: un secondo registro non vedrebbe nessuno dei veicoli collegati.
+        // Stesso registro del livello di rete, come nel binario.
         let messaggistica = Arc::new(MessageHub::new(
             Arc::clone(&repo),
             Arc::clone(&registro),
@@ -508,8 +394,7 @@ impl TestServer {
         let indirizzo = porta_libera();
         let configurazione = ServerConfig {
             bind_addr: indirizzo,
-            // Nessuno dei due percorsi viene aperto da `run`: il database e' gia'
-            // aperto qui sopra, e il log del tempo di CPU vive nel binario.
+            // Database gia' aperto qui; il log CPU lo gestisce il binario.
             db_path: PathBuf::from(":memory:"),
             log_dir: PathBuf::from("logs"),
         };
@@ -544,10 +429,6 @@ impl TestServer {
     }
 
     /// Registra un utente senza passare dalla rete e ne restituisce l'id.
-    ///
-    /// E' il preparativo di quasi tutti gli scenari: il client di prova accede e basta,
-    /// per il motivo spiegato in cima al modulo. Usa la stessa funzione del livello di
-    /// rete, quindi l'hash della password e' quello vero.
     pub async fn registra(&self, nome: &str) -> UserId {
         let repo: Arc<dyn Repository> = Arc::clone(&self.archivio) as Arc<dyn Repository>;
 
@@ -565,14 +446,8 @@ impl TestServer {
             .id
     }
 
-    /// Posizioni che il server ha persistito per un utente.
-    ///
-    /// L'intervallo copre un anno attorno a [`istante_base`], cioe' molto oltre quello che
-    /// uno scenario attraversa: qui non si sta verificando il filtro temporale, che ha i
-    /// suoi controlli, ma che cosa e' arrivato a storico.
-    ///
-    /// La lettura e' sincrona e non passa da `spawn_blocking`: e' un accesso a uno SQLite
-    /// in memoria, dell'ordine dei microsecondi, e il test non ha altro da fare intanto.
+    /// Posizioni salvate per un utente, su un intervallo di un anno attorno a
+    /// [`istante_base`].
     pub fn posizioni(&self, utente: UserId) -> Vec<PositionRecord> {
         self.archivio
             .positions_in_range(
@@ -583,22 +458,15 @@ impl TestServer {
             .expect("lettura delle posizioni riuscita")
     }
 
-    /// Sposta in avanti il tempo di dominio di client e server insieme.
-    ///
-    /// E' cosi' che i tre minuti del requisito R5, o i minuti fra una rilevazione e la
-    /// successiva dentro un'analisi, costano microsecondi invece di minuti veri.
+    /// Sposta in avanti il tempo di dominio di client e server.
     pub fn avanza(&self, delta: TimeDelta) {
         self.orologio.advance(delta);
     }
 
-    /// Chiede lo spegnimento ordinato e attende che il ciclo di accettazione finisca.
-    ///
-    /// E' anche il punto in cui si rivendicano i panic dei task del server: se uno di
-    /// essi e' morto per un panic, lo scenario fallisce qui invece di chiudersi come se
-    /// niente fosse. Vedi la nota sulla spia sui panic in cima a questa sezione.
+    /// Spegne il server, attende il ciclo di accettazione e fa fallire lo scenario se un
+    /// task del server e' andato in panico.
     pub async fn spegni(mut self) {
-        // L'errore significa solo che nessuno e' piu' in ascolto, cioe' che il server sta
-        // gia' terminando.
+        // Un errore indica solo che il server sta gia' terminando.
         let _ = self.spegnimento.send(());
 
         let ciclo = self
@@ -611,10 +479,7 @@ impl TestServer {
             .expect("il task del server non va in panico")
             .expect("il server termina senza errori di I/O");
 
-        // Il ciclo di accettazione finisce prima delle connessioni che ha spawnato: si
-        // lascia loro il tempo di arrivare in fondo alla propria chiusura, altrimenti un
-        // panic che avviene proprio li' non sarebbe ancora stato registrato. La finestra
-        // copre la scadenza di chiusura di `timeouts_di_prova`.
+        // Si lascia alle connessioni il tempo di chiudersi prima di controllare i panic.
         sleep(ATTESA_CHIUSURA_CONNESSIONI).await;
 
         pretendi_nessun_panic_nei_task();
@@ -623,10 +488,8 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        // Rete di sicurezza per lo scenario che non chiama `spegni`: senza questo, i suoi
-        // panic tornerebbero silenziosi. Non si controlla nulla mentre lo scenario sta
-        // gia' srotolando per un panic suo, perche' un secondo panic durante l'unwind
-        // aborte il processo e nasconderebbe il fallimento vero.
+        // Controllo anche per gli scenari che non chiamano `spegni`, ma non durante un
+        // unwind: un secondo panic abortirebbe il processo.
         if std::thread::panicking() {
             return;
         }
@@ -634,15 +497,7 @@ impl Drop for TestServer {
     }
 }
 
-/// Indirizzo di loopback su una porta che il sistema dichiara libera.
-///
-/// [`net::run`] non restituisce l'indirizzo a cui si e' legato, quindi con la porta 0
-/// non sarebbe piu' ricostruibile dall'esterno: la si fa assegnare qui da un ascolto
-/// temporaneo, chiuso subito dopo. Fra la chiusura e il legame del server resta una
-/// finestra in cui un altro processo potrebbe prendersi quella porta; sul loopback di una
-/// macchina che sta eseguendo dei test e' un'eventualita' remota, e in cambio nessuno
-/// scenario deve fissare un numero di porta, che sarebbe invece un conflitto certo fra due
-/// scenari eseguiti insieme.
+/// Indirizzo di loopback su una porta libera, ottenuta da un ascolto temporaneo.
 fn porta_libera() -> SocketAddr {
     let ascolto =
         std::net::TcpListener::bind(("127.0.0.1", 0)).expect("una porta effimera e' disponibile");
@@ -653,9 +508,6 @@ fn porta_libera() -> SocketAddr {
 }
 
 /// Attende che l'indirizzo accetti connessioni.
-///
-/// La connessione di prova viene chiusa subito: il server la vede come un client che si e'
-/// presentato e se n'e' andato prima dell'handshake, e la lascia cadere.
 async fn attendi_ascolto(indirizzo: SocketAddr) {
     let scadenza = Instant::now() + ATTESA;
 
@@ -671,9 +523,6 @@ async fn attendi_ascolto(indirizzo: SocketAddr) {
 }
 
 /// Attende che il registro delle connessioni contenga esattamente gli utenti indicati.
-///
-/// Serve dove la chiusura di una sessione non produce nessun evento osservabile dal client
-/// — un logout, una sostituzione — e la sola prova che sia avvenuta sta dentro il server.
 pub async fn attendi_connessi(server: &TestServer, attesi: &[UserId]) {
     let scadenza = Instant::now() + ATTESA;
     let mut ultimo = Vec::new();
@@ -705,11 +554,7 @@ pub async fn attendi_stato(server: &TestServer, utente: UserId, atteso: UserStat
     panic!("stato {ultimo:?} invece di {atteso:?} dopo {ATTESA:?}");
 }
 
-/// Attende che un messaggio con quel verso e quel corpo sia arrivato alla persistenza.
-///
-/// Cio' che un veicolo manda al server non torna indietro in nessuna risposta di
-/// contenuto — il livello di rete replica con un `Ack` — quindi l'unico posto in cui si
-/// vede se sia stato preso in carico e' la scrittura, che la spia registra.
+/// Attende che un messaggio con quel verso e quel corpo sia stato salvato.
 pub async fn attendi_messaggio(server: &TestServer, verso: MessageDirection, corpo: &str) {
     let scadenza = Instant::now() + ATTESA;
     let mut ultimi = Vec::new();
@@ -725,10 +570,7 @@ pub async fn attendi_messaggio(server: &TestServer, verso: MessageDirection, cor
     panic!("fra i messaggi {verso:?} {ultimi:?} non c'e' {corpo:?} dopo {ATTESA:?}");
 }
 
-/// Il client vero, pilotato dai suoi due canali.
-///
-/// Ogni attesa ha una scadenza e fallisce con un messaggio che dice che cosa si aspettava:
-/// un test che si blocca per sempre non direbbe nulla a chi lo legge.
+/// Client vero, pilotato dai suoi canali; ogni attesa ha una scadenza.
 pub struct TestClient {
     /// Nucleo di rete del client, con i canali di comandi ed eventi.
     handle: ClientHandle,
@@ -738,9 +580,6 @@ pub struct TestClient {
 
 impl TestClient {
     /// Avvia il client senza attendere l'esito dell'accesso.
-    ///
-    /// E' la forma piu' generale, quella che serve dove l'accesso deve fallire: gli
-    /// scenari normali usano [`TestClient::accedi`].
     pub fn avvia(
         server: &TestServer,
         nome: &str,
@@ -754,8 +593,7 @@ impl TestClient {
         let sorgente = strategia
             .build()
             .expect("la sorgente manuale non puo' fallire");
-        // L'orologio e' lo stesso del server: il `recorded_at` che il client scrive nelle
-        // posizioni e l'ora con cui il server le giudica sono cosi' la stessa cosa.
+        // Stesso orologio del server.
         let orologio: Arc<dyn Clock> = Arc::clone(&server.orologio) as Arc<dyn Clock>;
 
         Self {
@@ -789,21 +627,15 @@ impl TestClient {
         cliente
     }
 
-    /// Si registra dal filo e attende la sessione aperta.
-    ///
-    /// Va usata solo dove nessuna caduta di connessione e' prevista: vedi la nota in cima
-    /// al modulo.
+    /// Si registra e attende la sessione aperta; da usare solo senza cadute di
+    /// connessione.
     pub async fn registrandosi(server: &TestServer, nome: &str) -> Self {
         let mut cliente = Self::avvia(server, nome, PASSWORD, true, tempi_fermi());
         cliente.attendi_connessione().await;
         cliente
     }
 
-    /// Restituisce il primo evento che soddisfa il predicato, scartando quelli prima.
-    ///
-    /// Gli eventi scartati non sono un problema: il ticker delle posizioni e i messaggi del
-    /// server arrivano quando capita, e uno scenario che aspetta un cambio di stato non
-    /// deve inciampare in una conferma di invio.
+    /// Restituisce il primo evento che soddisfa il predicato, scartando gli altri.
     pub async fn attendi(
         &mut self,
         atteso: &str,
@@ -846,8 +678,7 @@ impl TestClient {
         }
     }
 
-    /// Attende un testo dal server, diretto o rivolto alla flotta, e ne restituisce il
-    /// corpo.
+    /// Attende un testo dal server, diretto o broadcast, e ne restituisce il corpo.
     pub async fn attendi_testo(&mut self, diretto: bool) -> String {
         let atteso = if diretto {
             "un messaggio diretto"
@@ -905,11 +736,7 @@ impl TestClient {
         }
     }
 
-    /// Attende che il task di rete termini, cioe' che il canale degli eventi si chiuda.
-    ///
-    /// E' la prova che il client **non** sta riprovando: dopo una sessione sostituita o un
-    /// fallimento terminale dell'autenticazione il task esce, e nessun altro evento puo'
-    /// arrivare.
+    /// Attende la fine del task di rete, cioe' la chiusura del canale degli eventi.
     pub async fn attendi_fine(&mut self) {
         let scadenza = Instant::now() + ATTESA;
 
@@ -935,11 +762,8 @@ impl TestClient {
             .expect("il task di rete accetta comandi");
     }
 
-    /// Sposta la sorgente manuale su una coordinata e attende che sia partita.
-    ///
-    /// A inviare e' solo il ticker delle posizioni: il comando cambia la coordinata che la
-    /// sorgente restituisce, e la conferma arriva al primo scatto successivo. Serve quindi
-    /// un client costruito con [`tempi_con_invii`].
+    /// Sposta la sorgente manuale e attende l'invio della nuova posizione; richiede
+    /// [`tempi_con_invii`].
     pub async fn invia_posizione(&mut self, dove: Coordinate) {
         self.comanda(ClientCommand::SetManualPosition(dove)).await;
         self.attendi(
@@ -960,12 +784,7 @@ impl TestClient {
     }
 }
 
-/// Un client che parla il protocollo a mano, senza la sequenza che il client vero rispetta.
-///
-/// Serve agli scenari di sicurezza: una versione di protocollo che il server non accetta,
-/// una richiesta prima dell'accesso, una posizione datata nel futuro sono tutte cose che
-/// [`ClientHandle`] non fa e non deve fare. Usa gli stessi codec dei due programmi, quindi
-/// sul filo passano gli stessi byte.
+/// Client che scrive i messaggi a mano con gli stessi codec, per le prove fuori sequenza.
 pub struct ClientGrezzo {
     /// Meta' in lettura, con il codec dei messaggi del server.
     ingresso: FramedRead<OwnedReadHalf, ServerCodec>,
@@ -1057,19 +876,9 @@ impl ClientGrezzo {
         }
     }
 
-    /// Scarta il ritorno a fermo che il battito della macchina a stati puo' avere gia'
-    /// accodato, senza pretendere che ci sia.
-    ///
-    /// Serve dove uno scenario porta il veicolo oltre la soglia dei tre minuti lasciandolo
-    /// in movimento e poi asserisce su un messaggio preciso: da li' in avanti il task
-    /// periodico e' nel suo diritto di accodare un ritorno a fermo sullo stesso canale, e
-    /// quale dei due arrivi prima dipende da dove cade uno scatto di [`BATTITO`], che e'
-    /// tempo vero. Il cambio si scarta una volta sola perche' e' unico, e va fatto prima
-    /// di mandare la richiesta successiva, quando la coda non puo' contenere altro.
+    /// Scarta l'eventuale ritorno a fermo gia' accodato dal task periodico, se c'e'.
     pub async fn scarta_ritorno_a_fermo(&mut self) {
         match timeout(ATTESA_DEL_BATTITO, self.ingresso.next()).await {
-            // Lo scatto e' gia' avvenuto: il cambio esce dalla coda e cio' che si attende
-            // torna a essere il primo messaggio.
             Ok(Some(Ok(ServerMessage::StateChanged {
                 state: UserState::Still,
             }))) => {}
@@ -1078,9 +887,7 @@ impl ClientGrezzo {
             }
             Ok(Some(Err(errore))) => panic!("frame non valido dal server: {errore}"),
             Ok(None) => panic!("il server ha chiuso il flusso invece di restare in attesa"),
-            // Nessun messaggio entro la finestra: o lo scatto era gia' stato consumato da
-            // una lettura precedente, o non aveva nulla da segnalare. In nessuno dei due
-            // casi e' un fallimento, ed e' per questo che la scadenza non e' generosa.
+            // Nessun cambio entro la finestra: non e' un errore.
             Err(_) => {}
         }
     }

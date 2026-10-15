@@ -1,16 +1,7 @@
 //! Analisi dei comandi digitati nella riga di input della TUI.
 //!
-//! Come `console.rs` nel server, il parsing e' separato dall'esecuzione: [`analizza_input`]
-//! e' una funzione pura che traduce una riga in un [`ComandoUtente`], e chi la chiama
-//! decide cosa farne. I test qui sotto non aprono ne' un terminale ne' una connessione.
-//!
-//! Questa TUI non ha un canale "chat" implicito: il testo libero si manda solo con `/msg`.
-//! Una riga vuota, o senza `/` iniziale, non e' quindi un errore ma un caso senza nulla da
-//! eseguire, e vale [`ErroreInput::NienteDaFare`], che chi chiama ignora in silenzio.
-//!
-//! Solo `/msg` accetta testo con spazi; gli altri comandi si dividono per parole con
-//! [`str::split_whitespace`], mai indicizzando i byte: una riga con caratteri multibyte non
-//! puo' far cadere l'interfaccia su un indice fuori da un confine di carattere.
+//! Solo `/msg` accetta testo con spazi. Una riga vuota o senza `/` iniziale non e' un
+//! errore: vale [`ErroreInput::NienteDaFare`] e viene ignorata.
 
 use georuggine_common::protocol::AnalysisRange;
 use georuggine_common::types::{Coordinate, CoordinateError};
@@ -32,8 +23,7 @@ pub enum ComandoUtente {
 /// Errore restituito da [`analizza_input`] quando la riga non e' un comando eseguibile.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ErroreInput {
-    /// Riga vuota o senza `/` iniziale: vedi la documentazione del modulo. Non e' un
-    /// errore dell'operatore, ed e' cosi' che chi chiama lo riconosce.
+    /// Riga vuota o senza `/` iniziale: nulla da eseguire.
     #[error("nessun comando da eseguire")]
     NienteDaFare,
     /// Al comando manca un argomento obbligatorio.
@@ -71,17 +61,11 @@ pub enum ErroreInput {
     ComandoSconosciuto(String),
 }
 
-/// Traduce una riga digitata nella TUI nel comando che descrive.
-///
-/// La riga viene ripulita degli spazi ai due estremi; il primo termine e' il nome del
-/// comando e tutto cio' che segue sono i suoi argomenti. Non tocca nessuno stato e non
-/// legge nulla: e' una funzione pura.
+/// Traduce una riga nel comando corrispondente.
 ///
 /// # Errori
 ///
-/// La variante di [`ErroreInput`] che descrive cosa non va: [`ErroreInput::NienteDaFare`]
-/// per una riga vuota o senza `/`, un argomento mancante o di troppo, un numero o una
-/// coordinata non validi, un intervallo o un comando sconosciuti.
+/// La variante di [`ErroreInput`] che descrive il problema.
 pub fn analizza_input(riga: &str) -> Result<ComandoUtente, ErroreInput> {
     let riga = riga.trim();
     if !riga.starts_with('/') {
@@ -131,8 +115,7 @@ pub fn analizza_input(riga: &str) -> Result<ComandoUtente, ErroreInput> {
     }
 }
 
-/// Divide una riga gia' ripulita nel primo termine e in cio' che lo segue, tagliando su
-/// un confine di carattere: una riga multibyte non puo' produrre un indice illegale.
+/// Divide una riga nel primo termine e nel resto, su un confine di carattere.
 fn spezza(riga: &str) -> (&str, &str) {
     match riga.split_once(char::is_whitespace) {
         Some((primo, resto)) => (primo, resto.trim_start()),
@@ -140,11 +123,11 @@ fn spezza(riga: &str) -> (&str, &str) {
     }
 }
 
-/// Verifica che a un comando senza argomenti non ne sia stato passato nessuno.
+/// Verifica che il comando non abbia argomenti.
 ///
 /// # Errori
 ///
-/// [`ErroreInput::ArgomentiInEccesso`] se dopo il nome del comando c'e' altro.
+/// [`ErroreInput::ArgomentiInEccesso`] se ce ne sono.
 fn senza_argomenti(comando: &'static str, resto: &str) -> Result<(), ErroreInput> {
     if resto.is_empty() {
         Ok(())
@@ -157,7 +140,7 @@ fn senza_argomenti(comando: &'static str, resto: &str) -> Result<(), ErroreInput
 ///
 /// # Errori
 ///
-/// [`ErroreInput::NumeroNonValido`] se il testo non si interpreta come numero.
+/// [`ErroreInput::NumeroNonValido`] se non e' un numero.
 fn analizza_f64(
     comando: &'static str,
     campo: &'static str,
@@ -173,14 +156,11 @@ fn analizza_f64(
         })
 }
 
-/// Traduce l'alias di un intervallo nella variante di [`AnalysisRange`] che indica.
-///
-/// Valgono i soli tre nomi inglesi: la TUI non ha bisogno di due lingue per lo stesso
-/// comando.
+/// Traduce `today`, `week` o `month` in [`AnalysisRange`].
 ///
 /// # Errori
 ///
-/// [`ErroreInput::IntervalloSconosciuto`] su qualunque altra parola.
+/// [`ErroreInput::IntervalloSconosciuto`] per qualunque altra parola.
 fn analizza_intervallo(parola: &str) -> Result<AnalysisRange, ErroreInput> {
     match parola {
         "today" => Ok(AnalysisRange::Today),

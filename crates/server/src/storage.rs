@@ -1,15 +1,8 @@
-//! Persistenza del server: utenti, storico delle posizioni e messaggi in attesa.
+//! Persistenza del server su SQLite: utenti, posizioni e messaggi.
 //!
-//! L'accesso ai dati passa dal trait [`Repository`], implementato da
-//! [`SqliteRepository`]. I metodi sono **sincroni**: SQLite e' una libreria bloccante, e
-//! nasconderla dietro `async fn` farebbe fermare un thread dell'esecutore. Il chiamante
-//! li avvolge in `tokio::task::spawn_blocking`, quindi qui non si importa tokio.
-//!
-//! Gli istanti sono salvati come testo RFC3339 in UTC **a precisione fissa** in
-//! nanosecondi (`2024-01-01T00:00:00.000000000Z`). SQLite non ha un tipo per le date e
-//! confronta il testo carattere per carattere: a lunghezza variabile `...:00Z` (0x5A)
-//! risulterebbe maggiore di `...:00.5Z`, cioe' l'inverso dell'ordine cronologico. A
-//! lunghezza fissa `ORDER BY recorded_at` coincide con l'ordine sul tempo.
+//! I metodi di [`Repository`] sono sincroni e il chiamante li esegue in `spawn_blocking`.
+//! Gli istanti sono salvati come testo RFC 3339 a nanosecondi fissi, cosi' l'ordinamento
+//! del testo coincide con quello cronologico.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -20,12 +13,9 @@ use georuggine_common::types::{Coordinate, PositionRecord, UserId, Username};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-/// Schema del database, applicato a ogni apertura.
+/// Schema del database, applicato a ogni apertura; ogni `CREATE` e' idempotente.
 ///
-/// Ogni `CREATE` e' `IF NOT EXISTS`, quindi l'apertura e' idempotente.
-/// `foreign_keys=ON` va ripetuto a ogni connessione perche' SQLite lo disattiva per
-/// impostazione predefinita, ed e' cio' che rende osservabile il riferimento a un utente
-/// inesistente.
+/// `foreign_keys` va attivato a ogni connessione perche' SQLite lo tiene spento.
 const SCHEMA: &str = "\
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -69,8 +59,7 @@ pub enum StorageError {
     /// L'operazione fa riferimento a un utente che non esiste.
     #[error("utente inesistente")]
     UserNotFound,
-    /// Una riga letta dal database non si converte nel tipo di dominio corrispondente,
-    /// per esempio uno username che non supera piu' la validazione.
+    /// Una riga letta non si converte nel tipo di dominio.
     #[error("dato illeggibile dal database: {0}")]
     Serialization(String),
 }
@@ -100,8 +89,7 @@ pub enum MessageDirection {
 }
 
 impl MessageDirection {
-    /// Etichetta salvata nella colonna `direction`: il nome e non un intero, cosi' la
-    /// tabella resta leggibile con un qualunque client SQL.
+    /// Etichetta salvata nella colonna `direction`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Broadcast => "Broadcast",
@@ -111,11 +99,7 @@ impl MessageDirection {
     }
 }
 
-/// Identificatore di una riga di `messages`.
-///
-/// E' un `i64` perche' coincide con il `rowid` di SQLite, e un newtype perche' il
-/// compilatore lo distingua da un [`UserId`]: scambiarli marcherebbe consegnato il
-/// messaggio sbagliato, in silenzio.
+/// Identificatore di una riga di `messages`, distinto da [`UserId`] a livello di tipo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId(pub i64);
 
@@ -128,15 +112,9 @@ pub struct PendingMessage {
     pub sent_at: DateTime<Utc>,
 }
 
-/// Accesso in lettura e scrittura ai dati persistiti del server.
+/// Accesso ai dati persistiti del server, condiviso fra i task come `Arc<dyn Repository>`.
 ///
-/// I bound stanno sul trait perche' il repository si condivide fra i task come
-/// `Arc<dyn Repository>` e le sue chiamate finiscono in `spawn_blocking`, che richiede
-/// argomenti `'static`.
-///
-/// Contratto comune, verificato dai test: le letture per un utente inesistente
-/// restituiscono un risultato vuoto e non un errore; gli id degli utenti partono da 1 e
-/// crescono di uno; i risultati hanno l'ordine indicato su ciascun metodo.
+/// Le letture per un utente inesistente restituiscono un risultato vuoto, non un errore.
 pub trait Repository: Send + Sync + 'static {
     /// Registra un nuovo utente e ne restituisce l'id assegnato.
     ///
@@ -146,11 +124,11 @@ pub trait Repository: Send + Sync + 'static {
     fn create_user(&self, username: &Username, password_hash: &str)
     -> Result<UserId, StorageError>;
 
-    /// Cerca un utente per username; l'assenza vale `Ok(None)`, non un errore.
+    /// Cerca un utente per username; `Ok(None)` se non esiste.
     ///
     /// # Errori
     ///
-    /// [`StorageError::Serialization`] se la riga non si converte nei tipi di dominio.
+    /// [`StorageError::Serialization`] se la riga non e' valida.
     fn find_user_by_username(
         &self,
         username: &Username,
@@ -163,14 +141,11 @@ pub trait Repository: Send + Sync + 'static {
     /// [`StorageError::UserNotFound`] se `record.user_id` non esiste.
     fn insert_position(&self, record: &PositionRecord) -> Result<(), StorageError>;
 
-    /// Posizioni di un utente nell'intervallo indicato, estremi inclusi.
-    ///
-    /// Ordinate per `recorded_at` crescente e, a parita' di istante, per ordine di
-    /// inserimento.
+    /// Posizioni di un utente nell'intervallo, estremi inclusi, in ordine cronologico.
     ///
     /// # Errori
     ///
-    /// [`StorageError::Serialization`] se una riga non si converte nei tipi di dominio.
+    /// [`StorageError::Serialization`] se una riga non e' valida.
     fn positions_in_range(
         &self,
         user_id: UserId,
@@ -178,11 +153,8 @@ pub trait Repository: Send + Sync + 'static {
         to: DateTime<Utc>,
     ) -> Result<Vec<PositionRecord>, StorageError>;
 
-    /// Registra un messaggio come non ancora consegnato e ne restituisce l'id.
-    ///
-    /// `user_id` e' `None` per i messaggi senza un singolo destinatario. L'id serve a
-    /// marcare consegnato **quel** messaggio con [`Repository::mark_delivered`], senza
-    /// toccare gli altri che lo stesso utente potrebbe avere in attesa.
+    /// Salva un messaggio non ancora consegnato e ne restituisce l'id; `user_id` e'
+    /// `None` per i broadcast.
     ///
     /// # Errori
     ///
@@ -195,20 +167,14 @@ pub trait Repository: Send + Sync + 'static {
         at: DateTime<Utc>,
     ) -> Result<MessageId, StorageError>;
 
-    /// Messaggi che il server deve ancora recapitare all'utente, per `sent_at` crescente.
-    ///
-    /// Sono i soli [`MessageDirection::Direct`] non consegnati: cio' che il veicolo ha
-    /// mandato al server ha gia' raggiunto il destinatario, e gli avvisi alla flotta
-    /// valgono per chi era collegato quando sono partiti.
+    /// Messaggi diretti non ancora consegnati all'utente, in ordine di invio.
     ///
     /// # Errori
     ///
-    /// [`StorageError::Serialization`] se una riga non si converte nei tipi di dominio.
+    /// [`StorageError::Serialization`] se una riga non e' valida.
     fn pending_messages(&self, user_id: UserId) -> Result<Vec<PendingMessage>, StorageError>;
 
-    /// Segna come consegnato il singolo messaggio indicato.
-    ///
-    /// E' idempotente, e un id che non esiste non e' un errore.
+    /// Segna come consegnato un messaggio; un id inesistente non e' un errore.
     ///
     /// # Errori
     ///
@@ -217,19 +183,16 @@ pub trait Repository: Send + Sync + 'static {
 
     /// Segna come consegnati tutti i messaggi in attesa dell'utente.
     ///
-    /// Riguarda esattamente cio' che [`Repository::pending_messages`] restituirebbe. Le
-    /// righe vengono marcate e non cancellate: lo storico resta interrogabile.
-    ///
     /// # Errori
     ///
     /// [`StorageError::Sqlite`] se la scrittura fallisce.
     fn clear_pending_messages(&self, user_id: UserId) -> Result<(), StorageError>;
 
-    /// Tutti gli utenti registrati, ordinati per id crescente.
+    /// Utenti registrati, in ordine di id.
     ///
     /// # Errori
     ///
-    /// [`StorageError::Serialization`] se una riga non si converte nei tipi di dominio.
+    /// [`StorageError::Serialization`] se una riga non e' valida.
     fn list_users(&self) -> Result<Vec<StoredUser>, StorageError>;
 }
 
@@ -247,14 +210,14 @@ fn analizza_istante(testo: &str) -> Result<DateTime<Utc>, StorageError> {
         })
 }
 
-/// Converte l'id a 64 bit di una riga nel [`UserId`] a 32 bit, senza troncare con `as`.
+/// Converte l'id di una riga in [`UserId`] senza troncare.
 fn id_da_riga(grezzo: i64) -> Result<UserId, StorageError> {
     u32::try_from(grezzo).map(UserId).map_err(|_| {
         StorageError::Serialization(format!("id utente {grezzo} fuori dall'intervallo di u32"))
     })
 }
 
-/// Riconosce la violazione del vincolo `UNIQUE` su `users.username`, l'unico dello schema.
+/// Riconosce la violazione del vincolo `UNIQUE` su `users.username`.
 fn errore_di_unicita(errore: rusqlite::Error) -> StorageError {
     match &errore {
         rusqlite::Error::SqliteFailure(fallimento, _)
@@ -281,11 +244,7 @@ fn errore_di_riferimento(errore: rusqlite::Error) -> StorageError {
 /// Colonne di `users` come arrivano da SQLite, prima della validazione di dominio.
 type ColonneUtente = (i64, String, String, String);
 
-/// Costruisce uno [`StoredUser`] dalle colonne grezze.
-///
-/// Sta fuori dalla chiusura passata a rusqlite, che puo' fallire solo con
-/// `rusqlite::Error`: cosi' un errore di validazione non va impacchettato dentro un
-/// errore di database per poi doverlo riestrarre.
+/// Costruisce uno [`StoredUser`] dalle colonne lette.
 fn utente_da_colonne(colonne: ColonneUtente) -> Result<StoredUser, StorageError> {
     let (id, username, password_hash, created_at) = colonne;
     Ok(StoredUser {
@@ -298,11 +257,8 @@ fn utente_da_colonne(colonne: ColonneUtente) -> Result<StoredUser, StorageError>
     })
 }
 
-/// Repository su file SQLite.
-///
-/// La connessione sta dietro un [`Mutex`] perche' `rusqlite::Connection` e' `Send` ma
-/// non `Sync`, mentre [`Repository`] va condiviso fra i task. Il lock non attraversa mai
-/// un `.await`: i metodi sono sincroni e girano dentro `spawn_blocking`.
+/// Repository su file SQLite; la connessione sta dietro un [`Mutex`] perche' non e'
+/// `Sync`.
 pub struct SqliteRepository {
     connessione: Mutex<Connection>,
     /// Sorgente dell'ora usata per `created_at`.
@@ -310,14 +266,11 @@ pub struct SqliteRepository {
 }
 
 impl SqliteRepository {
-    /// Apre il database al percorso indicato e vi applica lo schema.
-    ///
-    /// Il percorso puo' essere `":memory:"` per un database temporaneo in RAM.
+    /// Apre il database (anche `":memory:"`) e applica lo schema.
     ///
     /// # Errori
     ///
-    /// [`StorageError::Sqlite`] se il file non e' apribile o lo schema non e'
-    /// applicabile.
+    /// [`StorageError::Sqlite`] se il file non si apre o lo schema non si applica.
     pub fn new(percorso: impl AsRef<Path>, orologio: Arc<dyn Clock>) -> Result<Self, StorageError> {
         let connessione = Connection::open(percorso)?;
         connessione.execute_batch(SCHEMA)?;
@@ -328,8 +281,7 @@ impl SqliteRepository {
         })
     }
 
-    /// Prende il lock riprendendolo anche se e' avvelenato: ogni metodo esegue statement
-    /// completi, e SQLite non lascia transazioni implicite a meta'.
+    /// Prende il lock anche se avvelenato: ogni metodo esegue statement completi.
     fn blocca(&self) -> MutexGuard<'_, Connection> {
         self.connessione
             .lock()
@@ -448,8 +400,7 @@ impl Repository for SqliteRepository {
             ],
         )?;
 
-        // `last_insert_rowid` e' relativo alla connessione, che sta sotto lo stesso lock
-        // dell'inserimento: fra le due chiamate non puo' passare un'altra scrittura.
+        // Stesso lock dell'inserimento: nessun'altra scrittura in mezzo.
         Ok(MessageId(connessione.last_insert_rowid()))
     }
 
@@ -480,7 +431,6 @@ impl Repository for SqliteRepository {
 
     fn mark_delivered(&self, id: MessageId) -> Result<(), StorageError> {
         let connessione = self.blocca();
-        // Un id che non esiste aggiorna zero righe: `execute` non lo considera un errore.
         connessione.execute(
             "UPDATE messages SET delivered = 1 WHERE id = ?1",
             params![id.0],
@@ -491,9 +441,7 @@ impl Repository for SqliteRepository {
 
     fn clear_pending_messages(&self, user_id: UserId) -> Result<(), StorageError> {
         let connessione = self.blocca();
-        // Il filtro ripete quello di `pending_messages`: le due operazioni devono avere
-        // la stessa idea di cosa sia un messaggio in attesa, altrimenti lo svuotamento
-        // marcherebbe righe che nessuno ha mai letto.
+        // Stesso filtro di `pending_messages`.
         connessione.execute(
             "UPDATE messages SET delivered = 1 \
              WHERE user_id = ?1 AND direction = ?2 AND delivered = 0",
@@ -539,8 +487,7 @@ mod tests {
         Username::new(nome).expect("username di test valido")
     }
 
-    /// Coordinata associata all'offset in secondi di una posizione di prova: insieme a
-    /// `recorded_at` fa da impronta del record.
+    /// Coordinata associata all'offset di una posizione di prova, per riconoscerla.
     fn posizione_di(offset: i64) -> Coordinate {
         Coordinate::new(45.0 + offset as f64 / 1_000.0, 7.6869).expect("coordinata valida")
     }
@@ -563,7 +510,7 @@ mod tests {
         ))
     }
 
-    /// Cancella il file di prova e i file ausiliari che il modo WAL si porta dietro.
+    /// Cancella il file di prova e i file ausiliari del modo WAL.
     fn rimuovi(percorso: &Path) {
         for sospeso in ["", "-wal", "-shm"] {
             let mut nome = percorso.as_os_str().to_owned();
@@ -633,8 +580,7 @@ mod tests {
             .create_user(&utente("veicolo_02"), "hash")
             .expect("creazione riuscita");
 
-        // Inserite fuori ordine cronologico: se la query non ordinasse per `recorded_at`
-        // tornerebbero nell'ordine di inserimento.
+        // Inserite fuori ordine: la query deve ordinarle per `recorded_at`.
         for offset in [30, 0, 40, 10, 20] {
             repo.insert_position(&PositionRecord {
                 user_id: id,
@@ -660,8 +606,6 @@ mod tests {
             assert_eq!(posizione.coordinate, posizione_di(offset));
         }
 
-        // Intervallo vuoto, utente senza posizioni e utente inesistente: risultato
-        // vuoto, non errore.
         for (utente_cercato, da, a) in [(id, 100, 200), (secondo, 0, 100), (UserId(9_999), 0, 100)]
         {
             assert!(
@@ -715,9 +659,7 @@ mod tests {
             .expect("inserimento riuscito");
         assert_ne!(piu_recente, piu_vecchio, "ogni messaggio ha un id suo");
 
-        // Nessuno dei tre e' in attesa: il testo che il veicolo ha mandato al server ha
-        // gia' raggiunto il destinatario, l'avviso alla flotta vale per chi era
-        // collegato, e il diretto e' di un altro utente.
+        // Solo i diretti non consegnati sono in attesa.
         for (destinatario, direzione, corpo) in [
             (Some(id), MessageDirection::Inbound, "sono in arrivo"),
             (Some(id), MessageDirection::Broadcast, "chiusura turno"),
@@ -798,8 +740,7 @@ mod tests {
 
     #[test]
     fn messages_non_ha_il_vincolo_di_chiave_esterna_di_positions() {
-        // Asimmetria voluta dello schema: un messaggio per un utente inesistente viene
-        // accettato, mentre `insert_position` da' UserNotFound. Il test la fissa.
+        // Lo schema accetta messaggi per utenti inesistenti, a differenza delle posizioni.
         let repo = repo_in_memoria();
 
         repo.insert_message(
@@ -826,9 +767,7 @@ mod tests {
             .create_user(&utente("veicolo_01"), "hash")
             .expect("creazione riuscita");
 
-        // E' il caso in cui un formato a precisione variabile farebbe ordinare a SQLite
-        // il testo in modo diverso dal tempo. Verifica anche che i nanosecondi
-        // sopravvivano al giro di andata e ritorno.
+        // Precisione variabile: verifica ordinamento e conservazione dei nanosecondi.
         for istante in [
             t0 + TimeDelta::milliseconds(500),
             t0,
@@ -870,8 +809,7 @@ mod tests {
             repo.create_user(&nome, "hash").expect("creazione riuscita")
         };
 
-        // La seconda apertura riesegue lo schema: deve essere idempotente e lasciare
-        // intatte le righe gia' presenti.
+        // La seconda apertura riapplica lo schema senza toccare i dati.
         let repo = SqliteRepository::new(&percorso, Arc::new(FakeClock::new(istante_base())))
             .expect("riapertura riuscita");
         assert_eq!(

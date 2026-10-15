@@ -1,17 +1,11 @@
-//! Nucleo di rete del client: configurazione, sessione e ciclo di invio delle posizioni.
+//! Nucleo di rete del client: configurazione, sessione e invio periodico delle posizioni.
 //!
-//! [`ClientHandle::spawn`] avvia un task che apre la connessione, si autentica e resta in
-//! ascolto. L'interfaccia non conosce il socket: le manda [`ClientCommand`] e ne legge
-//! [`ClientEvent`], attraverso due canali.
+//! [`ClientHandle::spawn`] avvia il task di rete; l'interfaccia comunica con lui solo
+//! tramite [`ClientCommand`] ed [`ClientEvent`].
 //!
-//! # Riconnessione
-//!
-//! Una connessione che cade non ferma il client: si riprova con un backoff crescente,
-//! continuando nel frattempo a interrogare la sorgente e ad accumulare in una coda locale
-//! le posizioni che non si possono inviare. Due casi fanno invece terminare il task:
-//! credenziali rifiutate o versione di protocollo incompatibile (riprovare darebbe lo
-//! stesso esito) e la sostituzione di sessione, dove riconnettersi espellerebbe la
-//! connessione che ha preso il posto di questa, in un ciclo perpetuo fra i due client.
+//! Se la connessione cade il task riprova con un backoff crescente, accodando nel
+//! frattempo le posizioni. Si ferma invece su credenziali rifiutate, versione
+//! incompatibile o sessione sostituita, dove riprovare non avrebbe senso.
 
 use std::collections::VecDeque;
 use std::net::{AddrParseError, SocketAddr};
@@ -55,9 +49,6 @@ const CAPACITA_EVENTI: usize = 32;
 const ATTESA_CHIUSURA: Duration = Duration::from_secs(5);
 
 /// Attesa massima, dopo il `Logout`, perche' il server chiuda la connessione.
-///
-/// Sta sotto [`ATTESA_CHIUSURA`], che la comprende: il server risponde al `Logout` e chiude
-/// in pochi millisecondi, e un secondo basta anche a uno sotto carico.
 const ATTESA_LOGOUT: Duration = Duration::from_secs(1);
 
 /// Testo mostrato da `--help`.
@@ -136,17 +127,14 @@ pub struct ClientConfig {
     pub username: Username,
     /// Password in chiaro, verificata dal server.
     pub password: String,
-    /// Se vero apre la sessione con [`ClientMessage::Register`] invece che con
+    /// Apre la prima sessione con [`ClientMessage::Register`] invece di
     /// [`ClientMessage::Login`].
     pub register: bool,
     /// Strategia con cui il client simula la propria posizione.
     pub source: SourceKind,
 }
 
-/// Esito dell'analisi degli argomenti.
-///
-/// Come nel server, `--help` non stampa ne' esce da dentro l'analisi: la decisione torna
-/// al chiamante, cosi' la funzione resta pura e verificabile.
+/// Esito dell'analisi degli argomenti; `--help` viene gestito dal chiamante.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Avvio {
     /// Il client deve partire con questa configurazione.
@@ -155,8 +143,7 @@ pub enum Avvio {
     Uso,
 }
 
-/// Argomenti specifici di `--source`, raccolti indipendentemente dall'ordine in cui
-/// compaiono rispetto a `--source` stesso.
+/// Opzioni specifiche della sorgente, valide in qualunque ordine rispetto a `--source`.
 #[derive(Default)]
 struct SorgenteGrezza {
     file_path: Option<PathBuf>,
@@ -381,7 +368,7 @@ fn costruisci_source_kind(
     }
 }
 
-/// Comando che l'interfaccia manda al task di rete. Per invio di messaggi
+/// Comando che l'interfaccia invia al task di rete.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientCommand {
     /// Manda un messaggio testuale al server.
@@ -397,10 +384,10 @@ pub enum ClientCommand {
 /// Evento che il task di rete manda all'interfaccia.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientEvent {
-    /// La sessione e' aperta: handshake, autenticazione e messaggi in attesa consegnati.
+    /// Sessione aperta.
     Connected,
-    /// La connessione e' caduta; il campo descrive il motivo. Un tentativo di
-    /// riconnessione e' gia' in corso, salvo che il task stia per terminare
+    /// Connessione caduta, con il motivo; se il task non sta terminando, la
+    /// riconnessione e' gia' in corso.
     Disconnected(String),
     /// Testo ricevuto dal server.
     ServerText {
@@ -415,13 +402,11 @@ pub enum ClientEvent {
     PositionSent(Coordinate),
     /// Il server ha risposto a [`ClientCommand::RequestAnalysis`].
     AnalysisReceived(MovementSummary),
-    /// Un errore non fatale: una richiesta rifiutata dal server, o l'impossibilita' di
-    /// aprire la sessione con le credenziali configurate.
+    /// Errore non fatale, per esempio una richiesta rifiutata dal server.
     Error(String),
 }
 
-/// Parametri temporali del task di rete: intervallo di invio periodico e progressione del
-/// backoff di riconnessione.
+/// Intervallo di invio e ritardi di riconnessione del task di rete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tempi {
     /// Intervallo fra due interrogazioni della sorgente di posizione.
@@ -433,8 +418,7 @@ pub struct Tempi {
 }
 
 impl Default for Tempi {
-    /// Trenta secondi fra un invio e il successivo, come chiede la traccia; backoff 1s,
-    /// 2s, 4s, 8s, poi 30s fisso.
+    /// Invio ogni 30 secondi; backoff 1, 2, 4, 8 secondi, poi 30 fissi.
     fn default() -> Self {
         Self {
             intervallo_posizione: Duration::from_secs(30),
@@ -450,7 +434,8 @@ impl Default for Tempi {
 }
 
 impl Tempi {
-    /// Ritardo del tentativo numero `tentativo` (il primo e' 1), con un jitter casuale fino al 20% in piu'
+    /// Ritardo del tentativo numero `tentativo` (da 1), con fino al 20% di variazione
+    /// casuale.
     fn ritardo_di(&self, tentativo: u32) -> Duration {
         let indice = usize::try_from(tentativo.saturating_sub(1)).unwrap_or(usize::MAX);
         let base = self
@@ -463,7 +448,7 @@ impl Tempi {
     }
 }
 
-/// Stato che il task di rete porta attraverso le fasi connessa e disconnessa.
+/// Stato del task di rete condiviso fra fase connessa e attesa di riconnessione.
 struct StatoRete<'a> {
     sorgente: &'a mut dyn PositionSource,
     manuale: Option<&'a SorgenteManuale<Coordinate>>,
@@ -474,54 +459,47 @@ struct StatoRete<'a> {
 
 /// Motivo per cui l'apertura della sessione non e' riuscita.
 enum MotivoFallimento {
-    /// Un guasto di rete o un protocollo violato: vale la pena riprovare.
+    /// Errore di rete o di protocollo: si riprova.
     Rete(String),
-    /// Credenziali rifiutate o versione incompatibile: riprovare con la stessa
-    /// configurazione darebbe di nuovo lo stesso esito, quindi il task termina.
+    /// Credenziali rifiutate o versione incompatibile: riprovare non servirebbe.
     Terminale(String),
 }
 
 /// Esito della fase connessa del task di rete.
 enum EsitoFase {
-    /// La connessione e' caduta: il chiamante riprova con il backoff.
+    /// Connessione caduta: si riprova con il backoff.
     Riconnetti(String),
-    /// Il server ha chiuso la sessione apposta, perche' lo stesso utente si e' collegato
-    /// da un'altra parte: il task termina **senza** riprovare, ma l'utente va avvisato.
+    /// Sessione sostituita da un altro accesso dello stesso utente: il task termina
+    /// senza riprovare.
     SessioneSostituita(String),
-    /// [`ClientCommand::Quit`] o la caduta del canale dei comandi: il task termina.
+    /// [`ClientCommand::Quit`] o canale dei comandi chiuso: il task termina.
     Termina,
 }
 
 /// Esito dell'attesa fra un tentativo di riconnessione e il successivo.
 enum EsitoAttesa {
-    /// Il ritardo e' scaduto: si puo' tentare di nuovo la connessione.
+    /// Il ritardo e' scaduto: si riprova.
     Riprova,
-    /// [`ClientCommand::Quit`] o la caduta del canale dei comandi: il task termina.
+    /// [`ClientCommand::Quit`] o canale dei comandi chiuso: il task termina.
     Termina,
 }
 
-/// Nucleo di rete: avvia un task interno e lo disaccoppia dal resto del programma con due
-/// canali.
+/// Handle del task di rete, con i canali di comandi ed eventi.
 ///
-/// Il canale degli eventi si chiude (restituendo `None`) quando il task termina. Chi lo
-/// avvia deve chiuderlo con [`ClientHandle::chiudi`]: lasciar cadere l'handle non basta.
+/// Il canale degli eventi si chiude quando il task termina; va chiuso con
+/// [`ClientHandle::chiudi`].
 pub struct ClientHandle {
     /// Comandi da mandare al task di rete.
     pub command_tx: mpsc::Sender<ClientCommand>,
     /// Eventi che il task di rete produce.
     pub event_rx: mpsc::Receiver<ClientEvent>,
-    /// Task di rete, atteso da [`ClientHandle::chiudi`]. Non e' pubblico: chi usa
-    /// l'handle non deve poterlo interrompere se non passando dalla chiusura ordinata.
+    /// Task di rete, atteso da [`ClientHandle::chiudi`].
     task: JoinHandle<()>,
 }
 
 impl ClientHandle {
-    /// Avvia il task di rete.
-    ///
-    /// `sorgente` arriva gia' costruita da [SourceKind::build]
-    /// `clock` e `tempi` sono parametri e non valori fissi perche' i test possano
-    /// accorciare intervallo e backoff e iniettare un orologio deterministico. In produzione si passano
-    /// `SystemClock` e [`Tempi::default`].
+    /// Avvia il task di rete con la sorgente gia' costruita. `clock` e `tempi` sono
+    /// parametri per i test; in produzione si usano `SystemClock` e [`Tempi::default`].
     pub fn spawn(
         config: ClientConfig,
         sorgente: SorgenteCostruita,
@@ -538,20 +516,10 @@ impl ClientHandle {
         }
     }
 
-    /// Chiude la sessione e attende che il task di rete sia davvero terminato; falso se
-    /// la scadenza passa per prima.
+    /// Chiude la sessione e attende la fine del task di rete; `false` se scade l'attesa.
     ///
-    /// Lasciar cadere l'handle non basta: al ritorno di `main` il runtime viene distrutto
-    /// e i task ancora vivi spariscono, quindi il `Logout` andrebbe perso in una corsa e
-    /// il server libererebbe la sessione solo alla scadenza di inattivita'. L'ordine
-    /// conta:
-    ///
-    /// 1. cade il ricevitore degli eventi, altrimenti un task fermo su un canale pieno —
-    ///    nessuno lo drena piu' — non arriverebbe mai a leggere il comando di chiusura;
-    /// 2. parte [`ClientCommand::Quit`], che fa inviare `Logout` e chiudere la scrittura;
-    /// 3. cade anche il mittente dei comandi, cosi' un task gia' oltre la lettura del
-    ///    comando termina comunque sul canale chiuso;
-    /// 4. si attende la fine del task, con un tetto complessivo sulle tre attese.
+    /// Si chiude prima il canale degli eventi, cosi' il task non resta bloccato a
+    /// scriverci, poi si invia [`ClientCommand::Quit`] e si attende il task.
     pub async fn chiudi(self) -> bool {
         let Self {
             command_tx,
@@ -563,8 +531,7 @@ impl ClientHandle {
         timeout(ATTESA_CHIUSURA, async move {
             let _ = command_tx.send(ClientCommand::Quit).await;
             drop(command_tx);
-            // L'errore di join significa che il task e' andato in panico: non c'e' nulla
-            // da fare oltre a smettere di aspettarlo.
+            // Un errore di join indica un panico del task: non c'e' altro da fare.
             let _ = task.await;
         })
         .await
@@ -572,8 +539,8 @@ impl ClientHandle {
     }
 }
 
-/// Corpo del task di rete: alterna connessione e attesa di riconnessione finche' non
-/// arriva [`ClientCommand::Quit`] o un fallimento non ripetibile dell'autenticazione.
+/// Corpo del task di rete: alterna connessione e attesa di riconnessione fino a
+/// [`ClientCommand::Quit`] o a un errore non recuperabile.
 async fn esegui(
     config: ClientConfig,
     costruita: SorgenteCostruita,
@@ -588,16 +555,13 @@ async fn esegui(
 
     let mut ticker = tokio::time::interval(tempi.intervallo_posizione);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // Il primo tick matura subito: lo si consuma qui, altrimenti la prima posizione
-    // partirebbe all'apertura della connessione invece che dopo un intervallo.
+    // Si scarta il primo tick, che matura subito: la prima posizione parte dopo un
+    // intervallo.
     ticker.tick().await;
 
     let mut tentativo: u32 = 0;
-    // `config.register` dice come aprire la *prima* sessione, non tutte: una volta
-    // registrato l'utente esiste, e ripresentare `Register` a ogni riconnessione si
-    // prenderebbe `UsernameTaken`, che e' terminale e farebbe uscire il task. Il flag vive
-    // percio' nel ciclo, e lo abbassa solo un `Register` a cui il server ha risposto
-    // `SessionToken`.
+    // `--register` vale solo per la prima sessione: le riconnessioni usano il login,
+    // altrimenti il server risponderebbe UsernameTaken.
     let mut da_registrare = config.register;
 
     loop {
@@ -625,8 +589,7 @@ async fn esegui(
                 .await
                 {
                     EsitoFase::Termina => return,
-                    // Chiusura voluta dal server: si avvisa e si esce, senza passare dal
-                    // backoff. Rilanciare il client tocca all'utente.
+                    // Sessione sostituita: si avvisa e si termina senza backoff.
                     EsitoFase::SessioneSostituita(motivo) => {
                         let _ = event_tx.send(ClientEvent::Disconnected(motivo)).await;
                         return;
@@ -666,10 +629,8 @@ async fn esegui(
     }
 }
 
-/// Apre la connessione ed esegue handshake e autenticazione.
-///
-/// `registra` decide fra [`ClientMessage::Register`] e [`ClientMessage::Login`], e non e'
-/// `config.register` perche' quel campo vale per la prima sessione e non per le successive.
+/// Apre la connessione ed esegue handshake e autenticazione; `registra` sceglie fra
+/// Register e Login.
 async fn connetti_e_autentica(
     config: &ClientConfig,
     registra: bool,
@@ -729,8 +690,7 @@ async fn connetti_e_autentica(
     }
 }
 
-/// Legge il prossimo messaggio, traducendo EOF ed errori di frame in
-/// [`MotivoFallimento::Rete`].
+/// Legge il prossimo messaggio; EOF ed errori diventano [`MotivoFallimento::Rete`].
 async fn prossimo(
     ingresso: &mut FramedRead<OwnedReadHalf, ServerCodec>,
 ) -> Result<ServerMessage, MotivoFallimento> {
@@ -753,8 +713,8 @@ fn esito_errore(code: ErrorCode, message: String) -> MotivoFallimento {
     }
 }
 
-/// Ciclo principale a connessione aperta: invii periodici, comandi in arrivo e messaggi
-/// dal server, finche' la connessione non cade o arriva [`ClientCommand::Quit`].
+/// Ciclo a connessione aperta: invii periodici, comandi e messaggi del server, fino alla
+/// caduta della connessione o a [`ClientCommand::Quit`].
 async fn fase_connessa(
     ingresso: &mut FramedRead<OwnedReadHalf, ServerCodec>,
     uscita: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
@@ -762,7 +722,7 @@ async fn fase_connessa(
     command_rx: &mut mpsc::Receiver<ClientCommand>,
     event_tx: &mpsc::Sender<ClientEvent>,
 ) -> EsitoFase {
-    // Le posizioni accumulate durante una disconnessione precedente partono subito.
+    // Prima si inviano le posizioni accumulate da disconnessi.
     if let Err(errore) = svuota_coda(stato.coda, uscita, event_tx).await {
         return EsitoFase::Riconnetti(errore);
     }
@@ -773,9 +733,8 @@ async fn fase_connessa(
                 let ora = stato.clock.now();
                 match stato.sorgente.next_position(ora) {
                     Some(coordinate) => accoda(stato.coda, coordinate, ora),
-                    // Sorgente esaurita: un percorso da file arrivato in fondo senza
-                    // ripetizione non produrra' piu' nulla, e una connessione muta viene
-                    // chiusa dal server alla scadenza di inattivita'
+                    // Sorgente esaurita: si invia un Ping per non far scadere la
+                    // connessione per inattivita'.
                     None => {
                         if uscita.send(ClientMessage::Ping).await.is_err() {
                             return EsitoFase::Riconnetti("scrittura fallita".to_owned());
@@ -838,9 +797,7 @@ async fn fase_connessa(
                     Some(Ok(ServerMessage::AnalysisReport(riepilogo))) => {
                         let _ = event_tx.send(ClientEvent::AnalysisReceived(riepilogo)).await;
                     }
-                    // La sostituzione di sessione si riconosce dal testo e non dal codice:
-                    // il protocollo non ha un `ErrorCode` dedicato. Il ramo precede quello
-                    // generale apposta, altrimenti finirebbe fra gli errori qualunque.
+                    // La sostituzione si riconosce dal testo: non ha un ErrorCode dedicato.
                     Some(Ok(ServerMessage::Error { message, .. }))
                         if message == SESSION_REPLACED_MESSAGE =>
                     {
@@ -849,7 +806,7 @@ async fn fase_connessa(
                     Some(Ok(ServerMessage::Error { message, .. })) => {
                         let _ = event_tx.send(ClientEvent::Error(message)).await;
                     }
-                    // Welcome, SessionToken, Ack e Pong fuori sequenza: nulla da fare.
+                    // Altri messaggi fuori sequenza: ignorati.
                     Some(Ok(_)) => {}
                     Some(Err(errore)) => return EsitoFase::Riconnetti(errore.to_string()),
                     None => {
@@ -861,15 +818,11 @@ async fn fase_connessa(
     }
 }
 
-/// Manda `Logout` e chiude la connessione in modo ordinato.
+/// Invia `Logout` e chiude in modo ordinato: chiude solo il verso di scrittura e legge
+/// finche' il server non chiude, al massimo per [`ATTESA_LOGOUT`].
 ///
-/// Chiudere subito il socket non basta: se il server sta ancora rispondendo alle richieste
-/// precedenti, le sue risposte arrivano a un socket chiuso, il sistema operativo del client
-/// risponde con un reset e il server scarta cio' che aveva ricevuto ma non ancora letto,
-/// cioe' le ultime posizioni e il `Logout` stesso. Si chiude percio' solo il verso di
-/// scrittura e si continua a leggere, scartando, finche' il server non chiude a sua volta,
-/// cosa che fa subito dopo aver confermato il `Logout`; [`ATTESA_LOGOUT`] limita l'attesa
-/// se il server non risponde.
+/// Chiudere subito il socket farebbe rispondere il sistema con un reset alle risposte
+/// ancora in arrivo, e il server scarterebbe le ultime posizioni non ancora lette.
 async fn chiudi_con_logout(
     ingresso: &mut FramedRead<OwnedReadHalf, ServerCodec>,
     uscita: &mut FramedWrite<OwnedWriteHalf, ClientCodec>,
@@ -882,8 +835,8 @@ async fn chiudi_con_logout(
     .await;
 }
 
-/// Attende il ritardo di backoff, continuando a interrogare la sorgente e a servire i
-/// comandi che non richiedono una connessione.
+/// Attende il ritardo di backoff continuando a raccogliere posizioni e a gestire i
+/// comandi che non richiedono la connessione.
 async fn attesa_riconnessione(
     ritardo: Duration,
     stato: &mut StatoRete<'_>,
@@ -935,7 +888,7 @@ fn accoda(
     coda.push_back((coordinate, quando));
 }
 
-/// Invia in ordine tutte le posizioni in coda, emettendo [`ClientEvent::PositionSent`] per
+/// Invia in ordine le posizioni in coda, emettendo [`ClientEvent::PositionSent`] per
 /// ognuna.
 async fn svuota_coda(
     coda: &mut VecDeque<(Coordinate, DateTime<Utc>)>,
@@ -967,11 +920,10 @@ mod tests {
     use georuggine_common::clock::SystemClock;
     use tokio::net::TcpListener;
 
-    /// Quanto un test aspetta un evento o un messaggio prima di considerarlo mancato.
+    /// Attesa massima di un evento o di un messaggio nei test.
     const ATTESA: Duration = Duration::from_secs(5);
 
-    /// Tempi accorciati per i test su backoff e invio periodico: reali, ma troppo brevi
-    /// perche' un test debba aspettare i valori di produzione.
+    /// Tempi accorciati per i test.
     fn tempi_di_prova() -> Tempi {
         Tempi {
             intervallo_posizione: Duration::from_millis(80),
@@ -980,9 +932,8 @@ mod tests {
         }
     }
 
-    /// Backoff cortissimo, cosi' la riconnessione arriva subito, e invio periodico lasciato
-    /// a trenta secondi, cosi' il ticker non infila messaggi in mezzo alla sequenza
-    /// osservata.
+    /// Backoff cortissimo e invio periodico lento, per non avere posizioni in mezzo ai
+    /// messaggi osservati.
     fn tempi_di_riconnessione() -> Tempi {
         Tempi {
             intervallo_posizione: Duration::from_secs(30),
@@ -995,8 +946,7 @@ mod tests {
         Coordinate::new(lat, lon).expect("coordinata di test valida")
     }
 
-    /// Configurazione di test con una sorgente manuale, che non produce mai posizioni
-    /// nuove da sola.
+    /// Configurazione di test con sorgente manuale.
     fn config(indirizzo: SocketAddr) -> ClientConfig {
         ClientConfig {
             server_addr: indirizzo,
@@ -1009,7 +959,7 @@ mod tests {
         }
     }
 
-    /// Configurazione con un cammino casuale: produce posizioni diverse a ogni chiamata.
+    /// Configurazione con un cammino casuale.
     fn config_con_random(indirizzo: SocketAddr) -> ClientConfig {
         ClientConfig {
             source: SourceKind::RandomWalk {
@@ -1022,8 +972,7 @@ mod tests {
         }
     }
 
-    /// Avvia il task di rete costruendo la sorgente dalla configurazione, come fa il
-    /// binario.
+    /// Avvia il task di rete costruendo la sorgente dalla configurazione.
     fn avvia(config: ClientConfig, tempi: Tempi) -> ClientHandle {
         let sorgente = config.source.build().expect("sorgente di test costruibile");
         ClientHandle::spawn(config, sorgente, Arc::new(SystemClock), tempi)
@@ -1063,8 +1012,7 @@ mod tests {
             .expect("il canale degli eventi non deve chiudersi qui")
     }
 
-    /// Server finto in ascolto su una porta effimera: parla il protocollo vero con i codec
-    /// di `common`.
+    /// Server finto su una porta effimera, con i codec veri.
     struct ServerFinto {
         listener: TcpListener,
         indirizzo: SocketAddr,
@@ -1090,18 +1038,14 @@ mod tests {
             ConnessioneFinta::da_stream(stream)
         }
 
-        /// Vero se entro `durata` nessuno prova a collegarsi.
-        ///
-        /// Serve a verificare che un tentativo di riconnessione **non** parta. Va usata
-        /// con un backoff di prova molto piu' corto della durata attesa, altrimenti
-        /// direbbe vero anche di un client che si sta ancora preparando a riprovare.
+        /// Vero se entro `durata` nessuno si collega; va usato con un backoff molto piu'
+        /// corto di `durata`.
         async fn nessuna_connessione_entro(&self, durata: Duration) -> bool {
             timeout(durata, self.listener.accept()).await.is_err()
         }
     }
 
-    /// Connessione accettata dal server finto: legge [`ClientMessage`] e scrive
-    /// [`ServerMessage`].
+    /// Connessione accettata dal server finto.
     struct ConnessioneFinta {
         lettura: FramedRead<OwnedReadHalf, ClientCodec>,
         scrittura: FramedWrite<OwnedWriteHalf, ServerCodec>,
@@ -1132,9 +1076,8 @@ mod tests {
                 .expect("il frame ricevuto deve essere valido")
         }
 
-        /// Risponde Welcome a Hello e restituisce il messaggio di autenticazione che segue,
-        /// lasciando al chiamante la risposta: restituirlo invece di scartarlo serve ai
-        /// test che devono distinguere `Register` da `Login` tentativo per tentativo.
+        /// Risponde Welcome a Hello e restituisce il messaggio di autenticazione, senza
+        /// rispondere.
         async fn handshake(&mut self) -> ClientMessage {
             match self.ricevi().await {
                 ClientMessage::Hello { protocol_version } => {
@@ -1219,7 +1162,7 @@ mod tests {
 
         assert!(configura(&["--source", "manual", "--start", "45.0,7.0", "--register"]).register);
 
-        // `--help` vince anche su una riga che sarebbe incompleta.
+        // `--help` prevale anche su una riga incompleta.
         assert_eq!(
             ClientConfig::from_args(argomenti(&["--help"])).expect("analisi riuscita"),
             Avvio::Uso
@@ -1309,7 +1252,7 @@ mod tests {
             assert!(atteso(&errore), "errore inatteso: {errore:?}");
         }
 
-        // Le opzioni obbligatorie mancanti, globali e della sorgente scelta.
+        // Opzioni obbligatorie mancanti.
         let senza_server = vec![
             "--user",
             "veicolo_01",
@@ -1348,12 +1291,10 @@ mod tests {
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
     }
 
-    /// Il ticker scatta a ogni intervallo, non solo una volta.
+    /// Il ticker scatta a ogni intervallo.
     ///
-    /// Il tempo qui e' vero, solo accorciato: `start_paused` non puo' convivere con un
-    /// `TcpListener` vero, perche' tokio farebbe avanzare l'orologio appena tutti i task
-    /// sono sospesi e su alcune piattaforme una connessione di loopback non e' ancora
-    /// pronta in quell'istante, facendo scadere l'handshake prima che arrivi.
+    /// Usa tempo reale accorciato: `start_paused` non funziona bene con un `TcpListener`
+    /// vero.
     #[tokio::test]
     async fn il_ticker_invia_una_posizione_a_ogni_intervallo() {
         let intervallo = tempi_di_prova().intervallo_posizione;
@@ -1365,7 +1306,7 @@ mod tests {
         connessione.accetta_login().await;
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
 
-        // Due scatti di fila: uno solo direbbe che il ticker parte, non che si ripete.
+        // Due scatti consecutivi dimostrano che il ticker si ripete.
         for numero in 1..=2u32 {
             let coordinate = match connessione.ricevi().await {
                 ClientMessage::Position { coordinate, .. } => coordinate,
@@ -1376,10 +1317,8 @@ mod tests {
                 ClientEvent::PositionSent(coordinate)
             );
 
-            // Solo un minimo. Il primo tick e' consumato all'avvio del task, quindi lo
-            // scatto n-esimo non puo' maturare prima di n intervalli: e' questo a dire che
-            // le posizioni seguono il ritmo invece di partire tutte insieme. Un massimo
-            // sarebbe instabile, perche' su una macchina carica uno scatto puo' ritardare.
+            // Solo un minimo: il primo tick e' consumato all'avvio, quindi l'n-esimo
+            // non puo' arrivare prima di n intervalli.
             let trascorso = avvio.elapsed();
             assert!(
                 trascorso >= intervallo * numero,
@@ -1419,8 +1358,7 @@ mod tests {
         connessione.accetta_login().await;
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
 
-        // Chiusura brusca lato server: il banco resta in ascolto sullo stesso indirizzo,
-        // pronto ad accettare il tentativo di riconnessione.
+        // Chiusura brusca; il banco resta in ascolto per la riconnessione.
         drop(connessione);
         assert!(matches!(
             prossimo_evento(&mut handle).await,
@@ -1432,9 +1370,7 @@ mod tests {
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
     }
 
-    /// Con `--register` il primo tentativo registra, ma solo quello: una volta creato,
-    /// l'utente esiste, e un secondo `Register` si prenderebbe `UsernameTaken`, che e'
-    /// terminale e farebbe uscire il task.
+    /// Con `--register` solo il primo tentativo registra; le riconnessioni usano Login.
     #[tokio::test]
     async fn dopo_una_registrazione_riuscita_la_riconnessione_accede() {
         let finto = ServerFinto::avvia().await;
@@ -1499,10 +1435,8 @@ mod tests {
         );
     }
 
-    /// Solo un `Register` **riuscito** abbassa il flag. Se il primo tentativo si prende
-    /// `UsernameTaken` l'errore resta terminale: non sappiamo se la password data
-    /// corrisponde davvero a quell'utente, quindi ricadere su `Login` sarebbe un tentativo
-    /// alla cieca sulle credenziali di qualcun altro.
+    /// Un Register rifiutato con UsernameTaken resta un errore terminale: ripiegare su
+    /// Login significherebbe provare le credenziali di un altro utente.
     #[tokio::test]
     async fn un_register_rifiutato_resta_terminale_e_non_ricade_su_login() {
         let finto = ServerFinto::avvia().await;
@@ -1549,8 +1483,7 @@ mod tests {
         connessione.accetta_login().await;
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
 
-        // Il server non chiude di brutto: annuncia la sostituzione, come fa il server vero
-        // prima di lasciar cadere il canale della connessione precedente.
+        // Il server annuncia la sostituzione prima di chiudere, come quello vero.
         connessione
             .invia(ServerMessage::Error {
                 code: ErrorCode::NotAuthenticated,
@@ -1564,9 +1497,7 @@ mod tests {
             "la sostituzione e' una disconnessione con un motivo, non un errore qualunque"
         );
 
-        // Il punto del test: a differenza di una caduta qualunque, qui nessun nuovo
-        // handshake deve arrivare. Riconnettersi espellerebbe la connessione che ha preso
-        // il posto di questa, che a sua volta si riconnetterebbe, e cosi' via.
+        // Dopo una sostituzione non deve arrivare un nuovo handshake.
         assert!(
             finto
                 .nessuna_connessione_entro(Duration::from_millis(500))
@@ -1591,8 +1522,7 @@ mod tests {
         connessione.accetta_login().await;
         assert_eq!(prossimo_evento(&mut handle).await, ClientEvent::Connected);
 
-        // Chiude anche il banco: i tentativi di riconnessione devono fallire per restare
-        // nella fase di attesa, dove il ticker continua a interrogare la sorgente.
+        // Anche il banco si chiude, cosi' il client resta in attesa di riconnessione.
         drop(connessione);
         drop(finto);
         assert!(matches!(
@@ -1600,8 +1530,7 @@ mod tests {
             ClientEvent::Disconnected(_)
         ));
 
-        // Con un intervallo di prova di 80 ms, 250 ms bastano ad accumulare piu' di una
-        // posizione mentre i tentativi di riconnessione falliscono.
+        // Con invii ogni 80 ms, 250 ms accumulano piu' di una posizione.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let ripartito = TcpListener::bind(indirizzo)
@@ -1614,7 +1543,7 @@ mod tests {
         let mut connessione = ConnessioneFinta::da_stream(stream);
         connessione.accetta_login().await;
 
-        // Drena gli eventuali `Disconnected` dei tentativi falliti nel frattempo.
+        // Scarta gli eventuali Disconnected dei tentativi falliti.
         loop {
             match prossimo_evento(&mut handle).await {
                 ClientEvent::Connected => break,
@@ -1652,8 +1581,7 @@ mod tests {
             "il task di rete deve chiudersi entro l'attesa"
         );
 
-        // Il `Logout` e' partito prima che il task terminasse: `chiudi` ha atteso la
-        // chiusura ordinata invece di abbandonare il task a meta'.
+        // Il Logout e' partito prima della fine del task.
         match connessione.ricevi().await {
             ClientMessage::Logout => {}
             altro => panic!("atteso Logout, ottenuto {altro:?}"),
@@ -1662,8 +1590,7 @@ mod tests {
 
     #[tokio::test]
     async fn chiudi_termina_anche_senza_connessione_aperta() {
-        // Nessuno in ascolto sull'indirizzo: il task resta nel ciclo di riconnessione, dove
-        // la chiusura deve funzionare esattamente come a connessione aperta.
+        // Nessun server in ascolto: la chiusura deve funzionare anche in riconnessione.
         let indirizzo: SocketAddr = "127.0.0.1:1".parse().expect("indirizzo di test valido");
         let handle = avvia(config(indirizzo), tempi_di_prova());
 
@@ -1675,8 +1602,8 @@ mod tests {
 
     #[tokio::test]
     async fn una_sorgente_esaurita_manda_ping_invece_di_restare_muta() {
-        // Un percorso di un solo punto, senza ripetizione: dopo il primo invio la sorgente
-        // e' esaurita e non produrra' mai piu' una posizione.
+        // Percorso di un solo punto senza ripetizione: dopo il primo invio la sorgente e'
+        // esaurita.
         let file = FileDiProva::nuovo("esaurita", "lat,lon,offset_secs\n45.07,7.68,0\n");
         let finto = ServerFinto::avvia().await;
         let config = ClientConfig {
@@ -1697,8 +1624,7 @@ mod tests {
             altro => panic!("atteso il punto del percorso, ottenuto {altro:?}"),
         }
 
-        // Da qui la sorgente restituisce sempre `None`: senza il `Ping` la connessione
-        // resterebbe muta fino alla scadenza di inattivita' del server.
+        // Con la sorgente esaurita il client invia Ping per non scadere per inattivita'.
         for numero in 1..=2 {
             match connessione.ricevi().await {
                 ClientMessage::Ping => {}

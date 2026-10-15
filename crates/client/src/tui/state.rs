@@ -1,9 +1,5 @@
-//! Stato dell'interfaccia testuale del client, separato dal rendering perche' sia
-//! verificabile senza aprire un terminale.
-//!
-//! [`UiState::applica_evento`] e' l'unico punto in cui un [`ClientEvent`] arrivato da
-//! [`ClientHandle`](crate::core::ClientHandle) aggiorna lo stato: il ciclo di rendering
-//! (in [`super::render`]) legge solo questa struttura, mai gli eventi grezzi.
+//! Stato della TUI, aggiornato solo da [`UiState::applica_evento`] e separato dal
+//! disegno per poterlo testare senza terminale.
 
 use std::collections::VecDeque;
 
@@ -13,11 +9,10 @@ use georuggine_common::types::{Coordinate, UserState, Username, haversine_meters
 
 use crate::core::ClientEvent;
 
-/// Quante voci trattiene [`UiState::storico_posizioni`] prima di scartare le piu'
-/// vecchie.
+/// Voci massime in [`UiState::storico_posizioni`].
 const STORICO_POSIZIONI_MAX: usize = 20;
 
-/// Quante voci trattiene [`UiState::messaggi`] prima di scartare le piu' vecchie.
+/// Voci massime in [`UiState::messaggi`].
 const MESSAGGI_MAX: usize = 200;
 
 /// Stato mostrato dalla TUI, aggiornato solo da [`UiState::applica_evento`].
@@ -29,28 +24,20 @@ pub struct UiState {
     pub stato_movimento: Option<UserState>,
     /// Nome utente con cui il client si e' autenticato.
     pub username: Username,
-    /// Nome della strategia di posizione in uso (vedi `PositionSource::name`).
+    /// Nome della sorgente di posizione in uso.
     pub sorgente: &'static str,
     /// Ultima posizione inviata con successo al server, con l'istante dell'invio.
     pub ultima_posizione: Option<(Coordinate, DateTime<Utc>)>,
-    /// Ultime posizioni inviate, con la distanza dalla precedente in questa stessa coda.
-    ///
-    /// Limitata a [`STORICO_POSIZIONI_MAX`] elementi: le piu' vecchie cadono.
+    /// Ultime posizioni inviate, con la distanza dalla precedente; al massimo
+    /// `STORICO_POSIZIONI_MAX`.
     pub storico_posizioni: VecDeque<(Coordinate, DateTime<Utc>, f64)>,
-    /// Messaggi ricevuti dal server: testo, orario di arrivo, vero se diretto (falso se
-    /// broadcast).
-    ///
-    /// Limitata a [`MESSAGGI_MAX`] elementi: le piu' vecchie cadono.
+    /// Messaggi ricevuti: testo, orario e `true` se diretto; al massimo `MESSAGGI_MAX`.
     pub messaggi: VecDeque<(String, DateTime<Utc>, bool)>,
     /// Ultimo riepilogo dei movimenti ricevuto, sovrascritto da ogni nuova risposta.
     pub ultima_analisi: Option<MovementSummary>,
     /// Testo digitato dall'operatore, non ancora confermato con Invio.
     pub riga_di_input: String,
-    /// Ultimo motivo di disconnessione o ultimo errore non fatale ricevuto dal server.
-    ///
-    /// Un solo campo per entrambi: per chi guarda la TUI sono entrambi "l'ultima cosa
-    /// andata storta", e separarli costringerebbe il rendering a scegliere quale mostrare.
-    /// Si azzera a ogni [`ClientEvent::Connected`].
+    /// Ultimo errore o motivo di disconnessione; si azzera alla connessione.
     pub ultimo_errore: Option<String>,
 }
 
@@ -71,10 +58,7 @@ impl UiState {
         }
     }
 
-    /// Aggiorna lo stato in base a un evento ricevuto da `ClientHandle::event_rx`.
-    ///
-    /// `adesso` e' l'istante da registrare per gli eventi che non portano gia' un proprio
-    /// orario: come nel resto del progetto la TUI non chiama mai `Utc::now()` da sola.
+    /// Aggiorna lo stato con un evento; `adesso` e' l'orario da registrare.
     pub fn applica_evento(&mut self, evento: ClientEvent, adesso: DateTime<Utc>) {
         match evento {
             ClientEvent::Connected => {
@@ -114,9 +98,7 @@ impl UiState {
     }
 }
 
-/// Accoda un elemento, scartando il piu' vecchio se la coda e' gia' al limite.
-///
-/// E' generica perche' la usano sia lo storico delle posizioni sia quello dei messaggi.
+/// Accoda un elemento, scartando il piu' vecchio se la coda e' piena.
 fn accoda<T>(coda: &mut VecDeque<T>, elemento: T, capacita: usize) {
     if coda.len() >= capacita {
         coda.pop_front();
@@ -213,7 +195,7 @@ mod tests {
         }
 
         assert_eq!(stato.storico_posizioni.len(), 20);
-        // Le dieci piu' vecchie sono cadute: l'ultima rimasta e' quella dell'evento 10.
+        // Le dieci piu' vecchie sono state scartate.
         let attesa = coord(45.0 + 10.0 * 0.001, 7.0);
         assert_eq!(
             stato.storico_posizioni.front().map(|(c, ..)| *c),

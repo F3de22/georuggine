@@ -1,18 +1,11 @@
-//! Astrazione del tempo: la logica di dominio legge l'ora da un [`Clock`], mai da
-//! `Utc::now()`.
-//!
-//! Serve ai comportamenti che dipendono dal tempo, come i tre minuti dopo i quali un
-//! veicolo torna fermo: con un [`FakeClock`] il test li attraversa in microsecondi
-//! invece di aspettarli davvero. In produzione si passa [`SystemClock`].
+//! Astrazione del tempo: la logica di dominio legge l'ora da un [`Clock`] e non da
+//! `Utc::now()`, cosi' i test possono far scorrere il tempo con [`FakeClock`].
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use chrono::{DateTime, TimeDelta, Utc};
 
-/// Sorgente dell'ora corrente.
-///
-/// I bound stanno sul trait perche' un orologio si condivide fra i task come
-/// `Arc<dyn Clock>`.
+/// Sorgente dell'ora corrente, condivisa fra i task come `Arc<dyn Clock>`.
 pub trait Clock: Send + Sync + 'static {
     /// Istante corrente in UTC.
     fn now(&self) -> DateTime<Utc>;
@@ -28,11 +21,9 @@ impl Clock for SystemClock {
     }
 }
 
-/// Orologio simulato: il tempo avanza solo quando lo si sposta a mano.
+/// Orologio simulato: il tempo avanza solo con [`FakeClock::advance`].
 ///
-/// Non e' dietro `#[cfg(test)]` perche' serve anche ai test end-to-end, che vedono
-/// `georuggine-common` come dipendenza normale. Lo stato sta in un [`Mutex`] e non in
-/// una `RefCell` perche' i test lo condividono fra piu' task.
+/// Non e' sotto `#[cfg(test)]` perche' lo usano anche i test end-to-end.
 #[derive(Debug)]
 pub struct FakeClock {
     corrente: Mutex<DateTime<Utc>>,
@@ -46,9 +37,7 @@ impl FakeClock {
         }
     }
 
-    /// Sposta il tempo di `delta`, in avanti o (con `delta` negativo) all'indietro.
-    ///
-    /// Satura agli estremi rappresentabili invece di traboccare, come farebbe `+`.
+    /// Sposta il tempo di `delta`, anche all'indietro, saturando agli estremi.
     pub fn advance(&self, delta: TimeDelta) {
         let mut corrente = self.blocca();
         *corrente = corrente.checked_add_signed(delta).unwrap_or({
@@ -60,8 +49,8 @@ impl FakeClock {
         });
     }
 
-    /// Prende il lock riprendendo il valore anche se il mutex e' avvelenato: la sezione
-    /// critica e' una sola assegnazione, quindi non puo' lasciare lo stato a meta'.
+    /// Un mutex avvelenato non lascia lo stato a meta': la sezione critica e' una sola
+    /// assegnazione.
     fn blocca(&self) -> MutexGuard<'_, DateTime<Utc>> {
         self.corrente.lock().unwrap_or_else(PoisonError::into_inner)
     }

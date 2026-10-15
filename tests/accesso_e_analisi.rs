@@ -1,9 +1,5 @@
-//! Scenario end-to-end: registrazione, accesso, invio delle posizioni e riepilogo.
-//!
-//! Copre il percorso principale della traccia dal punto di vista di un veicolo che entra
-//! in servizio: si registra (R1), riapre la sessione con le proprie credenziali (R2),
-//! manda le posizioni che il server persiste (R3) e chiede il riepilogo dei propri
-//! movimenti (R10). Tutto passa da un socket TCP fra il client vero e il server vero.
+//! Scenario end-to-end: registrazione, accesso, invio delle posizioni e riepilogo, fra
+//! client e server veri su TCP.
 
 mod support;
 
@@ -18,19 +14,16 @@ use support::{
     partenza,
 };
 
-/// Tolleranza sulle distanze in metri: la formula del semiverso e la coordinata scelta
-/// dal test non cadono su un valore tondo, ma la differenza e' ben sotto il metro.
+/// Tolleranza sulle distanze, in metri.
 const TOLLERANZA_M: f64 = 0.5;
 
 #[tokio::test]
 async fn un_veicolo_nuovo_si_registra_e_apre_la_sessione() {
     let server = TestServer::avvia().await;
 
-    // `registrandosi` manda `Register` sul filo: l'utente non esiste prima di questa riga.
     let cliente = TestClient::registrandosi(&server, "veicolo_01").await;
 
-    // La sessione e' aperta, quindi il server ha creato l'utente e ne ha registrato la
-    // connessione: sono le due meta' del requisito R1.
+    // Sessione aperta: l'utente esiste ed e' nel registro delle connessioni.
     let id = server.id_utente("veicolo_01");
     attendi_connessi(&server, &[id]).await;
 
@@ -46,8 +39,7 @@ async fn un_veicolo_registrato_riapre_la_sessione_e_la_chiude() {
     let cliente = TestClient::accedi(&server, "veicolo_01").await;
     attendi_connessi(&server, &[id]).await;
 
-    // Il logout non e' solo la chiusura del socket: il server sgancia la sessione e
-    // toglie il veicolo dal registro delle connessioni.
+    // Il logout toglie il veicolo dal registro delle connessioni.
     cliente.chiudi().await;
     attendi_connessi(&server, &[]).await;
 
@@ -60,18 +52,15 @@ async fn le_posizioni_inviate_finiscono_nello_storico() {
     let id = server.registra("veicolo_01").await;
     let mut cliente = TestClient::accedi_e_invia(&server, "veicolo_01").await;
 
-    // Fra un punto e il successivo passa un minuto di tempo di dominio: e' anche cio' che
-    // riapre la finestra del limitatore di frequenza, che il ticker riempirebbe di
-    // duplicati mentre l'orologio sta fermo.
+    // Un minuto fra un punto e l'altro: riapre anche la finestra del limite di frequenza.
     cliente.invia_posizione(partenza()).await;
     server.avanza(TimeDelta::seconds(60));
     cliente.invia_posizione(a_cinquanta_metri()).await;
     server.avanza(TimeDelta::seconds(60));
     cliente.invia_posizione(a_cento_metri()).await;
 
-    // La conferma di invio dice che la posizione e' partita dal client, non che il server
-    // l'abbia gia' scritta: il registro che si svuota e' invece un fatto che avviene dopo
-    // il `Logout`, e quindi dopo tutto cio' che lo precedeva sulla stessa connessione.
+    // Il registro si svuota dopo il Logout, quindi dopo che tutte le posizioni sono
+    // state elaborate.
     cliente.chiudi().await;
     attendi_connessi(&server, &[]).await;
 
@@ -81,9 +70,8 @@ async fn le_posizioni_inviate_finiscono_nello_storico() {
         "lo storico contiene posizioni di un altro utente: {storico:?}"
     );
 
-    // Il ticker ripete l'ultima coordinata nota finche' non ne arriva una nuova, quindi
-    // lo storico contiene anche dei duplicati consecutivi: cio' che il requisito R3
-    // chiede e' che i tre punti ci siano tutti e in quest'ordine.
+    // Il client ripete l'ultima coordinata a ogni invio: si verifica solo che i tre
+    // punti ci siano, in ordine.
     let mut percorso: Vec<Coordinate> = storico.iter().map(|record| record.coordinate).collect();
     percorso.dedup();
     assert_eq!(
@@ -100,11 +88,8 @@ async fn il_riepilogo_dei_movimenti_arriva_al_veicolo_che_lo_chiede() {
     server.registra("veicolo_01").await;
     let inizio = server.orologio.now();
 
-    // Il percorso lo pianta un client grezzo, un punto per volta: e' l'unico modo di
-    // avere istanti esatti su cui verificare le durate del riepilogo, perche' il ticker
-    // del client vero ripete l'ultima coordinata a ogni scatto e quei duplicati
-    // sposterebbero i confini dei segmenti. Il tragitto e' un minuto di marcia seguito da
-    // una sosta di tre minuti.
+    // Il percorso lo invia un client grezzo, per avere istanti esatti: un minuto di
+    // marcia e tre minuti di sosta.
     let mut veicolo = ClientGrezzo::connetti(&server).await;
     veicolo.saluta_e_accedi("veicolo_01").await;
     invia_e_conferma(&mut veicolo, partenza(), &server).await;
@@ -115,12 +100,8 @@ async fn il_riepilogo_dei_movimenti_arriva_al_veicolo_che_lo_chiede() {
     ));
     invia_e_conferma(&mut veicolo, a_cinquanta_metri(), &server).await;
 
-    // La terza posizione lascia il veicolo in movimento oltre la soglia del requisito R5:
-    // da qui il battito della macchina a stati e' nel suo diritto di annunciare il ritorno
-    // a fermo, e lo accoda dove il test si aspetta l'`Ack` del logout. Non e' un difetto
-    // del server, ma un messaggio legittimo che questo scenario non sta verificando:
-    // quello di stati e' `stati`. Lo si toglie di mezzo qui, dove la coda non puo'
-    // contenere altro perche' nessuna richiesta e' in volo.
+    // Il veicolo e' in movimento oltre la soglia: il task periodico puo' accodare il
+    // ritorno a fermo, che qui va scartato.
     veicolo.scarta_ritorno_a_fermo().await;
 
     veicolo.invia(ClientMessage::Logout).await;
@@ -132,7 +113,7 @@ async fn il_riepilogo_dei_movimenti_arriva_al_veicolo_che_lo_chiede() {
     );
     veicolo.attendi_chiusura().await;
 
-    // La richiesta la fa invece il client vero, che e' chi la fara' in servizio.
+    // L'analisi la chiede il client vero.
     let fine = server.orologio.now();
     let mut cliente = TestClient::accedi(&server, "veicolo_01").await;
     cliente
@@ -151,7 +132,7 @@ async fn il_riepilogo_dei_movimenti_arriva_al_veicolo_che_lo_chiede() {
     );
     assert_eq!(riepilogo.moving_duration_secs, 60);
     assert_eq!(riepilogo.pause_duration_secs, STILL_AFTER_SECS);
-    // La sosta dura esattamente la soglia del requisito R5, che e' inclusa.
+    // La sosta dura esattamente la soglia, inclusa.
     assert_eq!(riepilogo.stop_count, 1);
     assert!(
         (riepilogo.average_speed_kmh - distanza_attesa / 60.0 * 3.6).abs() < 0.1,
@@ -171,11 +152,8 @@ async fn il_riepilogo_dei_movimenti_arriva_al_veicolo_che_lo_chiede() {
     server.spegni().await;
 }
 
-/// Manda una posizione datata all'ora corrente del dominio e attende la conferma.
-///
-/// Un eventuale [`ServerMessage::StateChanged`] viene scartato: segue l'`Ack` quando la
-/// posizione fa passare il veicolo in movimento, non e' una risposta alla richiesta, e di
-/// stati parla lo scenario `stati`.
+/// Invia una posizione all'ora corrente del dominio e attende l'Ack, scartando un
+/// eventuale cambio di stato.
 async fn invia_e_conferma(veicolo: &mut ClientGrezzo, dove: Coordinate, server: &TestServer) {
     veicolo
         .invia(ClientMessage::Position {

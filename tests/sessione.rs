@@ -1,14 +1,8 @@
 //! Scenario end-to-end: ciclo di vita di una sessione.
 //!
-//! Il server ammette una sola sessione per utente: se lo stesso account si presenta da
-//! un'altra parte, la connessione precedente viene chiusa. La chiusura non e' pero' muta,
-//! ed e' questo il punto delicato: il client sostituito riceve prima un errore con il
-//! testo [`SESSION_REPLACED_MESSAGE`], lo riconosce e **non** si riconnette. Senza quel
-//! discriminante vedrebbe solo la fine del flusso, non distinguibile da una caduta di
-//! rete, e i due client si espellerebbero a vicenda senza fine.
-//!
-//! Lo scenario copre anche le altre due uscite: il logout, che libera la sessione, e lo
-//! spegnimento del server, che chiude quelle aperte.
+//! Un secondo accesso con lo stesso utente chiude la sessione precedente, che riceve
+//! [`SESSION_REPLACED_MESSAGE`] e non si riconnette. Coperti anche logout e spegnimento
+//! del server.
 
 mod support;
 
@@ -26,13 +20,11 @@ async fn una_seconda_connessione_dello_stesso_utente_sostituisce_la_prima() {
     // Lo stesso account si collega da un'altra parte.
     let mut secondo = TestClient::accedi(&server, "veicolo_01").await;
 
-    // Il primo apprende il motivo della chiusura e smette: se si riconnettesse
-    // espellerebbe la connessione che ha preso il suo posto, in un ciclo senza fine.
+    // Il primo client riceve il motivo e non si riconnette.
     assert_eq!(primo.attendi_caduta().await, SESSION_REPLACED_MESSAGE);
     primo.attendi_fine().await;
 
-    // Nel registro resta una sola voce, ed e' quella della connessione nuova: un
-    // messaggio diretto la raggiunge.
+    // Nel registro resta solo la connessione nuova, raggiungibile con un diretto.
     attendi_connessi(&server, &[id]).await;
     let consegnato = server
         .messaggistica
@@ -56,8 +48,7 @@ async fn il_logout_libera_la_sessione() {
 
     cliente.chiudi().await;
 
-    // Il logout sgancia la sessione e toglie la voce dal registro, senza aspettare la
-    // scadenza di inattivita'; la macchina a stati ne prende atto.
+    // Il logout libera subito la sessione.
     attendi_connessi(&server, &[]).await;
     attendi_stato(&server, id, UserState::Disconnected).await;
 
@@ -78,7 +69,7 @@ async fn due_veicoli_diversi_restano_collegati_insieme() {
     let primo = TestClient::accedi(&server, "veicolo_01").await;
     let secondo = TestClient::accedi(&server, "veicolo_02").await;
 
-    // Il limite e' una sessione per utente, non una connessione per server.
+    // Una sessione per utente, non una per server.
     attendi_connessi(&server, &[primo_id, secondo_id]).await;
 
     primo.chiudi().await;
@@ -94,8 +85,7 @@ async fn lo_spegnimento_del_server_chiude_le_sessioni_aperte() {
     server.registra("veicolo_01").await;
     let mut cliente = TestClient::accedi(&server, "veicolo_01").await;
 
-    // Lo spegnimento non riguarda solo l'accettazione di nuove connessioni: anche quelle
-    // gia' aperte ricevono il segnale e si chiudono.
+    // Lo spegnimento chiude anche le connessioni gia' aperte.
     server.spegni().await;
 
     let motivo = cliente.attendi_caduta().await;
@@ -104,7 +94,6 @@ async fn lo_spegnimento_del_server_chiude_le_sessioni_aperte() {
         "anche una chiusura decisa dal server arriva con un motivo da mostrare"
     );
 
-    // Da qui in poi il client riprova con il backoff, perche' una caduta di rete non e'
-    // distinguibile da un server spento: e' l'utente a decidere quando smettere.
+    // Il client riprova: un server spento non si distingue da una caduta di rete.
     cliente.chiudi().await;
 }
