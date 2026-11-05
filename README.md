@@ -1,6 +1,6 @@
 # Georuggine — Real-Time Vehicle Fleet Tracking System
 
-[![CI Pipeline](https://github.com/G37/G37/actions/workflows/ci.yml/badge.svg)](https://github.com/G37/G37/actions)
+[![CI Pipeline](https://github.com/F3de22/georuggine/actions/workflows/ci.yml/badge.svg)](https://github.com/F3de22/georuggine/actions)
 ![Rust Edition](https://img.shields.io/badge/rust-2021-brightgreen.svg)
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 
